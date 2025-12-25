@@ -16,7 +16,17 @@ pyqt6_datas, pyqt6_binaries, pyqt6_hiddenimports = collect_all('PyQt6')
 datas = [
     ('models', 'models'),
     ('training', 'training'),
+    ('yolov8n.pt', '.'),
     ('supabase_rest.py', '.'),
+    ('database.py', '.'),
+    ('ai_detection.py', '.'),
+    ('ai_suggester.py', '.'),
+    ('preview_window.py', '.'),
+    ('compare_window.py', '.'),
+    ('cuddelink_downloader.py', '.'),
+    ('image_processor.py', '.'),
+    ('duplicate_dialog.py', '.'),
+    ('site_clustering.py', '.'),
 ]
 datas += pyqt6_datas
 

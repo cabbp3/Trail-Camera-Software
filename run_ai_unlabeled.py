@@ -19,7 +19,7 @@ def main():
         print("ERROR: AI model not available. Check models/ folder.")
         sys.exit(1)
 
-    print(f"AI model ready: CLIP={suggester.clip and suggester.clip.ready}, ONNX={suggester.onnx and suggester.onnx.ready}")
+    print(f"AI model ready: ONNX={suggester.onnx and suggester.onnx.ready}")
     print(f"Buck/Doe model ready: {suggester.buckdoe_ready}")
 
     # Get all photos

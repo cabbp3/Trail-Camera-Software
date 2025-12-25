@@ -76,7 +76,7 @@ class MegaDetectorV5:
         if not model_path.exists():
             print(f"MegaDetector model not found at {model_path}")
             print("Download from: https://github.com/microsoft/CameraTraps/releases")
-            print("Place at: ~/.trailcam/md_v5a.0.0.pt")
+            print(f"Place at: {Path.home() / '.trailcam' / 'md_v5a.0.0.pt'}")
             return
         
         try:

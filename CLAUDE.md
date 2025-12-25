@@ -168,6 +168,73 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ## Resume Next Session
 
+**What was completed (Dec 24, 2024 - Deep Clean Session):**
+
+1. **Windows Standalone Build Fixes** - Critical issues that would have broken the Windows build:
+   - Added missing dependencies to `requirements.txt`: numpy, opencv-python, onnxruntime
+   - Added missing data files to `TrailCamOrganizer_Windows.spec`: yolov8n.pt and all Python modules
+   - Fixed `ai_suggester.py` to use `sys._MEIPASS` for PyInstaller bundling (models now load correctly in standalone app)
+   - Added `yolov8n.pt` to both macOS and Windows spec files
+
+2. **Cross-Platform Path Fixes**
+   - Fixed `web/server.py` hardcoded paths to work on Windows
+   - Added `get_db_path()` and `get_library_path()` helpers for cross-platform paths
+   - Fixed `ai_detection.py` to show correct model path on Windows
+
+3. **Dead Code Cleanup**
+   - Fixed `run_ai_unlabeled.py:22` - Removed reference to deleted CLIP attribute (would crash)
+   - Identified duplicate preprocessing code in ai_suggester.py (left for future refactoring)
+
+4. **Code Review Findings** (for future work):
+   - `training/label_tool.py` is 3500+ lines - could be split into modules
+   - Duplicate image preprocessing in SpeciesSuggester, BuckDoeSuggester, ReIDSuggester
+   - Duplicate zoom/pan logic in preview_window.py and compare_window.py
+
+**Files Modified:**
+- `requirements.txt` - Added numpy, opencv-python, onnxruntime
+- `TrailCamOrganizer_Windows.spec` - Added all missing datas entries
+- `TrailCamOrganizer_macOS.spec` - Added yolov8n.pt
+- `ai_suggester.py` - Added `get_resource_path()` helper with sys._MEIPASS support
+- `web/server.py` - Cross-platform path helpers
+- `ai_detection.py` - Fixed model path print message
+- `run_ai_unlabeled.py` - Removed CLIP reference
+
+---
+
+**What was completed (Dec 24, 2024 - Night Session):**
+
+1. **Integrated Queue Mode** - Major UI overhaul
+   - Review queues (species suggestions, sex suggestions) now filter the main photo list instead of opening modal dialogs
+   - Full access to all labeling tools during queue review
+   - Queue control panel with Accept (A), Skip (S), Exit buttons
+   - Queue suggestion shown in photo list (e.g., "12/25/2024 3:16 AM — Deer (95%)")
+   - Green highlighting for reviewed items
+   - Can exit queue and stay on current photo
+   - Key code: `_enter_queue_mode()`, `_exit_queue_mode()`, `_queue_accept()`, `_queue_skip()` in label_tool.py
+
+2. **Background AI Processing**
+   - AI suggestions now run in background thread (`AIWorker` QThread class)
+   - Photos appear in queue as they're processed (live updates)
+   - Progress bar shows AI processing status
+   - Menu: Tools → Suggest Tags (AI) — Background + Live Queue
+
+3. **Session-Based Recent Species**
+   - Recent species quick buttons now update immediately when you apply a species
+   - Uses `_session_recent_species` list to track species applied this session
+   - Prioritizes session-applied species over database history
+
+4. **Bug Fixes**
+   - Fixed crash: `clear_suggested_tag` → `set_suggested_tag(pid, None, None)`
+   - Fixed crash: `clear_suggested_sex` → `set_suggested_sex(pid, None, None)`
+
+**Known Issue - Needs Future Work:**
+- **Queue mode performance is slow** - The integrated queue window runs slower than the old modal dialogs. May need optimization (lazy loading, reduced database queries, etc.)
+
+**Key Files Modified:**
+- `training/label_tool.py` - Queue mode, AIWorker, session recent species (~500 lines added)
+
+---
+
 **What was completed (Dec 24, 2024 - Evening Session):**
 
 1. **Removed CLIP - Simplified Species Classifier**

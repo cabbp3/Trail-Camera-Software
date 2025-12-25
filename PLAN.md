@@ -1,6 +1,21 @@
 # Trail Camera Software - Project Plan
 
-**Last Updated:** December 20, 2024 (Session 8)
+**Last Updated:** December 24, 2024 (Session 10)
+
+---
+
+## Timestamp Corrections Needed
+
+**216 photos at WB 27 need date correction:**
+- Currently set to: July 1-8, 2024
+- Original (wrong) dates: January 1-8, 2022
+- These came from a camera with incorrect clock settings
+- Need to determine actual dates and apply correction
+
+To find these photos:
+```sql
+SELECT * FROM photos WHERE date_taken LIKE '2024-07%' AND camera_location = 'WB 27';
+```
 
 This document tracks all tasks for the Trail Camera Photo Organizer. Tasks marked with `[X]` are complete.
 
@@ -24,18 +39,32 @@ This software is intended to become a **marketable product** for hunters and wil
 
 ## Resume Next Session
 
-**Where we left off (Dec 20, 2024):**
-- Windows version working! App runs with `python main.py`
-- Supabase cloud sync NOT working on Windows - needs `supabase` package
-- Issue: `pip install supabase` requires Visual C++ Build Tools
-- Visual C++ Build Tools installed but supabase still failing
+**Where we left off (Dec 24, 2024 - Night):**
 
-**To resume Windows setup:**
-1. Open Command Prompt
-2. `cd C:\Users\mbroo\OneDrive\Desktop\Trail Camera Software V 1.0`
-3. `venv\Scripts\activate`
-4. Try: `pip install supabase` (may need troubleshooting)
-5. `python main.py`
+1. **Integrated Queue Mode** - COMPLETED
+   - Review queues now filter main photo list (no modal dialogs)
+   - Full labeling tools available during queue review
+   - Accept (A), Skip (S), Exit buttons in queue panel
+   - Suggestion shown in photo list: "12/25/2024 — Deer (95%)"
+   - **KNOWN ISSUE:** Performance is slow - needs optimization
+
+2. **Background AI Processing** - COMPLETED
+   - `AIWorker` QThread class processes photos in background
+   - Photos appear in queue as processed
+   - Menu: Tools → Suggest Tags (AI) — Background + Live Queue
+
+3. **Session-Based Recent Species** - COMPLETED
+   - Quick buttons update immediately when species applied
+
+**To resume:**
+1. Open app: `cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0" && source .venv/bin/activate && python3 main.py`
+2. Consider profiling queue mode to find performance bottlenecks
+
+---
+
+**Previous (Dec 20, 2024):**
+- Windows version working with `python main.py`
+- Supabase sync fixed - using REST API (no C++ dependencies)
 
 **What works on Windows:**
 - App launches and runs
@@ -556,12 +585,15 @@ Key capabilities needed:
     - Skip labeled photos entirely (don't include in loop)
     - Makes progress bar more accurate and processing faster
     - Show per-species counts in progress bar (e.g., "Deer: 45 | Turkey: 12 | Buck: 30 | Doe: 15")
-14. **Background AI processing** - Run AI suggestions without blocking the UI
-    - Use QThread for AI processing in separate thread
-    - Non-modal progress indicator (status bar or floating widget)
-    - Allow user to continue browsing/labeling while AI runs
-    - Emit signals to update progress and notify when complete
-    - **NOTE:** Save a backup copy of the app folder before implementing this feature
+14. **[X] Background AI processing** - Run AI suggestions without blocking the UI
+    - IMPLEMENTED Dec 24, 2024 - `AIWorker` QThread class in label_tool.py
+    - Menu: Tools → Suggest Tags (AI) — Background + Live Queue
+    - Photos appear in queue as they're processed
+    - Progress bar shows AI processing status
+15. **Integrated queue mode performance** - Queue mode runs slow, needs optimization
+    - Current implementation re-filters and rebuilds photo list on each change
+    - Possible fixes: lazy loading, reduced database queries, caching
+    - May need to profile to find bottlenecks
 
 ---
 

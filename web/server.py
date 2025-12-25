@@ -192,10 +192,27 @@ def run_cuddelink_download(email, password, date_from, date_to):
         update_download_state(status="error", message=str(e), error=str(e))
 
 
+def get_db_path():
+    """Get database path - cross-platform."""
+    home = Path.home()
+    if sys.platform == 'win32':
+        db_dir = home / 'AppData' / 'Roaming' / 'TrailCam'
+    else:
+        db_dir = home / '.trailcam'
+    return str(db_dir / 'trailcam.db')
+
+
+def get_library_path():
+    """Get photo library path - cross-platform."""
+    if sys.platform == 'win32':
+        return Path("C:/TrailCamLibrary")
+    return Path.home() / "TrailCamLibrary"
+
+
 def refresh_photos_json():
     """Re-export photos from database to JSON."""
     import sqlite3
-    db_path = os.path.expanduser('~/.trailcam/trailcam.db')
+    db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -248,13 +265,13 @@ class TrailCamHandler(http.server.SimpleHTTPRequestHandler):
 
         # Serve photos from TrailCamLibrary
         if path.startswith('/photos/'):
-            photo_path = os.path.expanduser('~/TrailCamLibrary' + path[7:])
+            photo_path = str(get_library_path()) + path[7:]
             self.serve_file(photo_path, 'image/jpeg')
             return
 
         # Serve thumbnails
         if path.startswith('/thumbnails/'):
-            thumb_path = os.path.expanduser('~/TrailCamLibrary/.thumbnails' + path[11:])
+            thumb_path = str(get_library_path() / '.thumbnails') + path[11:]
             self.serve_file(thumb_path, 'image/jpeg')
             return
 
@@ -350,7 +367,7 @@ if __name__ == '__main__':
         print(f"-------------------")
         print(f"URL: http://localhost:{PORT}")
         print(f"Web files: {WEB_DIR}")
-        print(f"Photos: ~/TrailCamLibrary")
+        print(f"Photos: {get_library_path()}")
         print(f"\nPress Ctrl+C to stop")
         try:
             httpd.serve_forever()

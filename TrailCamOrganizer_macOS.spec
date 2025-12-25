@@ -13,6 +13,7 @@ block_cipher = None
 datas = [
     ('models', 'models'),
     ('training', 'training'),
+    ('yolov8n.pt', '.'),
     ('supabase_rest.py', '.'),
     ('database.py', '.'),
     ('ai_detection.py', '.'),

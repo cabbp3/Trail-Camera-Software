@@ -55,6 +55,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QProgressDialog,
+    QProgressBar,
     QInputDialog,
     QAbstractItemView,
     QLayout,
@@ -463,6 +464,267 @@ class FlowLayout(QLayout):
             line_height = max(line_height, item.sizeHint().height())
 
 
+class AIWorker(QThread):
+    """Background worker thread for AI processing."""
+
+    # Signals emitted during processing
+    progress = pyqtSignal(int, int, str)  # current, total, message
+    photo_processed = pyqtSignal(dict)  # {id, species, species_conf, sex, sex_conf}
+    finished_all = pyqtSignal(int, int)  # species_count, sex_count
+    error = pyqtSignal(str)  # error message
+
+    def __init__(self, photos: list, db, suggester, detector_getter, parent=None):
+        super().__init__(parent)
+        self.photos = photos
+        self.db = db
+        self.suggester = suggester
+        self._get_detector = detector_getter
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        """Run AI processing in background thread."""
+        total = len(self.photos)
+        species_count = 0
+        sex_count = 0
+
+        # Get detector (may need to load model)
+        try:
+            detector, names = self._get_detector()
+        except Exception as e:
+            self.error.emit(f"Failed to load detector: {e}")
+            return
+
+        for i, p in enumerate(self.photos):
+            if self._cancelled:
+                break
+
+            # Emit progress
+            self.progress.emit(i, total, f"Processing {i + 1} of {total}...")
+
+            result = {
+                "id": p.get("id"),
+                "species": None,
+                "species_conf": 0,
+                "sex": None,
+                "sex_conf": 0
+            }
+
+            try:
+                # Run detection if no boxes exist
+                self._ensure_detection_boxes(p, detector, names)
+
+                # Check for animal boxes
+                boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
+                has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+
+                if not has_animal_box:
+                    # No animals detected - suggest Empty
+                    self.db.set_suggested_tag(p["id"], "Empty", 0.95)
+                    result["species"] = "Empty"
+                    result["species_conf"] = 0.95
+                    species_count += 1
+                else:
+                    # Run classifier on crop
+                    crop = self._best_crop_for_photo(p)
+                    path = str(crop) if crop else p.get("file_path")
+                    res = self.suggester.predict(path)
+
+                    if res:
+                        label, conf = res
+                        # If classifier says Empty but detector found animals, skip
+                        if label != "Empty":
+                            self.db.set_suggested_tag(p["id"], label, conf)
+                            result["species"] = label
+                            result["species_conf"] = conf
+                            species_count += 1
+
+                            # If Deer, also suggest buck/doe
+                            if label == "Deer":
+                                self._add_deer_head_boxes(p, detector, names)
+                                if self.suggester.buckdoe_ready:
+                                    head_crop = self._best_head_crop_for_photo(p)
+                                    if head_crop:
+                                        sex_res = self.suggester.predict_sex(str(head_crop))
+                                        if sex_res:
+                                            sex_label, sex_conf = sex_res
+                                            self.db.set_suggested_sex(p["id"], sex_label, sex_conf)
+                                            result["sex"] = sex_label
+                                            result["sex_conf"] = sex_conf
+                                            sex_count += 1
+                                        try:
+                                            Path(head_crop).unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
+
+                    if crop:
+                        try:
+                            Path(crop).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.warning(f"AI processing failed for photo {p.get('id')}: {e}")
+
+            # Emit result for this photo
+            if result["species"]:
+                self.photo_processed.emit(result)
+
+        self.finished_all.emit(species_count, sex_count)
+
+    def _ensure_detection_boxes(self, photo: dict, detector, names) -> bool:
+        """Run detector on photo if it has no boxes."""
+        pid = photo.get("id")
+        if not pid:
+            return False
+        try:
+            if self.db.has_detection_boxes(pid):
+                return True
+        except Exception:
+            pass
+        path = photo.get("file_path")
+        if not path or not os.path.exists(path):
+            return False
+        boxes = self._detect_boxes_for_path(path, detector, names, conf_thresh=0.25)
+        if boxes:
+            try:
+                self.db.set_boxes(pid, boxes)
+                return True
+            except Exception:
+                pass
+        return False
+
+    def _detect_boxes_for_path(self, path: str, detector, names, conf_thresh=0.25):
+        """Run detector and return boxes."""
+        if detector is None:
+            return []
+        try:
+            results = detector(path, verbose=False)
+            boxes = []
+            for result in results:
+                for box in result.boxes:
+                    conf = float(box.conf[0])
+                    if conf < conf_thresh:
+                        continue
+                    cls_id = int(box.cls[0])
+                    label = names.get(cls_id, f"class_{cls_id}") if names else f"class_{cls_id}"
+                    # Normalize coordinates
+                    x1, y1, x2, y2 = box.xyxyn[0].tolist()
+                    boxes.append({
+                        "label": f"ai_{label}",
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "confidence": conf
+                    })
+            return boxes
+        except Exception:
+            return []
+
+    def _best_crop_for_photo(self, photo: dict):
+        """Return a temp file path of the best crop or None."""
+        from PIL import Image
+
+        pid = photo.get("id")
+        if not pid:
+            return None
+        boxes = []
+        try:
+            boxes = self.db.get_boxes(pid)
+        except Exception:
+            boxes = []
+        if not boxes:
+            return None
+        # Prefer deer_head, then ai_animal, then subject
+        chosen = None
+        for b in boxes:
+            if b.get("label") == "deer_head":
+                chosen = b
+                break
+        if chosen is None:
+            for b in boxes:
+                if b.get("label") == "ai_animal":
+                    chosen = b
+                    break
+        if chosen is None:
+            for b in boxes:
+                if str(b.get("label")).endswith("subject"):
+                    chosen = b
+                    break
+        if chosen is None:
+            return None
+        path = photo.get("file_path")
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+            x1 = int(chosen["x1"] * w); x2 = int(chosen["x2"] * w)
+            y1 = int(chosen["y1"] * h); y2 = int(chosen["y2"] * h)
+            x1 = max(0, min(w, x1)); x2 = max(0, min(w, x2))
+            y1 = max(0, min(h, y1)); y2 = max(0, min(h, y2))
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                return None
+            tmp = Path(tempfile.mkstemp(suffix=".jpg")[1])
+            img.crop((x1, y1, x2, y2)).save(tmp, "JPEG", quality=90)
+            return tmp
+        except Exception:
+            return None
+
+    def _best_head_crop_for_photo(self, photo: dict):
+        """Return a temp file path of deer_head crop or None."""
+        from PIL import Image
+
+        pid = photo.get("id")
+        if not pid:
+            return None
+        boxes = []
+        try:
+            boxes = self.db.get_boxes(pid)
+        except Exception:
+            boxes = []
+        if not boxes:
+            return None
+        chosen = None
+        for b in boxes:
+            if b.get("label") == "deer_head":
+                chosen = b
+                break
+        if chosen is None:
+            for b in boxes:
+                if b.get("label") == "ai_deer_head":
+                    chosen = b
+                    break
+        if chosen is None:
+            return None
+        path = photo.get("file_path")
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+            x1 = int(chosen["x1"] * w); x2 = int(chosen["x2"] * w)
+            y1 = int(chosen["y1"] * h); y2 = int(chosen["y2"] * h)
+            # Add 10% padding
+            pad_x = int((x2 - x1) * 0.1)
+            pad_y = int((y2 - y1) * 0.1)
+            x1 = max(0, x1 - pad_x); x2 = min(w, x2 + pad_x)
+            y1 = max(0, y1 - pad_y); y2 = min(h, y2 + pad_y)
+            if x2 - x1 < 32 or y2 - y1 < 32:
+                return None
+            tmp = Path(tempfile.mkstemp(suffix=".jpg")[1])
+            img.crop((x1, y1, x2, y2)).save(tmp, "JPEG", quality=90)
+            return tmp
+        except Exception:
+            return None
+
+    def _add_deer_head_boxes(self, photo: dict, detector, names):
+        """Add deer head boxes if deer head detector is available."""
+        # This would use a separate deer head detector model
+        # For now, skip if not available
+        pass
+
+
 class TrainerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -494,6 +756,21 @@ class TrainerWindow(QMainWindow):
         self.ai_reviewed_photos = set()  # Track reviewed photo IDs for green highlighting
         self._advancing_review = False  # Guard against recursive advance calls
         self._detector_warned = False
+
+        # Integrated queue mode (replaces modal dialogs)
+        self.queue_mode = False  # True when viewing a filtered queue
+        self.queue_type = None  # 'species', 'sex', 'boxes', etc.
+        self.queue_photo_ids = []  # List of photo IDs in the queue
+        self.queue_data = {}  # Extra data per photo (e.g., suggested species, confidence)
+        self.queue_reviewed = set()  # Photo IDs that have been reviewed
+        self.queue_pre_filter_index = 0  # Remember position before entering queue
+
+        # Background AI processing
+        self.ai_worker = None  # AIWorker instance when running
+        self.ai_processing = False  # True while AI is running in background
+
+        # Session-based recently applied species (for quick buttons)
+        self._session_recent_species = []  # Species applied this session, most recent first
 
         self.scene = QGraphicsScene()
         self.view = AnnotatableView()
@@ -1026,12 +1303,77 @@ class TrainerWindow(QMainWindow):
         filter_row_container = QWidget()
         filter_row_container.setLayout(filter_layout)
         self._populate_site_filter_options()
+
+        # Queue control panel (hidden by default, shown when in queue mode)
+        self.queue_panel = QFrame()
+        self.queue_panel.setFrameStyle(QFrame.Shape.StyledPanel)
+        self.queue_panel.setStyleSheet("QFrame { background-color: #2a4a6a; border-radius: 4px; padding: 4px; }")
+        queue_layout = QVBoxLayout(self.queue_panel)
+        queue_layout.setContentsMargins(8, 6, 8, 6)
+        queue_layout.setSpacing(4)
+
+        # Queue header with title and count
+        queue_header = QHBoxLayout()
+        self.queue_title_label = QLabel("Review Queue")
+        self.queue_title_label.setStyleSheet("font-weight: bold; color: white; font-size: 12px;")
+        self.queue_count_label = QLabel("0 / 0")
+        self.queue_count_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        queue_header.addWidget(self.queue_title_label)
+        queue_header.addStretch()
+        queue_header.addWidget(self.queue_count_label)
+        queue_layout.addLayout(queue_header)
+
+        # Suggestion info label
+        self.queue_suggestion_label = QLabel("")
+        self.queue_suggestion_label.setStyleSheet("color: #8cf; font-size: 11px;")
+        self.queue_suggestion_label.setWordWrap(True)
+        queue_layout.addWidget(self.queue_suggestion_label)
+
+        # AI processing progress bar (hidden when not processing)
+        self.queue_progress_bar = QProgressBar()
+        self.queue_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #555;
+                border-radius: 3px;
+                background: #333;
+                height: 16px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: #4a8;
+                border-radius: 2px;
+            }
+        """)
+        self.queue_progress_bar.setTextVisible(True)
+        self.queue_progress_bar.hide()  # Hidden until AI processing starts
+        queue_layout.addWidget(self.queue_progress_bar)
+
+        # Queue action buttons
+        queue_btn_layout = QHBoxLayout()
+        queue_btn_layout.setSpacing(4)
+        self.queue_accept_btn = QPushButton("Accept (A)")
+        self.queue_accept_btn.setStyleSheet("background-color: #4a4; color: white; font-weight: bold;")
+        self.queue_accept_btn.clicked.connect(self._queue_accept)
+        self.queue_skip_btn = QPushButton("Skip (S)")
+        self.queue_skip_btn.setStyleSheet("background-color: #666; color: white;")
+        self.queue_skip_btn.clicked.connect(self._queue_skip)
+        self.queue_exit_btn = QPushButton("Exit Queue")
+        self.queue_exit_btn.setStyleSheet("background-color: #a44; color: white;")
+        self.queue_exit_btn.clicked.connect(self._exit_queue_mode)
+        queue_btn_layout.addWidget(self.queue_accept_btn)
+        queue_btn_layout.addWidget(self.queue_skip_btn)
+        queue_btn_layout.addWidget(self.queue_exit_btn)
+        queue_layout.addLayout(queue_btn_layout)
+
+        self.queue_panel.hide()  # Hidden by default
+
         left_panel = QWidget()
         left_panel.setMinimumWidth(150)  # Prevent panel from disappearing
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
         left_layout.addWidget(filter_row_container)
+        left_layout.addWidget(self.queue_panel)
         left_layout.addWidget(self.photo_list_widget, 1)
         self._populate_photo_list()
         # preview strip frame
@@ -1113,6 +1455,8 @@ class TrainerWindow(QMainWindow):
         ai_action.triggered.connect(self.run_ai_suggestions)
         ai_all_action = self.tools_menu.addAction("Suggest Tags (AI) — All Photos")
         ai_all_action.triggered.connect(self.run_ai_suggestions_all)
+        ai_bg_action = self.tools_menu.addAction("Suggest Tags (AI) — Background + Live Queue")
+        ai_bg_action.triggered.connect(self.run_ai_suggestions_background)
         self.tools_menu.addSeparator()
         sex_suggest_action = self.tools_menu.addAction("Suggest Buck/Doe (AI) on Deer Photos...")
         sex_suggest_action.triggered.connect(self.run_sex_suggestions_on_deer)
@@ -1126,7 +1470,7 @@ class TrainerWindow(QMainWindow):
         box_review_action.triggered.connect(self.start_ai_review)
 
         species_review_action = self.tools_menu.addAction("Review Species Suggestions...")
-        species_review_action.triggered.connect(self.review_species_suggestions)
+        species_review_action.triggered.connect(self.review_species_suggestions_integrated)
 
         unlabeled_boxes_action = self.tools_menu.addAction("Label Photos with Boxes (No Suggestion)...")
         unlabeled_boxes_action.triggered.connect(self.review_unlabeled_with_boxes)
@@ -1722,6 +2066,10 @@ class TrainerWindow(QMainWindow):
             self.add_left_uncertain.setChecked(False)
             self.add_right_uncertain.setChecked(False)
 
+        # Update queue UI if in queue mode
+        if self.queue_mode:
+            self._update_queue_ui()
+
     def save_current(self):
         if not self.photos:
             return
@@ -1798,6 +2146,11 @@ class TrainerWindow(QMainWindow):
         if species:
             # Official tag applied; clear suggestion
             self.db.set_suggested_tag(pid, None, None)
+            # Bump to session recent species list
+            if species in self._session_recent_species:
+                self._session_recent_species.remove(species)
+            self._session_recent_species.insert(0, species)
+            self._session_recent_species = self._session_recent_species[:20]  # Keep max 20
             # persist custom species
             if species not in SPECIES_OPTIONS:
                 self.db.add_custom_species(species)
@@ -1943,6 +2296,48 @@ class TrainerWindow(QMainWindow):
         down.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         down.triggered.connect(lambda: self._handle_nav(1))
         self.addAction(down)
+
+        # Queue mode shortcuts (A=Accept, S=Skip, Escape=Exit)
+        accept_action = QAction(self)
+        accept_action.setShortcut(Qt.Key.Key_A)
+        accept_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        accept_action.triggered.connect(self._queue_accept_if_active)
+        self.addAction(accept_action)
+
+        skip_action = QAction(self)
+        skip_action.setShortcut(Qt.Key.Key_S)
+        skip_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        skip_action.triggered.connect(self._queue_skip_if_active)
+        self.addAction(skip_action)
+
+        exit_queue_action = QAction(self)
+        exit_queue_action.setShortcut(Qt.Key.Key_Escape)
+        exit_queue_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        exit_queue_action.triggered.connect(self._exit_queue_if_active)
+        self.addAction(exit_queue_action)
+
+    def _queue_accept_if_active(self):
+        """Accept queue item if in queue mode and focus is not in a text field."""
+        if not self.queue_mode:
+            return
+        fw = self.focusWidget()
+        if isinstance(fw, (QLineEdit, QTextEdit, QComboBox)):
+            return  # Let typing work normally
+        self._queue_accept()
+
+    def _queue_skip_if_active(self):
+        """Skip queue item if in queue mode and focus is not in a text field."""
+        if not self.queue_mode:
+            return
+        fw = self.focusWidget()
+        if isinstance(fw, (QLineEdit, QTextEdit, QComboBox)):
+            return
+        self._queue_skip()
+
+    def _exit_queue_if_active(self):
+        """Exit queue if in queue mode."""
+        if self.queue_mode:
+            self._exit_queue_mode()
 
     def _handle_nav(self, delta: int):
         fw = self.focusWidget()
@@ -3421,6 +3816,18 @@ class TrainerWindow(QMainWindow):
         """Apply all filters to in-memory photo list."""
         result = list(enumerate(self.photos))
 
+        # If in queue mode, filter to only queue photos (bypass other filters)
+        if self.queue_mode and self.queue_photo_ids:
+            queue_set = set(self.queue_photo_ids)
+            filtered = []
+            for idx, p in result:
+                if p.get("id") in queue_set:
+                    filtered.append((idx, p))
+            # Sort by queue order (preserve original queue order)
+            id_to_order = {pid: i for i, pid in enumerate(self.queue_photo_ids)}
+            filtered.sort(key=lambda x: id_to_order.get(x[1].get("id"), 999999))
+            return filtered
+
         # Apply species filter
         if hasattr(self, "species_filter_combo"):
             species_flt = self.species_filter_combo.currentData()
@@ -3639,6 +4046,9 @@ class TrainerWindow(QMainWindow):
                 target_item = item
             # Green highlight for reviewed items in AI box review mode
             if self.ai_review_mode and p.get("id") in self.ai_reviewed_photos:
+                item.setBackground(QColor(144, 238, 144))  # Light green
+            # Green highlight for reviewed items in queue mode
+            elif self.queue_mode and p.get("id") in self.queue_reviewed:
                 item.setBackground(QColor(144, 238, 144))  # Light green
 
         self.photo_list_widget.blockSignals(False)
@@ -3887,7 +4297,23 @@ class TrainerWindow(QMainWindow):
             suffix += "V"
         elif auto_suggest:
             suffix += "A"
-        display = f"{label} {suffix}".strip()
+
+        # In queue mode, append the suggestion to the display
+        queue_suffix = ""
+        if self.queue_mode and pid in self.queue_data:
+            data = self.queue_data[pid]
+            if self.queue_type == "species":
+                species = data.get("species", "")
+                conf = data.get("confidence", 0)
+                if species:
+                    queue_suffix = f" — {species} ({conf:.0%})"
+            elif self.queue_type == "sex":
+                sex = data.get("sex", "")
+                conf = data.get("confidence", 0)
+                if sex:
+                    queue_suffix = f" — {sex} ({conf:.0%})"
+
+        display = f"{label} {suffix}{queue_suffix}".strip()
         return display
 
     def _update_photo_list_item(self, idx: int):
@@ -3916,12 +4342,28 @@ class TrainerWindow(QMainWindow):
                 self.load_photo()
                 return
 
-    def _import_files(self, files: List[Path], skip_hash: bool = True, collection: str = "") -> int:
-        """Copy files into the library, add to DB, and build thumbnails."""
+    def _import_files(self, files: List[Path], skip_hash: bool = True, collection: str = "", progress_callback=None) -> int:
+        """Copy files into the library, add to DB, and build thumbnails.
+
+        Args:
+            files: List of file paths to import
+            skip_hash: If True, skip files that match existing hashes
+            collection: Collection/farm name to assign to imported photos
+            progress_callback: Optional callable(current, total, filename) for progress updates.
+                               If it returns False, import is cancelled.
+        """
         if self._known_hashes is None:
             self._known_hashes = self._load_known_hashes()
         imported = 0
-        for file_path in files:
+        total = len(files)
+        for i, file_path in enumerate(files):
+            # Update progress if callback provided
+            if progress_callback:
+                progress_callback(i, total, file_path.name)
+                # Check if cancelled (callback sets self._import_cancelled flag)
+                if hasattr(self, '_import_cancelled') and self._import_cancelled:
+                    break
+
             file_hash = self._hash_file(file_path) if skip_hash else None
             if skip_hash and file_hash and file_hash in self._known_hashes:
                 continue
@@ -4137,16 +4579,71 @@ class TrainerWindow(QMainWindow):
         if not jpg_files:
             QMessageBox.information(self, "No Images", "No JPG/JPEG files found in the selected folder.")
             return
-        reply = QMessageBox.question(
-            self,
-            "Import Photos",
-            f"Found {len(jpg_files)} JPG file(s). Import them?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+
+        # Ask for collection before import
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Import Photos")
+        dialog.setMinimumWidth(350)
+        dlg_layout = QVBoxLayout(dialog)
+
+        dlg_layout.addWidget(QLabel(f"Found {len(jpg_files)} photo(s) in:\n{folder_path.name}"))
+
+        # Collection dropdown
+        collection_layout = QHBoxLayout()
+        collection_layout.addWidget(QLabel("Collection/Farm:"))
+        collection_combo = QComboBox()
+        collection_combo.setEditable(True)
+        collection_combo.setPlaceholderText("Select or type a collection name")
+        existing_collections = self.db.get_distinct_collections()
+        collection_combo.addItems(existing_collections)
+        if existing_collections:
+            collection_combo.setCurrentIndex(0)  # Default to first collection
+        collection_layout.addWidget(collection_combo)
+        dlg_layout.addLayout(collection_layout)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        import_btn = QPushButton("Import")
+        import_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(import_btn)
+        dlg_layout.addLayout(btn_layout)
+
+        cancel_btn.clicked.connect(dialog.reject)
+        import_btn.clicked.connect(dialog.accept)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        imported = self._import_files(jpg_files, skip_hash=skip_dup_checkbox.isChecked())
-        QMessageBox.information(self, "Import", f"Imported {imported} photo(s).")
+
+        selected_collection = collection_combo.currentText().strip()
+
+        # Create progress dialog
+        progress = QProgressDialog("Importing photos...", "Cancel", 0, len(jpg_files), self)
+        progress.setWindowTitle("Import Progress")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        self._import_cancelled = False
+
+        def update_progress(current, total, filename):
+            if progress.wasCanceled():
+                self._import_cancelled = True
+                return
+            progress.setValue(current)
+            progress.setLabelText(f"Importing {current + 1} of {total}:\n{filename}")
+            QApplication.processEvents()
+
+        imported = self._import_files(jpg_files, skip_hash=skip_dup_checkbox.isChecked(), collection=selected_collection, progress_callback=update_progress)
+        progress.setValue(len(jpg_files))
+        progress.close()
+
+        if self._import_cancelled:
+            QMessageBox.information(self, "Import", f"Import cancelled. Imported {imported} photo(s) before cancellation.")
+        else:
+            QMessageBox.information(self, "Import", f"Imported {imported} photo(s).")
+
         if imported:
             self.photos = self._sorted_photos(self.db.get_all_photos())
             self._populate_photo_list()
@@ -4295,8 +4792,31 @@ class TrainerWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        imported = self._import_files(jpg_files, skip_hash=skip_dup_checkbox.isChecked(), collection=selected_collection)
-        QMessageBox.information(self, "Import Complete", f"Imported {imported} photo(s).")
+        # Create progress dialog
+        progress = QProgressDialog("Importing photos...", "Cancel", 0, len(jpg_files), self)
+        progress.setWindowTitle("Import Progress")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        self._import_cancelled = False
+
+        def update_progress(current, total, filename):
+            if progress.wasCanceled():
+                self._import_cancelled = True
+                return
+            progress.setValue(current)
+            progress.setLabelText(f"Importing {current + 1} of {total}:\n{filename}")
+            QApplication.processEvents()
+
+        imported = self._import_files(jpg_files, skip_hash=skip_dup_checkbox.isChecked(), collection=selected_collection, progress_callback=update_progress)
+        progress.setValue(len(jpg_files))
+        progress.close()
+
+        if self._import_cancelled:
+            QMessageBox.information(self, "Import", f"Import cancelled. Imported {imported} photo(s) before cancellation.")
+        else:
+            QMessageBox.information(self, "Import Complete", f"Imported {imported} photo(s).")
+
         if imported:
             self.photos = self._sorted_photos(self.db.get_all_photos())
             self._populate_photo_list()
@@ -5202,6 +5722,359 @@ class TrainerWindow(QMainWindow):
         msg += "\nUse 'Review Buck/Doe Suggestions' to verify."
         QMessageBox.information(self, "Buck/Doe Suggestions", msg)
         self._populate_photo_list()
+
+    # ====== INTEGRATED QUEUE MODE ======
+
+    def _enter_queue_mode(self, queue_type: str, photo_ids: list, data: dict = None, title: str = "Review Queue"):
+        """Enter queue mode with the given photos.
+
+        Args:
+            queue_type: Type of queue ('species', 'sex', 'boxes', etc.)
+            photo_ids: List of photo IDs to include in queue
+            data: Optional dict mapping photo_id to extra data (e.g., suggestions)
+            title: Title to display in queue panel
+        """
+        if not photo_ids:
+            QMessageBox.information(self, title, "No items to review.")
+            return
+
+        # Remember current position
+        if self.photos and self.index < len(self.photos):
+            self.queue_pre_filter_index = self.index
+
+        self.queue_mode = True
+        self.queue_type = queue_type
+        self.queue_photo_ids = list(photo_ids)
+        self.queue_data = data or {}
+        self.queue_reviewed = set()
+
+        # Update queue panel
+        self.queue_title_label.setText(title)
+        self.queue_panel.show()
+
+        # Refresh photo list to show only queue photos
+        self._populate_photo_list()
+
+        # Jump to first photo in queue
+        if self.queue_photo_ids:
+            first_pid = self.queue_photo_ids[0]
+            for i, p in enumerate(self.photos):
+                if p.get("id") == first_pid:
+                    self.index = i
+                    break
+            self.load_photo()
+
+        self._update_queue_ui()
+
+    def _exit_queue_mode(self):
+        """Exit queue mode and return to normal view."""
+        if not self.queue_mode:
+            return
+
+        # Remember current photo to stay on it
+        current_photo_id = None
+        if self.photos and self.index < len(self.photos):
+            current_photo_id = self.photos[self.index].get("id")
+
+        self.queue_mode = False
+        self.queue_type = None
+        self.queue_photo_ids = []
+        self.queue_data = {}
+        self.queue_reviewed = set()
+
+        self.queue_panel.hide()
+
+        # Refresh photo list
+        self._populate_photo_list()
+
+        # Try to stay on the same photo, or return to pre-queue position
+        if current_photo_id:
+            for i, p in enumerate(self.photos):
+                if p.get("id") == current_photo_id:
+                    self.index = i
+                    self.load_photo()
+                    # Select in list
+                    for row in range(self.photo_list_widget.count()):
+                        item = self.photo_list_widget.item(row)
+                        if item.data(Qt.ItemDataRole.UserRole) == i:
+                            self.photo_list_widget.setCurrentItem(item)
+                            break
+                    return
+
+        # Fallback to pre-queue position
+        if self.queue_pre_filter_index < len(self.photos):
+            self.index = self.queue_pre_filter_index
+            self.load_photo()
+
+    def _update_queue_ui(self):
+        """Update the queue panel UI with current state."""
+        if not self.queue_mode:
+            return
+
+        # Count reviewed vs total
+        total = len(self.queue_photo_ids)
+        reviewed = len(self.queue_reviewed)
+        remaining = total - reviewed
+        self.queue_count_label.setText(f"{reviewed} / {total} reviewed ({remaining} remaining)")
+
+        # Get current photo's queue data
+        current_pid = None
+        if self.photos and self.index < len(self.photos):
+            current_pid = self.photos[self.index].get("id")
+
+        if current_pid and current_pid in self.queue_data:
+            data = self.queue_data[current_pid]
+            if self.queue_type == "species":
+                species = data.get("species", "?")
+                conf = data.get("conf", 0)
+                self.queue_suggestion_label.setText(f"Suggested: {species} ({conf:.0%})")
+            elif self.queue_type == "sex":
+                sex = data.get("sex", "?")
+                conf = data.get("conf", 0)
+                self.queue_suggestion_label.setText(f"Suggested: {sex} ({conf:.0%})")
+            else:
+                self.queue_suggestion_label.setText("")
+        else:
+            self.queue_suggestion_label.setText("")
+
+    def _queue_accept(self):
+        """Accept the current suggestion and move to next."""
+        if not self.queue_mode:
+            return
+
+        current_pid = None
+        if self.photos and self.index < len(self.photos):
+            current_pid = self.photos[self.index].get("id")
+
+        if current_pid:
+            # Apply the suggestion based on queue type
+            if self.queue_type == "species" and current_pid in self.queue_data:
+                species = self.queue_data[current_pid].get("species")
+                if species:
+                    self.db.add_tag(current_pid, species)
+                    self.db.set_suggested_tag(current_pid, None, None)
+                    # Mark as reviewed
+                    self.queue_reviewed.add(current_pid)
+                    # Remove from queue
+                    if current_pid in self.queue_photo_ids:
+                        self.queue_photo_ids.remove(current_pid)
+
+            elif self.queue_type == "sex" and current_pid in self.queue_data:
+                sex = self.queue_data[current_pid].get("sex")
+                if sex:
+                    self.db.add_tag(current_pid, sex)
+                    self.db.set_suggested_sex(current_pid, None, None)
+                    self.queue_reviewed.add(current_pid)
+                    if current_pid in self.queue_photo_ids:
+                        self.queue_photo_ids.remove(current_pid)
+
+            # Refresh display
+            self._populate_species_dropdown()
+            self._update_recent_species_buttons()
+            self.load_photo()
+
+        # Move to next or exit if done
+        self._queue_advance()
+
+    def _queue_skip(self):
+        """Skip current photo without accepting suggestion."""
+        if not self.queue_mode:
+            return
+
+        current_pid = None
+        if self.photos and self.index < len(self.photos):
+            current_pid = self.photos[self.index].get("id")
+
+        if current_pid:
+            self.queue_reviewed.add(current_pid)
+
+        self._queue_advance()
+
+    def _queue_advance(self):
+        """Move to next unreviewed photo in queue, or exit if done."""
+        if not self.queue_mode or not self.queue_photo_ids:
+            self._exit_queue_mode()
+            return
+
+        # Refresh the photo list with remaining queue items
+        self._populate_photo_list()
+
+        # Find next unreviewed photo
+        for pid in self.queue_photo_ids:
+            if pid not in self.queue_reviewed:
+                # Find this photo in the list
+                for i, p in enumerate(self.photos):
+                    if p.get("id") == pid:
+                        self.index = i
+                        self.load_photo()
+                        # Select in list
+                        for row in range(self.photo_list_widget.count()):
+                            item = self.photo_list_widget.item(row)
+                            idx = item.data(Qt.ItemDataRole.UserRole)
+                            if idx is not None and self.photos[idx].get("id") == pid:
+                                self.photo_list_widget.setCurrentItem(item)
+                                break
+                        self._update_queue_ui()
+                        return
+
+        # All done
+        reviewed_count = len(self.queue_reviewed)
+        self._exit_queue_mode()
+        QMessageBox.information(self, "Queue Complete", f"Finished reviewing {reviewed_count} photo(s).")
+
+    def review_species_suggestions_integrated(self):
+        """Review species suggestions using integrated queue mode."""
+        pending = self._gather_pending_species_suggestions()
+        if not pending:
+            QMessageBox.information(self, "Species Suggestions", "No pending species suggestions to review.")
+            return
+
+        # Build queue data
+        photo_ids = [p["id"] for p in pending]
+        data = {p["id"]: {"species": p["species"], "conf": p["conf"]} for p in pending}
+
+        self._enter_queue_mode(
+            queue_type="species",
+            photo_ids=photo_ids,
+            data=data,
+            title=f"Species Review ({len(pending)})"
+        )
+
+    # ====== BACKGROUND AI PROCESSING ======
+
+    def run_ai_suggestions_background(self):
+        """Run AI suggestions in background thread with live queue updates."""
+        if self.ai_processing:
+            QMessageBox.information(self, "AI Processing", "AI processing is already running.")
+            return
+
+        if not self.suggester or not self.suggester.ready:
+            QMessageBox.information(self, "AI Model Not Available", "AI model not loaded.")
+            return
+
+        # Get unlabeled photos
+        unlabeled_photos = [p for p in self.photos if not self._photo_has_human_species(p)]
+        if not unlabeled_photos:
+            QMessageBox.information(self, "AI Suggestions", "All photos in current view already have species labels.")
+            return
+
+        # Confirm with user
+        reply = QMessageBox.question(
+            self,
+            "Run AI Suggestions",
+            f"Process {len(unlabeled_photos)} unlabeled photo(s) with AI?\n\n"
+            "Photos will be added to the review queue as they're processed.\n"
+            "You can continue working while AI runs in the background.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Enter queue mode immediately (empty queue, will fill as photos are processed)
+        self.queue_mode = True
+        self.queue_type = "species"
+        self.queue_photo_ids = []
+        self.queue_data = {}
+        self.queue_reviewed = set()
+        if self.photos and self.index < len(self.photos):
+            self.queue_pre_filter_index = self.index
+
+        self.queue_title_label.setText(f"AI Processing (0 / {len(unlabeled_photos)})")
+        self.queue_suggestion_label.setText("Starting AI processing...")
+        self.queue_progress_bar.setRange(0, len(unlabeled_photos))
+        self.queue_progress_bar.setValue(0)
+        self.queue_progress_bar.show()
+        self.queue_panel.show()
+
+        # Create and start worker thread
+        self.ai_processing = True
+        self.ai_worker = AIWorker(
+            photos=unlabeled_photos,
+            db=self.db,
+            suggester=self.suggester,
+            detector_getter=self._get_detector_for_suggestions,
+            parent=self
+        )
+        self.ai_worker.progress.connect(self._on_ai_progress)
+        self.ai_worker.photo_processed.connect(self._on_ai_photo_processed)
+        self.ai_worker.finished_all.connect(self._on_ai_finished)
+        self.ai_worker.error.connect(self._on_ai_error)
+        self.ai_worker.start()
+
+    def _on_ai_progress(self, current: int, total: int, message: str):
+        """Handle progress update from AI worker."""
+        self.queue_progress_bar.setValue(current)
+        self.queue_title_label.setText(f"AI Processing ({current} / {total})")
+        remaining = len(self.queue_photo_ids) - len(self.queue_reviewed)
+        self.queue_count_label.setText(f"{remaining} to review")
+
+    def _on_ai_photo_processed(self, result: dict):
+        """Handle a photo being processed by AI worker."""
+        photo_id = result.get("id")
+        species = result.get("species")
+        conf = result.get("species_conf", 0)
+
+        if photo_id and species:
+            # Add to queue
+            if photo_id not in self.queue_photo_ids:
+                self.queue_photo_ids.append(photo_id)
+                self.queue_data[photo_id] = {
+                    "species": species,
+                    "conf": conf,
+                    "sex": result.get("sex"),
+                    "sex_conf": result.get("sex_conf", 0)
+                }
+
+            # Refresh photo list if in queue mode
+            if self.queue_mode:
+                self._populate_photo_list()
+
+            # Update suggestion label
+            remaining = len(self.queue_photo_ids) - len(self.queue_reviewed)
+            self.queue_count_label.setText(f"{remaining} to review")
+
+            # If this is the first photo, load it
+            if len(self.queue_photo_ids) == 1:
+                for i, p in enumerate(self.photos):
+                    if p.get("id") == photo_id:
+                        self.index = i
+                        self.load_photo()
+                        break
+
+    def _on_ai_finished(self, species_count: int, sex_count: int):
+        """Handle AI processing completion."""
+        self.ai_processing = False
+        self.ai_worker = None
+        self.queue_progress_bar.hide()
+
+        if self.queue_photo_ids:
+            self.queue_title_label.setText(f"Species Review ({len(self.queue_photo_ids)})")
+            self.queue_suggestion_label.setText(f"AI complete: {species_count} species, {sex_count} buck/doe")
+            self._update_queue_ui()
+        else:
+            self._exit_queue_mode()
+            QMessageBox.information(
+                self,
+                "AI Complete",
+                f"Processed {species_count} species suggestion(s).\n"
+                f"Suggested buck/doe for {sex_count} deer photo(s).\n\n"
+                "No photos require review."
+            )
+
+    def _on_ai_error(self, message: str):
+        """Handle AI processing error."""
+        self.ai_processing = False
+        self.ai_worker = None
+        self.queue_progress_bar.hide()
+        QMessageBox.warning(self, "AI Error", f"AI processing failed:\n{message}")
+
+    def stop_ai_processing(self):
+        """Stop background AI processing."""
+        if self.ai_worker and self.ai_processing:
+            self.ai_worker.cancel()
+            self.ai_processing = False
+            self.queue_progress_bar.hide()
+            self.queue_suggestion_label.setText("AI processing cancelled")
 
     def review_species_suggestions(self):
         """Review and approve/reject pending species suggestions with zoomable photo preview."""
@@ -7287,36 +8160,53 @@ class TrainerWindow(QMainWindow):
         self._update_recent_suggest_buttons()
 
     def _recent_species(self, limit: int = 10) -> List[str]:
-        """Return up to `limit` most recently used species (by date_taken)."""
+        """Return up to `limit` most recently used species.
+
+        Prioritizes species applied during this session, then falls back to
+        species by photo date_taken for variety.
+        """
         from datetime import datetime
-        species_dates = {}
-        species_set = set(SPECIES_OPTIONS)
-        try:
-            species_set.update([s for s in self.db.list_custom_species() if s])
-        except Exception:
-            pass
 
-        def parse_dt(val: str):
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                try:
-                    return datetime.strptime(val, fmt)
-                except Exception:
-                    continue
+        # Start with session-applied species (most recently applied first)
+        result = list(self._session_recent_species[:limit])
+
+        # If we need more, fill from database by photo date
+        if len(result) < limit:
+            species_dates = {}
+            species_set = set(SPECIES_OPTIONS)
             try:
-                return datetime.fromisoformat(val)
+                species_set.update([s for s in self.db.list_custom_species() if s])
             except Exception:
-                return None
+                pass
 
-        for photo in self.db.get_all_photos():
-            dt = parse_dt(photo.get("date_taken") or "") or datetime.min
-            tags = set(self.db.get_tags(photo["id"]))
-            for t in tags:
-                if t in species_set and t.lower() not in SEX_TAGS:
-                    if t not in species_dates or dt > species_dates[t]:
-                        species_dates[t] = dt
-        # order by most recent, fallback alphabetic
-        ordered = sorted(species_dates.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
-        return [k for k, _ in ordered[:limit]]
+            def parse_dt(val: str):
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        return datetime.strptime(val, fmt)
+                    except Exception:
+                        continue
+                try:
+                    return datetime.fromisoformat(val)
+                except Exception:
+                    return None
+
+            for photo in self.db.get_all_photos():
+                dt = parse_dt(photo.get("date_taken") or "") or datetime.min
+                tags = set(self.db.get_tags(photo["id"]))
+                for t in tags:
+                    if t in species_set and t.lower() not in SEX_TAGS:
+                        if t not in species_dates or dt > species_dates[t]:
+                            species_dates[t] = dt
+
+            # Add species not already in result
+            ordered = sorted(species_dates.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
+            for species, _ in ordered:
+                if species not in result:
+                    result.append(species)
+                    if len(result) >= limit:
+                        break
+
+        return result[:limit]
 
     def _update_recent_species_buttons(self):
         recents = self._recent_species(limit=10)

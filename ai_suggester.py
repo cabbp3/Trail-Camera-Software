@@ -8,7 +8,17 @@ Models expected at:
   - models/reid.onnx - Deer re-ID embeddings (optional)
 """
 import os
+import sys
 from typing import Optional, Tuple, List
+
+
+def get_resource_path(relative_path: str) -> str:
+    """Get absolute path to resource, works for dev and PyInstaller bundle."""
+    if hasattr(sys, '_MEIPASS'):
+        # Running as PyInstaller bundle
+        return os.path.join(sys._MEIPASS, relative_path)
+    # Running in development
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
 try:
     import onnxruntime as ort
@@ -39,9 +49,9 @@ class SpeciesSuggester:
       - labels.txt alongside the model lists labels in output order.
     """
 
-    def __init__(self, model_path: str = "models/species.onnx", labels_path: str = "models/labels.txt"):
-        self.model_path = model_path
-        self.labels_path = labels_path
+    def __init__(self, model_path: str = None, labels_path: str = None):
+        self.model_path = model_path or get_resource_path("models/species.onnx")
+        self.labels_path = labels_path or get_resource_path("models/labels.txt")
         self.session = None
         self.labels = []
         self.input_size = (224, 224)
@@ -111,9 +121,9 @@ class BuckDoeSuggester:
     Best used on deer_head crops.
     """
 
-    def __init__(self, model_path: str = "models/buckdoe.onnx", labels_path: str = "models/buckdoe_labels.txt"):
-        self.model_path = model_path
-        self.labels_path = labels_path
+    def __init__(self, model_path: str = None, labels_path: str = None):
+        self.model_path = model_path or get_resource_path("models/buckdoe.onnx")
+        self.labels_path = labels_path or get_resource_path("models/buckdoe_labels.txt")
         self.session = None
         self.labels = ["buck", "doe"]
         self._ready = False
@@ -171,8 +181,8 @@ class ReIDSuggester:
     Expects models/reid.onnx that outputs an embedding vector.
     """
 
-    def __init__(self, model_path: str = "models/reid.onnx"):
-        self.model_path = model_path
+    def __init__(self, model_path: str = None):
+        self.model_path = model_path or get_resource_path("models/reid.onnx")
         self.session = None
         self._ready = False
         self.input_size = (224, 224)
