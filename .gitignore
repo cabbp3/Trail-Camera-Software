@@ -55,3 +55,4 @@ outputs/
 # PyInstaller
 *.manifest
 *.spec.bak
+*.backup

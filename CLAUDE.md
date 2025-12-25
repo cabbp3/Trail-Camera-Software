@@ -168,7 +168,44 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ## Resume Next Session
 
-**What was completed (Dec 24, 2024):**
+**What was completed (Dec 24, 2024 - Evening Session):**
+
+1. **Removed CLIP - Simplified Species Classifier**
+   - CLIP was misclassifying 40% of deer as Turkey
+   - Now uses ONLY the ONNX model (trained on user's photos)
+   - ONNX: 100% accuracy on deer vs CLIP's 60%
+   - `ai_suggester.py` reduced from 383 to 254 lines
+   - Removed torch/open_clip dependencies for species classification
+
+2. **GitHub Repository Created**
+   - Repo: https://github.com/cabbp3/Trail-Camera-Software
+   - Initial commit with 59 files
+   - Added `.gitignore` to exclude: .venv, __pycache__, *.db, models/*.onnx, runs/, outputs/, exports/
+
+3. **Empty Suggestion Logic Fixed**
+   - Photos with NO MegaDetector boxes → Auto-suggested as "Empty" (95% confidence)
+   - Photos WITH animal boxes → Classifier runs on cropped area
+   - Empty suggestions appear in review queue for confirmation
+
+4. **AI Suggestion Workflow Clarified**
+   - Re-running suggestions WILL overwrite existing AI suggestions
+   - Human-confirmed tags are preserved (never overwritten)
+   - This is intentional - allows re-running to improve suggestions
+
+**Current AI Flow:**
+1. MegaDetector runs on photo
+2. If no animals detected → Suggest "Empty"
+3. If animals detected → Crop to box, run ONNX classifier
+4. If Deer → Run deer head detection, then buck/doe classifier
+
+**Files Modified:**
+- `ai_suggester.py` - Removed CLIP, simplified to ONNX-only
+- `training/label_tool.py` - Empty suggestion for no-box photos
+- `.gitignore` - Created for GitHub
+
+---
+
+**What was completed (Dec 24, 2024 - Morning Session):**
 
 1. **CuddeLink Collection Prompt** - Downloads now ask for Collection (defaults to "Brooke Farm")
 
@@ -195,23 +232,6 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
    - Prevents contradictory states (animal detected but labeled Empty)
 
 7. **Progress Bar Fix** - Now shows only unlabeled photo count, not total
-
-**Investigation in Progress:**
-- User reported "AI not calling anything deer" after running suggestions
-- Root cause identified: Photos already have human "Deer" tags in `tags` table
-- AI suggestions correctly skip photos with human-applied species tags
-- When we cleared `suggested_tag` field, we didn't clear the `tags` table
-- 52 photos have ai_deer_head boxes but no suggested_tag (because they already have human Deer tags)
-- 50 truly unlabeled photos exist; classifier IS returning "Deer" for some (photo 7560)
-- **Classifier is working correctly** - just most unlabeled photos are Turkey/Coyote/Person
-
-**Decision Needed Next Session:**
-- Should we clear human tags on those 100 photos to let AI re-classify them fresh?
-- Or keep human labels and just let AI run on truly new photos?
-
-**Files Modified:**
-- `training/label_tool.py` - CuddeLink collection, buck buttons, deer head separation, Empty prevention
-- `database.py` - Added `get_all_distinct_tags()` method, increased recent_bucks limit to 12
 
 ---
 

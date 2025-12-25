@@ -4974,19 +4974,28 @@ class TrainerWindow(QMainWindow):
                 was_cancelled = True
                 break
             # Auto-detect boxes if none exist (enables head crops for buck/doe)
-            if self._ensure_detection_boxes(p, detector=detector, names=names):
-                detect_count += 1
+            self._ensure_detection_boxes(p, detector=detector, names=names)
+
+            # Check if MegaDetector found any animals
+            boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
+            has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+
+            if not has_animal_box:
+                # No animals detected by MegaDetector - suggest Empty
+                self.db.set_suggested_tag(p["id"], "Empty", 0.95)
+                species_count += 1
+                continue
+
+            # Has animal boxes - run classifier on crop
+            detect_count += 1
             crop = self._best_crop_for_photo(p)
             path = str(crop) if crop else p.get("file_path")
             res = self.suggester.predict(path)
             if res:
                 label, conf = res
-                # If MegaDetector found animals, don't allow "Empty" label (contradicts detection)
+                # If classifier says Empty but MegaDetector found animals, skip
                 if label == "Empty":
-                    boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
-                    has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
-                    if has_animal_box:
-                        label = None  # Skip - classifier disagrees with detector
+                    label = None  # Skip - classifier disagrees with detector
                 if label:
                     self.db.set_suggested_tag(p["id"], label, conf)
                     species_count += 1
@@ -5065,19 +5074,28 @@ class TrainerWindow(QMainWindow):
                 was_cancelled = True
                 break
             # Auto-detect boxes if none exist (enables head crops for buck/doe)
-            if self._ensure_detection_boxes(p, detector=detector, names=names):
-                detect_count += 1
+            self._ensure_detection_boxes(p, detector=detector, names=names)
+
+            # Check if MegaDetector found any animals
+            boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
+            has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+
+            if not has_animal_box:
+                # No animals detected by MegaDetector - suggest Empty
+                self.db.set_suggested_tag(p["id"], "Empty", 0.95)
+                species_count += 1
+                continue
+
+            # Has animal boxes - run classifier on crop
+            detect_count += 1
             crop = self._best_crop_for_photo(p)
             path = str(crop) if crop else p.get("file_path")
             res = self.suggester.predict(path)
             if res:
                 label, conf = res
-                # If MegaDetector found animals, don't allow "Empty" label (contradicts detection)
+                # If classifier says Empty but MegaDetector found animals, skip
                 if label == "Empty":
-                    boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
-                    has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
-                    if has_animal_box:
-                        label = None  # Skip - classifier disagrees with detector
+                    label = None  # Skip - classifier disagrees with detector
                 if label:
                     self.db.set_suggested_tag(p["id"], label, conf)
                     species_count += 1
