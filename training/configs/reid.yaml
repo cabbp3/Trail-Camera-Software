@@ -1,0 +1,17 @@
+#
+# Deer re-ID (metric learning) config
+#
+csv_path: /path/to/reid/train.csv   # columns: path,deer_id[,season]
+val_csv: /path/to/reid/val.csv
+
+model_name: resnet50
+embedding_dim: 256
+batch: 64
+epochs: 30
+img_size: 224
+lr: 1e-4
+weight_decay: 1e-4
+margin: 0.2
+
+export_onnx: true
+export_path: outputs/reid.onnx

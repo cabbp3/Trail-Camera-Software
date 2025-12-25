@@ -1,0 +1,28 @@
+#
+# YOLO detector config
+#
+train_images: /path/to/your/yolo/train/images
+val_images: /path/to/your/yolo/val/images
+train_labels: /path/to/your/yolo/train/labels
+val_labels: /path/to/your/yolo/val/labels
+
+# Classes (order matters)
+classes:
+  - deer
+  - turkey
+  - coyote
+  - raccoon
+  - empty
+  - person
+  - vehicle
+
+model_name: yolov8n.pt          # ultralytics hub name or path to weights
+epochs: 50
+batch: 16
+img_size: 640
+conf_thres: 0.25
+iou_thres: 0.45
+
+export_onnx: true
+export_path: outputs/detector.onnx
+labels_out: outputs/detector_labels.txt

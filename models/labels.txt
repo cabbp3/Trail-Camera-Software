@@ -1,0 +1,15 @@
+Bobcat
+Coyote
+Deer
+Empty
+Opossum
+Other
+Other Bird
+Other Mammal
+Person
+Quail
+Rabbit
+Raccoon
+Squirrel
+Turkey
+Vehicle

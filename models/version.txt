@@ -1,0 +1,3 @@
+species=1.0
+buckdoe=1.0
+detector=1.0

@@ -1,0 +1,57 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local database (user data - don't commit)
+*.db
+*.db-journal
+
+# Large model files (download separately)
+models/*.onnx
+models/*.pt
+models/*.pth
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Training exports (can be regenerated)
+exports/
+
+# Training runs and outputs (large files)
+runs/
+outputs/
+
+# Model weights (except labels.txt which is small)
+*.pt
+*.pth
+
+# PyInstaller
+*.manifest
+*.spec.bak

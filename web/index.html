@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrailCam Trainer</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Left Panel: Photo List -->
+        <aside class="photo-list-panel">
+            <div class="panel-header">
+                <h2>Photos</h2>
+                <span class="photo-count" id="photo-count">0 photos</span>
+            </div>
+
+            <!-- Filters -->
+            <div class="filters">
+                <select id="location-filter" class="filter-select">
+                    <option value="">All Locations</option>
+                </select>
+                <select id="species-filter" class="filter-select">
+                    <option value="">All Species</option>
+                    <option value="untagged">Untagged</option>
+                    <option value="buck">Buck</option>
+                    <option value="doe">Doe</option>
+                    <option value="fawn">Fawn</option>
+                    <option value="turkey">Turkey</option>
+                    <option value="coyote">Coyote</option>
+                </select>
+                <select id="review-filter" class="filter-select">
+                    <option value="">All Photos</option>
+                    <option value="unreviewed">Needs Review</option>
+                    <option value="reviewed">Reviewed</option>
+                </select>
+            </div>
+
+            <!-- Photo Thumbnails List -->
+            <div class="photo-list" id="photo-list">
+                <!-- Populated by JS -->
+            </div>
+
+            <!-- Bulk Actions -->
+            <div class="bulk-actions">
+                <button class="btn btn-sm" id="select-all-btn">Select All</button>
+                <button class="btn btn-sm" id="clear-selection-btn">Clear</button>
+                <span class="selection-count" id="selection-count">0 selected</span>
+            </div>
+
+            <!-- CuddeLink Button -->
+            <div class="cuddelink-btn-container">
+                <button class="btn btn-accent btn-full" id="cuddelink-btn">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7 10 12 15 17 10"/>
+                        <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    Download from CuddeLink
+                </button>
+            </div>
+        </aside>
+
+        <!-- Center Panel: Image Preview -->
+        <main class="image-panel">
+            <div class="image-header">
+                <div class="image-info">
+                    <span class="filename" id="current-filename">No photo selected</span>
+                    <span class="datetime" id="current-datetime"></span>
+                    <span class="location-badge" id="current-location-badge"></span>
+                </div>
+                <div class="zoom-controls">
+                    <button class="zoom-btn" id="zoom-out">−</button>
+                    <input type="range" id="zoom-slider" min="100" max="500" value="100">
+                    <button class="zoom-btn" id="zoom-in">+</button>
+                    <span class="zoom-level" id="zoom-level">100%</span>
+                    <button class="zoom-btn reset" id="zoom-reset">Fit</button>
+                </div>
+            </div>
+
+            <div class="image-container" id="image-container">
+                <div class="image-wrapper" id="image-wrapper">
+                    <img id="main-image" src="" alt="Trail camera photo">
+                </div>
+                <div class="no-image" id="no-image">
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                        <circle cx="8.5" cy="8.5" r="1.5"/>
+                        <polyline points="21 15 16 10 5 21"/>
+                    </svg>
+                    <p>Select a photo from the list</p>
+                </div>
+                <div class="zoom-hint">Scroll to zoom in, drag to pan when zoomed</div>
+            </div>
+
+            <div class="image-nav">
+                <button class="nav-btn" id="prev-btn">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="15 18 9 12 15 6"/>
+                    </svg>
+                    Prev
+                </button>
+                <span class="nav-position" id="nav-position">0 / 0</span>
+                <button class="nav-btn" id="next-btn">
+                    Next
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="9 18 15 12 9 6"/>
+                    </svg>
+                </button>
+            </div>
+        </main>
+
+        <!-- Right Panel: Labeling Form -->
+        <aside class="form-panel">
+            <div class="panel-header">
+                <h2>Labels</h2>
+                <div class="form-actions-top">
+                    <button class="btn btn-primary btn-sm" id="save-btn">Save</button>
+                    <button class="btn btn-accent btn-sm" id="save-next-btn">Save & Next →</button>
+                </div>
+            </div>
+
+            <div class="form-scroll">
+                <!-- Species Section -->
+                <div class="form-section">
+                    <label class="form-label">Species</label>
+                    <div class="species-buttons" id="species-buttons">
+                        <button class="species-btn" data-species="buck">Buck</button>
+                        <button class="species-btn" data-species="doe">Doe</button>
+                        <button class="species-btn" data-species="fawn">Fawn</button>
+                        <button class="species-btn" data-species="turkey">Turkey</button>
+                        <button class="species-btn" data-species="coyote">Coyote</button>
+                        <button class="species-btn" data-species="other">Other</button>
+                        <button class="species-btn trash" data-species="empty">Empty/Trash</button>
+                    </div>
+                    <div class="current-tags" id="current-species-tags"></div>
+                </div>
+
+                <!-- Sex Section (shown for deer) -->
+                <div class="form-section" id="sex-section">
+                    <label class="form-label">Sex</label>
+                    <div class="sex-buttons">
+                        <button class="sex-btn" data-sex="buck">Buck</button>
+                        <button class="sex-btn" data-sex="doe">Doe</button>
+                        <button class="sex-btn" data-sex="unknown">Unknown</button>
+                    </div>
+                </div>
+
+                <!-- Deer ID Section -->
+                <div class="form-section" id="deer-section">
+                    <label class="form-label">Deer ID</label>
+                    <select id="deer-id-select" class="form-input">
+                        <option value="">Select or type deer ID...</option>
+                    </select>
+                    <div class="recent-bucks">
+                        <label class="form-label-small">Recent Buck IDs</label>
+                        <div class="quick-buck-buttons" id="quick-buck-buttons">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Age & Antlers Section (collapsible) -->
+                <div class="form-section collapsible" id="antler-section">
+                    <button class="collapse-toggle" id="antler-toggle">
+                        Antler Details
+                        <svg class="collapse-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="6 9 12 15 18 9"/>
+                        </svg>
+                    </button>
+                    <div class="collapse-content" id="antler-content">
+                        <div class="form-row">
+                            <label>Age Class</label>
+                            <select id="age-select" class="form-input">
+                                <option value="">Unknown</option>
+                                <option value="1.5">1.5 years</option>
+                                <option value="2.5">2.5 years</option>
+                                <option value="3.5">3.5 years</option>
+                                <option value="4.5">4.5 years</option>
+                                <option value="5.5+">5.5+ years</option>
+                            </select>
+                        </div>
+                        <div class="form-row">
+                            <label>Left Points</label>
+                            <div class="points-input">
+                                <input type="number" id="left-points" class="form-input small" min="0" max="20" placeholder="0">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="left-uncertain"> Uncertain
+                                </label>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <label>Right Points</label>
+                            <div class="points-input">
+                                <input type="number" id="right-points" class="form-input small" min="0" max="20" placeholder="0">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="right-uncertain"> Uncertain
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Camera Location Section -->
+                <div class="form-section">
+                    <label class="form-label">Camera Location</label>
+                    <select id="camera-location-select" class="form-input">
+                        <option value="">Select location...</option>
+                    </select>
+                    <div class="location-quick-buttons" id="location-quick-buttons">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+
+                <!-- Key Characteristics -->
+                <div class="form-section collapsible">
+                    <button class="collapse-toggle" id="char-toggle">
+                        Key Characteristics
+                        <svg class="collapse-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="6 9 12 15 18 9"/>
+                        </svg>
+                    </button>
+                    <div class="collapse-content" id="char-content">
+                        <div class="char-input-row">
+                            <input type="text" id="char-input" class="form-input" placeholder="Add characteristic...">
+                            <button class="btn btn-sm" id="add-char-btn">Add</button>
+                        </div>
+                        <div class="char-tags" id="char-tags">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Notes -->
+                <div class="form-section">
+                    <label class="form-label">Notes</label>
+                    <textarea id="notes-input" class="form-textarea" placeholder="Add notes..."></textarea>
+                </div>
+
+                <!-- Review Status -->
+                <div class="form-section">
+                    <label class="checkbox-label review-checkbox">
+                        <input type="checkbox" id="reviewed-checkbox">
+                        <span>Mark as Reviewed</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Bottom Actions -->
+            <div class="form-bottom-actions">
+                <button class="btn btn-secondary" id="compare-btn">Compare Selected</button>
+                <button class="btn btn-secondary" id="bulk-species-btn">Set Species on Selected</button>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Compare Modal -->
+    <div class="modal" id="compare-modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content compare-content">
+            <button class="modal-close" id="close-compare">&times;</button>
+            <h2>Compare Photos</h2>
+            <div class="compare-grid" id="compare-grid">
+                <!-- Up to 4 photos -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Bulk Species Modal -->
+    <div class="modal" id="bulk-modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content bulk-content">
+            <button class="modal-close" id="close-bulk">&times;</button>
+            <h2>Set Species on Selected Photos</h2>
+            <p class="bulk-count" id="bulk-count">0 photos selected</p>
+            <div class="bulk-species-buttons">
+                <button class="species-btn large" data-species="buck">Buck</button>
+                <button class="species-btn large" data-species="doe">Doe</button>
+                <button class="species-btn large" data-species="fawn">Fawn</button>
+                <button class="species-btn large" data-species="turkey">Turkey</button>
+                <button class="species-btn large" data-species="coyote">Coyote</button>
+                <button class="species-btn large trash" data-species="empty">Empty/Trash</button>
+            </div>
+            <div class="bulk-actions-modal">
+                <button class="btn btn-secondary" id="cancel-bulk">Cancel</button>
+                <button class="btn btn-primary" id="apply-bulk">Apply to Selected</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- CuddeLink Modal -->
+    <div class="modal" id="cuddelink-modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content cuddelink-content">
+            <button class="modal-close" id="close-cuddelink">&times;</button>
+            <h2>Download from CuddeLink</h2>
+
+            <div id="cuddelink-form-container">
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" id="cudde-email" class="form-input" placeholder="your@email.com">
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" id="cudde-password" class="form-input" placeholder="Password">
+                </div>
+                <div class="form-group">
+                    <label>Date Range</label>
+                    <div class="date-range-row">
+                        <input type="date" id="cudde-from" class="form-input">
+                        <span>to</span>
+                        <input type="date" id="cudde-to" class="form-input">
+                    </div>
+                </div>
+                <button class="btn btn-accent btn-full" id="start-cuddelink">Start Download</button>
+            </div>
+
+            <div id="cuddelink-progress-container" style="display: none;">
+                <div class="progress-status">
+                    <div class="progress-icon" id="progress-icon">
+                        <svg class="spinner" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10" stroke-dasharray="60" stroke-dashoffset="20"/>
+                        </svg>
+                    </div>
+                    <span id="progress-message">Starting...</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="cudde-progress-fill"></div>
+                </div>
+                <div class="progress-details" id="progress-details"></div>
+            </div>
+
+            <div id="cuddelink-complete-container" style="display: none;">
+                <div class="complete-icon">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                        <polyline points="22 4 12 14.01 9 11.01"/>
+                    </svg>
+                </div>
+                <p id="complete-message">Download complete!</p>
+                <button class="btn btn-primary" id="cuddelink-done">Done</button>
+            </div>
+
+            <div id="cuddelink-error-container" style="display: none;">
+                <div class="error-icon">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="15" y1="9" x2="9" y2="15"/>
+                        <line x1="9" y1="9" x2="15" y2="15"/>
+                    </svg>
+                </div>
+                <p id="error-message">An error occurred</p>
+                <button class="btn btn-secondary" id="cuddelink-retry">Try Again</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

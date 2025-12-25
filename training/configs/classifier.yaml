@@ -1,0 +1,25 @@
+#
+# Image classification config (species/empty or buck/doe on crops)
+#
+train_dir: /path/to/classifier/train
+val_dir: /path/to/classifier/val
+
+classes:
+  - deer
+  - turkey
+  - coyote
+  - raccoon
+  - empty
+  - person
+  - vehicle
+
+model_name: convnext_tiny
+epochs: 25
+batch: 32
+img_size: 224
+lr: 1e-3
+weight_decay: 1e-4
+
+export_onnx: true
+export_path: outputs/classifier.onnx
+labels_out: outputs/classifier_labels.txt
