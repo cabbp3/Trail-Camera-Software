@@ -1,6 +1,62 @@
 # Trail Camera Software - Project Plan
 
-**Last Updated:** December 24, 2024 (Session 10)
+**Last Updated:** December 26, 2024 (Session 12)
+
+---
+
+## Session 12 Progress (Dec 26, 2024)
+
+**Problem Identified:** Windows computer couldn't sync labels from Supabase because CuddeLink generates unique filenames per download session (like `2025-12-24T21_58_40.934128-1.jpeg`). Mac and Windows had different filenames for the same photos, so the sync key (`original_name|date_taken|camera_model`) didn't match.
+
+**Solution Implemented:** Added `file_hash` (MD5) column for content-based matching.
+
+**Completed:**
+- [X] Added `file_hash` column to local database schema
+- [X] Added `calculate_missing_hashes()` method to database.py
+- [X] Updated `push_to_supabase()` to include file_hash
+- [X] Updated `pull_from_supabase()` to use file_hash as fallback matching
+- [X] Updated `_get_photo_by_key()` to try file_hash when photo_key doesn't match
+- [X] Calculated MD5 hashes for all 4,422 Mac photos
+- [X] Created `windows_fix.py` script for Windows cleanup and hash-based sync
+- [X] Created `supabase_add_file_hash.sql` migration script
+
+**Still TODO (resume here):**
+- [ ] Run `supabase_add_file_hash.sql` in Supabase dashboard to add file_hash columns
+- [ ] Push from Mac to Supabase (will include file hashes)
+- [ ] On Windows: Run `python windows_fix.py` to calculate hashes and pull labels
+
+**Supabase SQL to run:**
+```sql
+ALTER TABLE photos_sync ADD COLUMN IF NOT EXISTS file_hash TEXT;
+ALTER TABLE tags ADD COLUMN IF NOT EXISTS file_hash TEXT;
+ALTER TABLE deer_metadata ADD COLUMN IF NOT EXISTS file_hash TEXT;
+ALTER TABLE deer_additional ADD COLUMN IF NOT EXISTS file_hash TEXT;
+ALTER TABLE annotation_boxes ADD COLUMN IF NOT EXISTS file_hash TEXT;
+CREATE INDEX IF NOT EXISTS idx_photos_sync_file_hash ON photos_sync(file_hash);
+CREATE INDEX IF NOT EXISTS idx_tags_file_hash ON tags(file_hash);
+```
+
+**After running SQL, push from Mac:**
+```bash
+cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0"
+source .venv/bin/activate
+python -c "
+from database import TrailCamDatabase
+import supabase_rest
+db = TrailCamDatabase()
+client = supabase_rest.create_client(
+    'https://iwvehmthbjcvdqjqxtty.supabase.co',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml3dmVobXRoYmpjdmRxanF4dHR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjYyMDI0NDQsImV4cCI6MjA4MTc3ODQ0NH0._z6WAfUBP_Qda0IcjTS_LEI_J7r147BrmSib3dyneLE'
+)
+db.push_to_supabase(client)
+"
+```
+
+**On Windows:**
+```cmd
+cd "C:\Users\mbroo\OneDrive\Desktop\Trail Camera Software V 1.0"
+python windows_fix.py
+```
 
 ---
 
@@ -29,380 +85,59 @@ This software is intended to become a **marketable product** for hunters and wil
 
 ## Current Status Summary
 
-- **~2,100+ photos** in the database (313 new from CuddeLink)
-- **1,622 photos** with camera location assigned via OCR (~90%)
-- **~1,275 buck/doe labeled** photos (997 buck, 278 doe)
-- **Buck/doe model** retrained with 2.3x more data (93.8% balanced accuracy)
-- **Species model** using simplified 5 categories (Deer, Empty, Turkey, Other Mammal, Other)
-- **3 AI models** deployed (species classifier, object detector, buck/doe classifier)
-- **Windows version** running (partially - see below)
-
-## Resume Next Session
-
-**Where we left off (Dec 24, 2024 - Night):**
-
-1. **Integrated Queue Mode** - COMPLETED
-   - Review queues now filter main photo list (no modal dialogs)
-   - Full labeling tools available during queue review
-   - Accept (A), Skip (S), Exit buttons in queue panel
-   - Suggestion shown in photo list: "12/25/2024 — Deer (95%)"
-   - **KNOWN ISSUE:** Performance is slow - needs optimization
-
-2. **Background AI Processing** - COMPLETED
-   - `AIWorker` QThread class processes photos in background
-   - Photos appear in queue as processed
-   - Menu: Tools → Suggest Tags (AI) — Background + Live Queue
-
-3. **Session-Based Recent Species** - COMPLETED
-   - Quick buttons update immediately when species applied
-
-**To resume:**
-1. Open app: `cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0" && source .venv/bin/activate && python3 main.py`
-2. Consider profiling queue mode to find performance bottlenecks
+- **4,422 photos** in the database (all with file hashes calculated)
+- **macOS** standalone build working
+- **Windows** standalone build working (run windows_fix.py for sync)
+- **Supabase cloud sync** working via REST API with hash-based matching
+- **Species model:** 12 classes, 96.3% accuracy
+- **Buck/doe model:** 93.8% balanced accuracy
+- **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
 
 ---
 
-**Previous (Dec 20, 2024):**
-- Windows version working with `python main.py`
-- Supabase sync fixed - using REST API (no C++ dependencies)
+## Session 11 Progress (Dec 25, 2024)
 
-**What works on Windows:**
-- App launches and runs
-- Photo import
-- Photo tagging
-- CuddeLink download
-- All core features
+**Windows Standalone Build:**
+- [X] Created BUILD.bat, RUN.bat, Create Desktop Shortcut.vbs
+- [X] Created icon.ico for Windows
+- [X] Fixed Python version issue (must use 3.11, not 3.14)
+- [X] Fixed missing database columns (`collection`, `left_ab_points_max`, `right_ab_points_max`)
+- [ ] Complete build (McAfee blocking .exe - needs folder exclusion)
+- [ ] Test standalone .exe on Windows
 
-**What doesn't work on Windows (yet):**
-- Supabase cloud sync (missing package)
-
-**Feature request noted:**
-- CuddeLink date range option (currently only downloads last 7 days)
-- Ask for camera location on photo import (complex when importing from multiple locations at once - may need to skip location assignment during bulk import)
-- Ask for Collection/Farm on photo import (which network of cameras the photos came from)
-
-**Pending features (todo list):**
-1. ~~**Export/Import Labels to Excel**~~ **DONE**
-2. ~~**Simple/Advanced Mode toggle**~~ **DONE**
-3. ~~**Fix CuddeLink auto-download**~~ **DONE**
-4. ~~**Photo list sorting**~~ **DONE**
-5. ~~**Supabase cloud sync**~~ **DONE on Mac** (Windows needs supabase package fix)
-6. ~~**Desktop app icon**~~ **DONE**
-7. ~~**Windows compatibility**~~ **PARTIAL** (app works, cloud sync pending)
-8. Batch editing by date range (for camera moves)
-9. ~~CuddeLink duplicate prevention~~ **DONE** (skips already-imported by filename)
-10. ~~CuddeLink date range selector~~ **DONE** (download more than 7 days)
+**Future Improvements:**
+- [ ] Code signing certificate (prevents antivirus false positives)
+- [ ] GitHub Actions for automated Windows/macOS builds
 
 ---
 
-## Session Log
+## Pending Tasks
 
-### December 21, 2024 (Session 9 - Evening)
-**What we did:**
-
-**Part 1: SD Card Import Improvements**
-- Added "Import from SD Card..." menu option (File menu)
-- Auto-detects mounted drives and shows photo counts
-- Added Collection/Farm dropdown to import dialog
-- Added `collection` parameter to database and import pipeline
-
-**Part 2: Tightwad House Import**
-- Imported 1,167 photos from SD card
-- Assigned all to "Tightwad House" collection
-- Fixed timestamps (+21h 46m offset - camera clock was wrong)
-- Ran AI species suggestions on new photos
-
-**Part 3: AI Progress Bars**
-- Added progress bars to "Suggest Tags (AI)" functions
-- Shows "Processing photo X of Y" with species/buck-doe counts
-- Fixed bug where "Cancelled" showed even on successful completion
-
-**Part 4: Species Review Queue Improvements**
-- Added box display to species review queue
-- Boxes drawn with 4px thick lines (yellow=AI, magenta=heads, green=manual)
-
-**Part 5: New Labeling Queue**
-- Added "Label Photos with Boxes (No Suggestion)..." to Tools menu
-- Shows photos with AI boxes but no species suggestion
-- Accept Boxes (A) - keep boxes and advance
-- Delete Boxes (D) - remove bad boxes and advance
-- Species quick buttons for fast labeling
-
-**Future items added to PLAN.md:**
-- Timestamp correction overlay (#12)
-- AI suggestions optimization (#13)
-- Background AI processing (#14)
-- GitHub setup (High Priority #4)
-- Remove Excel features (High Priority #5)
+- [ ] Complete Windows standalone build
+- [ ] Batch editing by date range (for camera moves)
+- [ ] Queue mode performance optimization
+- [ ] Deer head detection training (need more head boxes)
 
 ---
 
-### December 19, 2024 (Session 7)
-**What we did:**
+## Key Technical Notes
 
-**Part 1: Desktop App Icon Fix**
-- Fixed TrailCam Trainer.app launcher - was using wrong Python path
-- App now launches via Terminal (workaround for macOS security/permissions)
-- Added custom icon from ChatGPT deer image (`ChatGPT Image Dec 5, 2025, 07_07_24 PM.png`)
-- Icon converted to .icns and added to app bundle
+### Camera Location via OCR
+- Photos have timestamp watermarks with location names
+- Regex: `r'[AP]M\s+(.+?)\s+\d{3}'` extracts location text
+- OCR mappings for variations: "WB27" → "WB 27", "SALTLICKE" → "Salt Lick"
+- Date-based mappings for camera moves: "WEST OF ROAD" before Oct 25 = "West Salt Lick", after = "West Triangle"
 
-**Part 2: Photo List Sorting**
-- Added Sort dropdown to filter row (next to Year filter)
-- Options: Date (Newest), Date (Oldest), Location, Species, Deer ID
-- Sorting applied in `_filtered_photos()` method
+### Database Schema Additions
+- `stamp_location` - Raw OCR text from photo timestamp
+- `camera_location` - Verified location name
+- `sites` table - Site clustering results
+- `annotation_boxes` - Detection boxes from AI
 
-**Part 3: Supabase Cloud Sync**
-- Created Supabase account and project
-- Project URL: `https://iwvehmthbjcvdqjqxtty.supabase.co`
-- Created `supabase_setup.sql` with all table definitions
-- Added `supabase` to requirements.txt
-- Added sync methods to `database.py`:
-  - `push_to_supabase()` - uploads all labels to cloud
-  - `pull_from_supabase()` - downloads labels from cloud
-- Added UI to `training/label_tool.py`:
-  - Settings → Setup Supabase Cloud... (credentials dialog)
-  - File → Push to Cloud... (upload labels)
-  - File → Pull from Cloud... (download labels)
-- Photos matched across computers by `original_name|date_taken|camera_model` key
-
-**Tables synced to Supabase:**
-- `photos_sync` - photo identifiers (not file paths)
-- `tags` - species labels
-- `deer_metadata` - primary deer per photo
-- `deer_additional` - secondary deer
-- `buck_profiles` - deer profiles
-- `buck_profile_seasons` - per-season stats
-- `annotation_boxes` - bounding boxes
-
-**Awaiting user action:**
-- Run `supabase_setup.sql` in Supabase SQL Editor to create tables
-- Enter credentials in app and test connection
-
----
-
-### December 18, 2024 (Session 6)
-**What we did:**
-
-**Part 1: Simple/Advanced Mode Toggle**
-- Added Settings → Simple Mode toggle
-- Simple Mode hides:
-  - AI suggestion buttons and labels
-  - Box annotation tools
-  - Training/export buttons (Export CSVs, Retrain Model)
-  - Antler details section
-  - Key characteristics fields
-  - Bulk operations (Merge Buck IDs, Set Species on Selected)
-  - Review queue buttons
-  - AI-related Tools menu items
-- Simple Mode keeps visible:
-  - Photo list with location filter
-  - Image viewer with zoom
-  - Species dropdown and quick buttons
-  - Buck/Doe/Unknown buttons
-  - Deer ID and Age class
-  - Camera location
-  - Notes
-  - Navigation (Prev/Next, Save)
-
-**Part 2: Excel Export/Import (Multi-Computer Workflow)**
-- Added File → Export Labels to Excel
-  - Exports: filename, date_taken, camera_model, species, sex, deer_id, age_class, camera_location, notes, full_path
-  - Creates .xlsx file for sharing
-- Added File → Import Labels from Excel
-  - Matches photos by filename
-  - Imports species, sex (buck/doe), deer_id, age_class, camera_location, notes
-  - Shows progress and import summary
-- Added openpyxl to requirements.txt
-
-**How the multi-computer workflow works:**
-1. Main computer runs full app and labels photos
-2. Export labels to Excel (File → Export Labels to Excel)
-3. Share Excel file with other team members
-4. Other computers import their photos, then import the Excel file
-5. Labels are matched by filename and applied automatically
-
-**Part 3: Year Filter (Antler Year)**
-- Added Year filter dropdown to filter photos by antler year
-- Antler year runs May-April (e.g., photos from May 2024 - April 2025 = "2024-2025")
-- Displays as "YYYY-YYYY" format with photo counts
-- Newest years shown first in dropdown
-
-**Part 4: CuddeLink Auto-Download**
-- Added File → Setup CuddeLink Credentials dialog
-  - Enter email and password for CuddeLink account
-  - Test Connection button to verify credentials work
-  - Credentials saved locally using Qt settings
-- Updated File → Download from CuddeLink
-  - Prompts to set up credentials if not saved
-  - Shows progress while downloading
-  - Automatically imports downloaded photos
-- Removed dependency on environment variables (CUDDE_USER/CUDDE_PASS)
-- Fixed token extraction for ASP.NET login (regex patterns updated)
-- Fixed photo ID extraction (hidden input parsing)
-- Added date range filter (defaults to Dec 11, 2025 to today)
-  - Solves issue where only last 3 days were being downloaded
-  - Successfully downloads all 271 photos in date range
-
-**Part 5: UI Polish**
-- Removed "(for training)" from Species label
-- Fixed Hide Details button to actually hide the details panel
-- Show Details button now larger and more visible when panel is hidden
-
----
-
-### December 17, 2024 (Session 5)
-**What we did:**
-
-**Part 1: Camera Location via OCR (Major Feature)**
-- Pivoted from visual clustering to OCR-based location extraction
-- Trail camera photos have timestamp watermarks with location names
-- Used pytesseract to read text from photo stamps
-- Regex pattern extracts location: `r'[AP]M\s+(.+?)\s+\d{3}'`
-- Successfully assigned 1,622 of 1,803 photos (~90%)
-
-**OCR mappings implemented:**
-- Raw stamp variations mapped to canonical names:
-  - "WB27", "WB 27", "WB 27." → "WB 27"
-  - "RAYSLINE", "RAYS LINE" → "Ray's Line"
-  - "SALTLICKE", "SALT LICK E" → "Salt Lick"
-- Date-based mappings for camera moves:
-  - "WEST OF ROAD" before Oct 25, 2024 → "West Salt Lick"
-  - "WEST OF ROAD" on/after Oct 25, 2024 → "West Triangle"
-
-**Part 2: UI Improvements**
-- Merged "Site" and "Camera Location" into single "Camera Location" field
-- Added quick-select buttons for fast location assignment
-- Fixed location filter dropdown (was using old site_id system, now uses camera_location strings)
-- Green highlighting for reviewed items in queues
-
-**Database changes:**
-- Added `stamp_location` column - stores raw OCR text
-- `camera_location` field now stores verified location name
-
-**Key files:**
-- `training/label_tool.py` - UI changes, OCR logic, filter fixes
-- `site_clustering.py` - Visual clustering code (kept but OCR proved more reliable)
-
-**Why OCR approach won:**
-- Camera stamps are consistent (same camera = same stamp)
-- Works across lighting conditions (day/night)
-- Handles deer/objects blocking background
-- Date-based mappings handle camera moves elegantly
-
----
-
-### December 17, 2024 (Session 4)
-**What we did:**
-
-**Part 1: Integrated detection into classification pipeline**
-- AI suggestions now auto-run detector if no boxes exist
-- Buck/doe classifier uses head crops automatically
-- Detection boxes saved with confidence scores
-
-**Part 2: Auto Site Detection (NEW FEATURE)**
-- Built automatic camera site detection using image similarity clustering
-- Photos from the same camera location are grouped together automatically
-- Uses ResNet18 embeddings + DBSCAN clustering
-
-**How it works:**
-1. Go to **Tools → Auto-Detect Sites**
-2. App extracts visual features from each photo (trees, horizon, structures)
-3. Photos with similar backgrounds are clustered together
-4. Sites are created automatically (Site 1, Site 2, etc.)
-5. Rename sites to meaningful names (e.g., "North Feeder", "Creek Crossing")
-
-**New files:**
-- `site_clustering.py` - Embedding extraction and clustering algorithm
-
-**Database changes:**
-- Added `sites` table (id, name, description, representative_photo_id)
-- Added `photo_embeddings` table (stores visual features for clustering)
-- Added `site_id` column to photos table
-- Added site management methods
-
-**UI additions:**
-- Site filter dropdown in main window (filter photos by site)
-- Tools → Auto-Detect Sites (runs clustering)
-- Tools → Manage Sites (rename, delete, view photos by site)
-
-**Why this matters:**
-- No more manually tagging camera locations
-- Automatically organize 1,800+ photos by site
-- Foundation for site-specific background models (future)
-- Works for any customer's photos - no pre-training needed
-
----
-
-### December 16, 2024 (Session 3)
-**What we did:**
-- Retrained buck/doe model with 1,275 photos (was 551) - 2.3x more data
-  - Buck: 997 photos, Doe: 277 photos
-  - Final accuracy: Buck 90.6%, Doe 97.1%, Balanced 93.8%
-- Fixed zoom in review windows to match main window behavior:
-  - Ctrl+scroll to zoom (regular scroll pans)
-  - Double-click toggles fit/100%
-  - Pinch gesture for trackpad
-  - Drag mode auto-enabled when zoomed in
-- Added filters to buck/doe review dialog:
-  - Type filter: All / Buck / Doe
-  - Confidence filter: All / ≥90% / ≥80% / ≥70% / <70%
-  - Date filter: All / specific dates
-- Fixed bug: photos tagged as non-deer species (Rabbit, Turkey, etc.) now excluded from buck/doe review
-- Added to buck/doe review:
-  - Unknown (U) button - marks as unknown without tagging
-  - Properties (P) button - navigates to photo in main window
-  - Green highlighting for reviewed items (like species review)
-  - Suggestions cleared from DB only when dialog closes
-- Changed button labels from "Accept as Buck/Doe" to just "Buck/Doe"
-- Reran buck/doe model on 870 deer photos that had Unknown sex
-
-**Files changed:**
-- `training/label_tool.py` - Major updates to review_sex_suggestions():
-  - Added filter controls (sex, confidence, date)
-  - Changed reviewed tracking to use photo IDs instead of row indices
-  - Added Unknown and Properties buttons
-  - Fixed zoom behavior to match main window
-  - Added green highlighting for reviewed items
-  - Fixed _gather_pending_sex_suggestions() to exclude non-deer species
-  - Added date field to pending items
-- `preview_window.py` - Fixed QComboBox method calls (textChanged → currentTextChanged, text() → currentText())
-- `models/buckdoe.onnx` - Retrained with 1,275 photos
-
-**Key insight for future:**
-- Buck/doe model currently uses full photos
-- Need deer head detector + head crops for:
-  - Better buck/doe accuracy (antlers are on head)
-  - Antler point counting
-  - Antler measurement
-  - Individual deer re-ID
-
----
-
-### December 16, 2024 (Session 2)
-**What we did:**
-- Fixed labels.txt again (was still corrupted with partial entries like "Bob", "C", "Opp")
-- Added VALID_SPECIES protection in two places:
-  - `training/label_tool.py` - Only writes approved species to labels.txt
-  - `ai_suggester.py` - Filters out invalid labels when loading, rejects invalid predictions
-- Cleared bad AI suggestions from database (187 photos had junk labels)
-- Re-ran AI on 237 unlabeled photos with fixed labels
-- Added MPS (Apple Metal GPU) support to training script for 5-10x faster training
-- Retrained species model with simplified 5 categories:
-  - Deer, Empty, Turkey, Other Mammal, Other
-- Fixed multi-species tagging in species review dialog
-- Added zoom improvements and trackpad support
-
----
-
-### December 16, 2024 (Session 1)
-**What we did:**
-- Fixed labels.txt corruption (had junk entries like "VeriTION", partial names)
-- Fixed spelling: Oppossum → Opossum in database and labels
-- Changed all "Verification" tags to "Empty" (84 photos)
-- Re-ran AI species suggestions with corrected labels (921 photos)
-- Added AI rejection tracking for future model training
-- Added sort dropdown to species review dialog
-- Improved species review UX with green highlighting
+### Supabase Tables
+- `photos_sync`, `tags`, `deer_metadata`, `deer_additional`
+- `buck_profiles`, `buck_profile_seasons`, `annotation_boxes`
+- Photos matched by `original_name|date_taken|camera_model` key
 
 ---
 
@@ -605,8 +340,8 @@ Key capabilities needed:
 
 | Platform | App Type | Status | Priority |
 |----------|----------|--------|----------|
-| macOS | Standalone .app | Partial (runs via Python) | High |
-| Windows | Standalone .exe | Partial (needs C++ fix) | High |
+| macOS | Standalone .app | Done | High |
+| Windows | Standalone .exe | Done | High |
 | Android | Native/Flutter app | Not started | Medium |
 | iPhone | Native/Flutter app | Not started | Medium |
 | Web | Browser app | Not started | Medium |
@@ -686,7 +421,8 @@ This means the current Supabase integration is foundational for all future platf
 
 **Start the app:**
 ```bash
-cd /Users/brookebratcher/Desktop/Trail\ Camera\ Software
+cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0"
+source .venv/bin/activate
 python main.py
 ```
 
@@ -697,10 +433,8 @@ python main.py
 - AI suggester: `ai_suggester.py`
 
 **Current model stats:**
-- Species: 5 categories (Deer, Empty, Turkey, Other Mammal, Other)
-- Buck/Doe: 93.8% balanced accuracy (trained on 1,275 photos)
-  - Buck: 90.6% (997 training photos)
-  - Doe: 97.1% (277 training photos)
+- Species: 12 classes, 96.3% accuracy
+- Buck/Doe: 93.8% balanced accuracy
 
 **Database Quick Checks:**
 ```bash

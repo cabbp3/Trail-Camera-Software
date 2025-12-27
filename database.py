@@ -66,7 +66,9 @@ class TrailCamDatabase:
                 site_id INTEGER,
                 suggested_site_id INTEGER,
                 suggested_site_confidence REAL,
-                stamp_location TEXT
+                stamp_location TEXT,
+                collection TEXT DEFAULT '',
+                file_hash TEXT
             )
         """)
         
@@ -236,6 +238,8 @@ class TrailCamDatabase:
         add_column("suggested_sex", "suggested_sex TEXT", "")
         add_column("suggested_sex_confidence", "suggested_sex_confidence REAL", None)
         add_column("site_id", "site_id INTEGER", None)  # Auto-detected site
+        add_column("collection", "collection TEXT", "")  # Photo collection grouping
+        add_column("file_hash", "file_hash TEXT", None)  # MD5 hash for cross-computer sync
         # Custom species list table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS custom_species (
@@ -271,7 +275,9 @@ class TrailCamDatabase:
             add_column(table, "left_points_uncertain", "left_points_uncertain INTEGER DEFAULT 0")
             add_column(table, "right_points_uncertain", "right_points_uncertain INTEGER DEFAULT 0")
             add_column(table, "left_ab_points_min", "left_ab_points_min INTEGER")
+            add_column(table, "left_ab_points_max", "left_ab_points_max INTEGER")
             add_column(table, "right_ab_points_min", "right_ab_points_min INTEGER")
+            add_column(table, "right_ab_points_max", "right_ab_points_max INTEGER")
             add_column(table, "left_ab_points_uncertain", "left_ab_points_uncertain INTEGER DEFAULT 0")
             add_column(table, "right_ab_points_uncertain", "right_ab_points_uncertain INTEGER DEFAULT 0")
             add_column(table, "abnormal_points_min", "abnormal_points_min INTEGER")
@@ -1542,6 +1548,61 @@ class TrailCamDatabase:
         self.conn.commit()
 
     # ─────────────────────────────────────────────────────────────────────
+    # File Hash Methods (for cross-computer sync)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _calculate_file_hash(self, file_path: str) -> Optional[str]:
+        """Calculate MD5 hash of a file."""
+        import hashlib
+        try:
+            h = hashlib.md5()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    def calculate_missing_hashes(self, progress_callback=None) -> int:
+        """Calculate file hashes for photos that don't have one.
+
+        Args:
+            progress_callback: Optional callable(current, total) for progress updates
+
+        Returns:
+            Number of hashes calculated
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, file_path FROM photos WHERE file_hash IS NULL")
+        rows = cursor.fetchall()
+
+        count = 0
+        total = len(rows)
+        for i, row in enumerate(rows):
+            if progress_callback:
+                progress_callback(i, total)
+
+            file_path = row[1]
+            if file_path and os.path.exists(file_path):
+                file_hash = self._calculate_file_hash(file_path)
+                if file_hash:
+                    cursor.execute("UPDATE photos SET file_hash = ? WHERE id = ?",
+                                   (file_hash, row[0]))
+                    count += 1
+
+        self.conn.commit()
+        return count
+
+    def get_hash_stats(self) -> Dict[str, int]:
+        """Get stats about file hashes in the database."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM photos")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM photos WHERE file_hash IS NOT NULL")
+        with_hash = cursor.fetchone()[0]
+        return {"total": total, "with_hash": with_hash, "missing": total - with_hash}
+
+    # ─────────────────────────────────────────────────────────────────────
     # Supabase Sync Methods
     # ─────────────────────────────────────────────────────────────────────
 
@@ -1552,22 +1613,42 @@ class TrailCamDatabase:
         camera_model = photo.get("camera_model") or ""
         return f"{original_name}|{date_taken}|{camera_model}"
 
-    def _get_photo_by_key(self, photo_key: str) -> Optional[Dict]:
-        """Find a local photo by its sync key."""
-        parts = photo_key.split("|")
-        if len(parts) != 3:
-            return None
-        original_name, date_taken, camera_model = parts
+    def _get_photo_by_key(self, photo_key: str, file_hash: str = None) -> Optional[Dict]:
+        """Find a local photo by its sync key, with fallback to file_hash."""
         cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT * FROM photos
-            WHERE original_name = ? AND date_taken = ? AND camera_model = ?
-        """, (original_name, date_taken, camera_model))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+
+        # First try matching by the full photo_key
+        parts = photo_key.split("|")
+        if len(parts) == 3:
+            original_name, date_taken, camera_model = parts
+            cursor.execute("""
+                SELECT * FROM photos
+                WHERE original_name = ? AND date_taken = ? AND camera_model = ?
+            """, (original_name, date_taken, camera_model))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+
+        # Fallback: try matching by file_hash (for CuddeLink photos with different filenames)
+        if file_hash:
+            cursor.execute("SELECT * FROM photos WHERE file_hash = ?", (file_hash,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+
+        return None
 
     def push_to_supabase(self, supabase_client) -> Dict[str, int]:
         """Push all local data to Supabase using batch operations. Returns counts of items pushed."""
+        # Ensure all required columns exist before syncing (handles old databases)
+        self._ensure_deer_columns()
+
+        # Calculate file hashes for photos that don't have one (for cross-computer matching)
+        hash_stats = self.get_hash_stats()
+        if hash_stats["missing"] > 0:
+            print(f"Calculating file hashes for {hash_stats['missing']} photos...")
+            self.calculate_missing_hashes()
+
         from datetime import datetime
         counts = {"photos": 0, "tags": 0, "deer_metadata": 0, "deer_additional": 0,
                   "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0}
@@ -1592,6 +1673,7 @@ class TrailCamDatabase:
             photo_key = self._make_photo_key(photo)
             photos_data.append({
                 "photo_key": photo_key,
+                "file_hash": photo.get("file_hash"),  # For cross-computer matching
                 "original_name": photo.get("original_name"),
                 "date_taken": photo.get("date_taken"),
                 "camera_model": photo.get("camera_model"),
@@ -1607,7 +1689,7 @@ class TrailCamDatabase:
         # Push tags
         print("Syncing tags...")
         cursor.execute("""
-            SELECT t.tag_name, p.original_name, p.date_taken, p.camera_model
+            SELECT t.tag_name, p.original_name, p.date_taken, p.camera_model, p.file_hash
             FROM tags t
             JOIN photos p ON t.photo_id = p.id
         """)
@@ -1616,6 +1698,7 @@ class TrailCamDatabase:
             photo_key = f"{row['original_name']}|{row['date_taken']}|{row['camera_model']}"
             tags_data.append({
                 "photo_key": photo_key,
+                "file_hash": row["file_hash"],
                 "tag_name": row["tag_name"],
                 "updated_at": now
             })
@@ -1625,7 +1708,7 @@ class TrailCamDatabase:
         # Push deer_metadata
         print("Syncing deer metadata...")
         cursor.execute("""
-            SELECT d.*, p.original_name, p.date_taken, p.camera_model
+            SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
             FROM deer_metadata d
             JOIN photos p ON d.photo_id = p.id
         """)
@@ -1635,6 +1718,7 @@ class TrailCamDatabase:
             photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
             deer_meta_data.append({
                 "photo_key": photo_key,
+                "file_hash": d.get("file_hash"),
                 "deer_id": d.get("deer_id"),
                 "age_class": d.get("age_class"),
                 "left_points_min": d.get("left_points_min"),
@@ -1659,7 +1743,7 @@ class TrailCamDatabase:
         # Push deer_additional
         print("Syncing additional deer...")
         cursor.execute("""
-            SELECT d.*, p.original_name, p.date_taken, p.camera_model
+            SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
             FROM deer_additional d
             JOIN photos p ON d.photo_id = p.id
         """)
@@ -1669,6 +1753,7 @@ class TrailCamDatabase:
             photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
             deer_add_data.append({
                 "photo_key": photo_key,
+                "file_hash": d.get("file_hash"),
                 "deer_id": d.get("deer_id"),
                 "age_class": d.get("age_class"),
                 "left_points_min": d.get("left_points_min"),
@@ -1734,7 +1819,7 @@ class TrailCamDatabase:
         # Push annotation_boxes - clear and re-insert
         print("Syncing annotation boxes...")
         cursor.execute("""
-            SELECT b.*, p.original_name, p.date_taken, p.camera_model
+            SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
             FROM annotation_boxes b
             JOIN photos p ON b.photo_id = p.id
         """)
@@ -1744,6 +1829,7 @@ class TrailCamDatabase:
             photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
             boxes_data.append({
                 "photo_key": photo_key,
+                "file_hash": d.get("file_hash"),
                 "label": d.get("label"),
                 "x1": d.get("x1"),
                 "y1": d.get("y1"),
@@ -1766,6 +1852,9 @@ class TrailCamDatabase:
 
     def pull_from_supabase(self, supabase_client) -> Dict[str, int]:
         """Pull data from Supabase and update local database. Returns counts."""
+        # Ensure all required columns exist before syncing (handles old databases)
+        self._ensure_deer_columns()
+
         counts = {"photos": 0, "tags": 0, "deer_metadata": 0, "deer_additional": 0,
                   "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0}
 
@@ -1774,7 +1863,7 @@ class TrailCamDatabase:
         # Pull photos_sync - update local photo metadata
         result = supabase_client.table("photos_sync").select("*").execute()
         for row in result.data:
-            photo = self._get_photo_by_key(row["photo_key"])
+            photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
                 cursor.execute("""
                     UPDATE photos SET
@@ -1788,7 +1877,7 @@ class TrailCamDatabase:
         # Pull tags
         result = supabase_client.table("tags").select("*").execute()
         for row in result.data:
-            photo = self._get_photo_by_key(row["photo_key"])
+            photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
                 cursor.execute("""
                     INSERT OR IGNORE INTO tags (photo_id, tag_name) VALUES (?, ?)
@@ -1798,7 +1887,7 @@ class TrailCamDatabase:
         # Pull deer_metadata
         result = supabase_client.table("deer_metadata").select("*").execute()
         for row in result.data:
-            photo = self._get_photo_by_key(row["photo_key"])
+            photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
                 cursor.execute("""
                     INSERT OR REPLACE INTO deer_metadata
@@ -1820,7 +1909,7 @@ class TrailCamDatabase:
         # Pull deer_additional
         result = supabase_client.table("deer_additional").select("*").execute()
         for row in result.data:
-            photo = self._get_photo_by_key(row["photo_key"])
+            photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo and row.get("deer_id"):
                 cursor.execute("""
                     INSERT OR REPLACE INTO deer_additional
