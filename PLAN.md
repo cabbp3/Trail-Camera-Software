@@ -58,6 +58,18 @@ cd "C:\Users\mbroo\OneDrive\Desktop\Trail Camera Software V 1.0"
 python windows_fix.py
 ```
 
+**Other TODO:**
+- [ ] Commit Windows build from KEXIN SSD to GitHub
+
+**Future Discussion: Web Interface**
+Consider building a web-based frontend (HTML/JS) that works on any device:
+- Could use Supabase directly from browser
+- No platform-specific builds needed
+- Would work on phones/tablets too
+- Options: view-only vs full editing vs hybrid approach
+- Desktop app could remain for SD card imports and local AI
+- Web app for viewing, labeling, buck profiles from anywhere
+
 ---
 
 ## Timestamp Corrections Needed
