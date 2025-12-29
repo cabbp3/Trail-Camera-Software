@@ -240,6 +240,7 @@ class TrailCamDatabase:
         add_column("site_id", "site_id INTEGER", None)  # Auto-detected site
         add_column("collection", "collection TEXT", "")  # Photo collection grouping
         add_column("file_hash", "file_hash TEXT", None)  # MD5 hash for cross-computer sync
+        add_column("archived", "archived INTEGER DEFAULT 0", 0)  # Hide from default view
         # Custom species list table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS custom_species (
@@ -1212,20 +1213,31 @@ class TrailCamDatabase:
     def search_photos(self, tag: Union[str, List[str]] = None, deer_id: str = None,
                      age_class: Union[str, List[str]] = None, season_year: Union[int, List[int], None] = None,
                      date_from: str = None, date_to: str = None, camera_location: Optional[str] = None,
-                     suggested_tag: Union[str, List[str], None] = None) -> List[Dict]:
+                     suggested_tag: Union[str, List[str], None] = None,
+                     include_archived: bool = False, archived_only: bool = False) -> List[Dict]:
         """Search photos by various criteria.
-        
+
+        Args:
+            include_archived: If True, include archived photos in results
+            archived_only: If True, only return archived photos
+
         Returns:
             List of photo dictionaries
         """
         cursor = self.conn.cursor()
         query = """
             SELECT DISTINCT p.id, p.file_path, p.original_name, p.date_taken,
-                   p.camera_model, p.thumbnail_path, p.favorite, p.notes, p.season_year, p.camera_location, p.key_characteristics, p.suggested_tag, p.suggested_confidence, p.suggested_sex, p.suggested_sex_confidence, p.site_id, p.suggested_site_id, p.suggested_site_confidence, p.collection
+                   p.camera_model, p.thumbnail_path, p.favorite, p.notes, p.season_year, p.camera_location, p.key_characteristics, p.suggested_tag, p.suggested_confidence, p.suggested_sex, p.suggested_sex_confidence, p.site_id, p.suggested_site_id, p.suggested_site_confidence, p.collection, p.archived
             FROM photos p
         """
         conditions = []
         params = []
+
+        # Archive filtering
+        if archived_only:
+            conditions.append("p.archived = 1")
+        elif not include_archived:
+            conditions.append("(p.archived IS NULL OR p.archived = 0)")
         
         if tag:
             query += " INNER JOIN tags t ON p.id = t.photo_id"
@@ -1328,6 +1340,31 @@ class TrailCamDatabase:
     def delete_photo(self, photo_id: int):
         """Alias for remove_photo for API compatibility."""
         self.remove_photo(photo_id)
+
+    def archive_photo(self, photo_id: int):
+        """Archive a photo (hide from default view but don't delete)."""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE photos SET archived = 1 WHERE id = ?", (photo_id,))
+        self.conn.commit()
+
+    def unarchive_photo(self, photo_id: int):
+        """Unarchive a photo (restore to default view)."""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE photos SET archived = 0 WHERE id = ?", (photo_id,))
+        self.conn.commit()
+
+    def archive_photos(self, photo_ids: List[int]):
+        """Archive multiple photos."""
+        cursor = self.conn.cursor()
+        for pid in photo_ids:
+            cursor.execute("UPDATE photos SET archived = 1 WHERE id = ?", (pid,))
+        self.conn.commit()
+
+    def get_archived_count(self) -> int:
+        """Get count of archived photos."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM photos WHERE archived = 1")
+        return cursor.fetchone()[0]
 
     # ========== Site Management ==========
 

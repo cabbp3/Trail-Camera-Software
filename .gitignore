@@ -56,3 +56,6 @@ outputs/
 *.manifest
 *.spec.bak
 *.backup
+
+# Archived/deprecated code
+archive/

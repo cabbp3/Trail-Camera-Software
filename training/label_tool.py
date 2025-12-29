@@ -788,6 +788,9 @@ class TrainerWindow(QMainWindow):
         # Session-based recently applied species (for quick buttons)
         self._session_recent_species = []  # Species applied this session, most recent first
 
+        # Photos marked for comparison (easier than Ctrl+Click)
+        self.marked_for_compare = set()  # Set of photo IDs
+
         self.scene = QGraphicsScene()
         self.view = AnnotatableView()
         self.view.setScene(self.scene)
@@ -1044,9 +1047,9 @@ class TrainerWindow(QMainWindow):
         form.addRow("", self.bulk_container)
         form.addRow(self.add_buck_toggle)
         form.addRow(self.add_buck_container)
-        quick_container = QWidget()
-        quick_container.setLayout(quick_grid)
-        form.addRow("", quick_container)
+        self.quick_buck_container = QWidget()
+        self.quick_buck_container.setLayout(quick_grid)
+        form.addRow("", self.quick_buck_container)
         # Box tools (split into two rows to avoid crowding)
         box_row_top = QHBoxLayout()
         box_row_bottom = QHBoxLayout()
@@ -1167,6 +1170,15 @@ class TrainerWindow(QMainWindow):
         self.export_btn.clicked.connect(self.export_csvs)
         self.compare_btn = QPushButton("Compare Selected")
         self.compare_btn.clicked.connect(self.compare_selected)
+        # Mark for Compare feature - easier than Ctrl+Click
+        self.mark_compare_btn = QPushButton("Mark (M)")
+        self.mark_compare_btn.setToolTip("Mark current photo for comparison (keyboard: M)")
+        self.mark_compare_btn.clicked.connect(self.toggle_mark_for_compare)
+        self.compare_marked_btn = QPushButton("Compare Marked (0)")
+        self.compare_marked_btn.setToolTip("Compare all marked photos")
+        self.compare_marked_btn.clicked.connect(self.compare_marked_photos)
+        self.clear_marks_btn = QPushButton("Clear Marks")
+        self.clear_marks_btn.clicked.connect(self.clear_marked_photos)
         self.priority_btn = QPushButton("Label Next (priority)")
         self.priority_btn.clicked.connect(self.prioritize_for_labeling)
         self.suggest_review_btn = QPushButton("Suggest & Review")
@@ -1198,6 +1210,9 @@ class TrainerWindow(QMainWindow):
         nav.addWidget(self.save_next_btn)
         nav.addWidget(self.export_btn)
         nav.addWidget(self.compare_btn)
+        nav.addWidget(self.mark_compare_btn)
+        nav.addWidget(self.compare_marked_btn)
+        nav.addWidget(self.clear_marks_btn)
         nav.addWidget(self.priority_btn)
         nav.addWidget(self.suggest_review_btn)
         nav.addWidget(self.review_queue_btn)
@@ -1287,6 +1302,13 @@ class TrainerWindow(QMainWindow):
         self.sort_combo.addItem("Species", "species")
         self.sort_combo.addItem("Deer ID", "deer_id")
         self.sort_combo.currentIndexChanged.connect(self._populate_photo_list)
+        # Archive filter
+        self.archive_filter_combo = QComboBox()
+        self.archive_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.archive_filter_combo.addItem("Active Photos", "active")
+        self.archive_filter_combo.addItem("Archived", "archived")
+        self.archive_filter_combo.addItem("All Photos", "all")
+        self.archive_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
         self._populate_species_filter_options()
         self._populate_sex_filter_options()
         self._populate_deer_id_filter_options()
@@ -1321,12 +1343,26 @@ class TrainerWindow(QMainWindow):
         filter_row3.addWidget(QLabel("Sort:"))
         filter_row3.addWidget(self.sort_combo, 1)
 
+        filter_row4 = QHBoxLayout()
+        filter_row4.setSpacing(4)
+        filter_row4.addWidget(QLabel("Show:"))
+        filter_row4.addWidget(self.archive_filter_combo, 1)
+        self.archive_btn = QPushButton("Archive")
+        self.archive_btn.setToolTip("Archive selected photo(s) - hides from default view")
+        self.archive_btn.clicked.connect(self.archive_current_photo)
+        self.unarchive_btn = QPushButton("Unarchive")
+        self.unarchive_btn.setToolTip("Restore archived photo(s) to default view")
+        self.unarchive_btn.clicked.connect(self.unarchive_current_photo)
+        filter_row4.addWidget(self.archive_btn)
+        filter_row4.addWidget(self.unarchive_btn)
+
         filter_layout.addLayout(filter_row1)
         filter_layout.addLayout(filter_row2)
         filter_layout.addLayout(filter_row3)
+        filter_layout.addLayout(filter_row4)
 
-        filter_row_container = QWidget()
-        filter_row_container.setLayout(filter_layout)
+        self.filter_row_container = QWidget()
+        self.filter_row_container.setLayout(filter_layout)
         self._populate_site_filter_options()
 
         # Queue control panel (hidden by default, shown when in queue mode)
@@ -1402,7 +1438,7 @@ class TrainerWindow(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
-        left_layout.addWidget(filter_row_container)
+        left_layout.addWidget(self.filter_row_container)
         left_layout.addWidget(self.queue_panel)
         left_layout.addWidget(self.photo_list_widget, 1)
         self._populate_photo_list()
@@ -1458,11 +1494,6 @@ class TrainerWindow(QMainWindow):
         cudde_setup_action.triggered.connect(self.setup_cuddelink_credentials)
         cudde_status_action = file_menu.addAction("Check CuddeLink Status...")
         cudde_status_action.triggered.connect(self.check_cuddelink_status)
-        file_menu.addSeparator()
-        export_labels_action = file_menu.addAction("Export Labels to Excel...")
-        export_labels_action.triggered.connect(self.export_labels_to_excel)
-        import_labels_action = file_menu.addAction("Import Labels from Excel...")
-        import_labels_action.triggered.connect(self.import_labels_from_excel)
         file_menu.addSeparator()
         push_cloud_action = file_menu.addAction("Push to Cloud...")
         push_cloud_action.triggered.connect(self.push_to_cloud)
@@ -2101,6 +2132,9 @@ class TrainerWindow(QMainWindow):
         if self.queue_mode:
             self._update_queue_ui()
 
+        # Update mark button state for current photo
+        self._update_mark_button_state()
+
         self._loading_photo_data = False  # Done loading, allow auto-advance
 
     def save_current(self):
@@ -2376,6 +2410,18 @@ class TrainerWindow(QMainWindow):
         exit_queue_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         exit_queue_action.triggered.connect(self._exit_queue_if_active)
         self.addAction(exit_queue_action)
+
+        # Mark for compare shortcut (M key)
+        mark_action = QAction(self)
+        mark_action.setShortcut(Qt.Key.Key_M)
+        mark_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        mark_action.triggered.connect(self._mark_if_not_typing)
+        self.addAction(mark_action)
+
+    def _mark_if_not_typing(self):
+        """Toggle mark for compare if not typing in a field."""
+        if not self._is_typing_in_field():
+            self.toggle_mark_for_compare()
 
     def _is_typing_in_field(self) -> bool:
         """Check if user is typing in a text field (should ignore hotkeys)."""
@@ -2935,194 +2981,6 @@ class TrainerWindow(QMainWindow):
 
         QMessageBox.information(self, "Exported", f"Wrote:\n{cls_path}\n{reid_path}")
 
-    def export_labels_to_excel(self):
-        """Export all photo labels to an Excel file for sharing between computers.
-
-        Exports: filename, date_taken, camera_model, species, sex (buck/doe),
-        deer_id, age_class, camera_location, notes.
-        """
-        import pandas as pd
-        from pathlib import Path as P
-
-        if not self.photos:
-            QMessageBox.warning(self, "Export", "No photos to export.")
-            return
-
-        # Ask for save location
-        default_name = "trailcam_labels.xlsx"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Labels to Excel", default_name,
-            "Excel Files (*.xlsx);;All Files (*)"
-        )
-        if not file_path:
-            return
-
-        # Collect data
-        rows = []
-        for photo in self.photos:
-            pid = photo["id"]
-            path = P(photo.get("file_path", ""))
-            tags = self.db.get_tags(pid)
-            deer_meta = self.db.get_deer_metadata(pid) or {}
-
-            # Extract species (non-sex tags)
-            species_tags = [t for t in tags if t.lower() not in ("buck", "doe", "unknown")]
-            species = ", ".join(species_tags) if species_tags else ""
-
-            # Extract sex
-            sex = ""
-            if "Buck" in tags:
-                sex = "Buck"
-            elif "Doe" in tags:
-                sex = "Doe"
-
-            rows.append({
-                "filename": path.name,
-                "date_taken": photo.get("date_taken", ""),
-                "camera_model": photo.get("camera_model", ""),
-                "species": species,
-                "sex": sex,
-                "deer_id": deer_meta.get("deer_id", ""),
-                "age_class": deer_meta.get("age_class", ""),
-                "camera_location": photo.get("camera_location", ""),
-                "notes": photo.get("notes", ""),
-                # Include full path as reference (won't be used for matching)
-                "full_path": str(path),
-            })
-
-        df = pd.DataFrame(rows)
-
-        try:
-            df.to_excel(file_path, index=False, engine="openpyxl")
-            labeled_count = len([r for r in rows if r["species"] or r["sex"] or r["deer_id"]])
-            QMessageBox.information(
-                self, "Export Complete",
-                f"Exported {len(rows)} photos to:\n{file_path}\n\n"
-                f"{labeled_count} photos have labels."
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"Failed to export:\n{e}")
-
-    def import_labels_from_excel(self):
-        """Import labels from an Excel file, matching by filename.
-
-        Matches photos by filename and applies labels. If a photo already has
-        labels, you can choose to skip or overwrite.
-        """
-        import pandas as pd
-        from pathlib import Path as P
-
-        # Ask for file to import
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Import Labels from Excel", "",
-            "Excel Files (*.xlsx *.xls);;All Files (*)"
-        )
-        if not file_path:
-            return
-
-        try:
-            df = pd.read_excel(file_path, engine="openpyxl")
-        except Exception as e:
-            QMessageBox.critical(self, "Import Error", f"Failed to read Excel file:\n{e}")
-            return
-
-        # Check required columns
-        required = ["filename"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            QMessageBox.warning(
-                self, "Import Error",
-                f"Excel file is missing required columns: {missing}\n\n"
-                "Required: filename\n"
-                "Optional: species, sex, deer_id, age_class, camera_location, notes"
-            )
-            return
-
-        # Build filename -> photo mapping
-        photo_by_filename = {}
-        for photo in self.photos:
-            fname = P(photo.get("file_path", "")).name
-            if fname:
-                photo_by_filename[fname] = photo
-
-        # Process imports
-        matched = 0
-        updated = 0
-        skipped = 0
-
-        progress = QProgressDialog("Importing labels...", "Cancel", 0, len(df), self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-
-        for idx, row in df.iterrows():
-            if progress.wasCanceled():
-                break
-            progress.setValue(idx)
-
-            filename = str(row.get("filename", "")).strip()
-            if not filename or filename not in photo_by_filename:
-                skipped += 1
-                continue
-
-            photo = photo_by_filename[filename]
-            pid = photo["id"]
-            matched += 1
-
-            # Get values from Excel (handle NaN)
-            species = str(row.get("species", "")) if pd.notna(row.get("species")) else ""
-            sex = str(row.get("sex", "")) if pd.notna(row.get("sex")) else ""
-            deer_id = str(row.get("deer_id", "")) if pd.notna(row.get("deer_id")) else ""
-            age_class = str(row.get("age_class", "")) if pd.notna(row.get("age_class")) else ""
-            location = str(row.get("camera_location", "")) if pd.notna(row.get("camera_location")) else ""
-            notes = str(row.get("notes", "")) if pd.notna(row.get("notes")) else ""
-
-            # Build tag list
-            tags = []
-            if species:
-                # Handle comma-separated species
-                for s in species.split(","):
-                    s = s.strip()
-                    if s:
-                        tags.append(s)
-            if sex and sex.lower() in ("buck", "doe"):
-                tags.append(sex.title())
-
-            # Apply tags
-            if tags:
-                self.db.set_tags(pid, tags)
-
-            # Apply deer metadata
-            if deer_id or age_class:
-                self.db.set_deer_metadata(pid, deer_id.strip(), age_class.strip())
-
-            # Apply location and notes
-            cursor = self.db.conn.cursor()
-            if location or notes:
-                cursor.execute(
-                    "UPDATE photos SET camera_location = COALESCE(?, camera_location), "
-                    "notes = COALESCE(?, notes) WHERE id = ?",
-                    (location or None, notes or None, pid)
-                )
-            self.db.conn.commit()
-
-            updated += 1
-
-        progress.setValue(len(df))
-
-        # Refresh UI
-        self.photos = self._sorted_photos(self.db.get_all_photos())
-        self._populate_photo_list()
-        if self.photos:
-            self.load_photo()
-
-        QMessageBox.information(
-            self, "Import Complete",
-            f"Imported labels from Excel:\n\n"
-            f"Rows in file: {len(df)}\n"
-            f"Matched photos: {matched}\n"
-            f"Updated: {updated}\n"
-            f"Skipped (no match): {skipped}"
-        )
-
     @staticmethod
     def _sorted_photos(photos: list) -> list:
         """Sort photos by date_taken (ascending), fallback to file_path."""
@@ -3323,8 +3181,11 @@ class TrainerWindow(QMainWindow):
     def _toggle_simple_mode(self, enabled: bool):
         """Toggle between Simple Mode and Advanced Mode.
 
-        Simple Mode hides AI features, training tools, and complex annotation options.
-        Shows only: photo browsing, basic tagging, species, buck/doe, deer ID, location, notes.
+        Simple Mode hides AI/training features but keeps core labeling tools:
+        - KEEPS: thumbnails, filters, species, buck/doe, deer ID, location,
+                 key characteristics, quick buck buttons, additional bucks
+        - HIDES: AI suggestions, box annotation, antler point counting,
+                 training tools, bulk operations, raw tags
         """
         self.simple_mode = enabled
         show_advanced = not enabled
@@ -3333,9 +3194,9 @@ class TrainerWindow(QMainWindow):
         mode_str = " (Simple Mode)" if enabled else ""
         self.setWindowTitle(f"TrailCam Trainer{mode_str}")
 
-        # --- Hide/show UI elements ---
+        # --- Elements HIDDEN in Simple Mode ---
 
-        # Box annotation tools
+        # Box annotation tools (AI feature)
         self.box_container_top.setVisible(show_advanced)
         self.box_container_bottom.setVisible(show_advanced)
 
@@ -3344,40 +3205,30 @@ class TrainerWindow(QMainWindow):
         self.sex_suggest_label.setVisible(show_advanced)
         self.apply_sex_suggest_btn.setVisible(show_advanced)
 
-        # Antler details toggle (hide the toggle, container follows)
+        # Antler point counting (complex)
         self.antler_toggle.setVisible(show_advanced)
         if enabled:
             self.antler_container.setVisible(False)
 
-        # Tags row (comma-separated tags)
+        # Raw tags field (technical)
         self.tags_edit.setVisible(show_advanced)
 
-        # Key characteristics - keep visible in simple mode
-
-        # Bulk operations container (merge, bulk buck, profile buttons)
+        # Bulk operations (merge, bulk assign)
         self.bulk_container.setVisible(show_advanced)
 
-        # Additional buck toggle and container
-        self.add_buck_toggle.setVisible(show_advanced)
-        if enabled:
-            self.add_buck_container.setVisible(False)
-
-        # Navigation buttons (hide advanced ones)
+        # Training/AI navigation buttons
         self.export_btn.setVisible(show_advanced)
-        self.compare_btn.setVisible(show_advanced)
         self.priority_btn.setVisible(show_advanced)
         self.suggest_review_btn.setVisible(show_advanced)
         self.review_queue_btn.setVisible(show_advanced)
         self.exit_review_btn.setVisible(show_advanced)
         self.retrain_btn.setVisible(show_advanced)
-        self.select_all_btn.setVisible(show_advanced)
-        self.clear_sel_btn.setVisible(show_advanced)
         self.bulk_species_btn.setVisible(show_advanced)
 
-        # Suggestion filter in left panel
+        # AI suggestion filter in left panel
         self.suggest_filter_combo.setVisible(show_advanced)
 
-        # Menu items
+        # AI/training menu items
         for action in self.advanced_menu_actions:
             action.setVisible(show_advanced)
 
@@ -3893,6 +3744,26 @@ class TrainerWindow(QMainWindow):
             filtered.sort(key=lambda x: id_to_order.get(x[1].get("id"), 999999))
             return filtered
 
+        # Apply archive filter
+        if hasattr(self, "archive_filter_combo"):
+            archive_flt = self.archive_filter_combo.currentData()
+            if archive_flt == "active":
+                # Show only non-archived photos (default)
+                result = [(idx, p) for idx, p in result if not p.get("archived")]
+            elif archive_flt == "archived":
+                # Show only archived photos
+                result = [(idx, p) for idx, p in result if p.get("archived")]
+            # "all" shows everything, no filter needed
+
+        # In Simple Mode, hide "Empty" photos (treat like archived)
+        if self.simple_mode:
+            filtered = []
+            for idx, p in result:
+                tags = set(self.db.get_tags(p["id"]))
+                if "Empty" not in tags:
+                    filtered.append((idx, p))
+            result = filtered
+
         # Apply species filter
         if hasattr(self, "species_filter_combo"):
             species_flt = self.species_filter_combo.currentData()
@@ -4175,6 +4046,77 @@ class TrainerWindow(QMainWindow):
         dlg = CompareWindow(photo_ids=photo_ids, db=self.db, parent=self)
         dlg.exec()
 
+    def toggle_mark_for_compare(self):
+        """Toggle mark on current photo for comparison."""
+        if not self.photos or self.index < 0 or self.index >= len(self.photos):
+            return
+        photo_id = self.photos[self.index].get("id")
+        if not photo_id:
+            return
+        if photo_id in self.marked_for_compare:
+            self.marked_for_compare.discard(photo_id)
+        else:
+            if len(self.marked_for_compare) >= 4:
+                QMessageBox.information(self, "Mark Limit", "Maximum 4 photos can be marked for comparison.")
+                return
+            self.marked_for_compare.add(photo_id)
+        self._update_mark_button_state()
+        self._update_photo_list_marks()
+
+    def compare_marked_photos(self):
+        """Open compare window with all marked photos."""
+        if len(self.marked_for_compare) < 2:
+            QMessageBox.information(self, "Compare", "Mark at least 2 photos first (press M or click 'Mark').")
+            return
+        photo_ids = list(self.marked_for_compare)[:4]
+        dlg = CompareWindow(photo_ids=photo_ids, db=self.db, parent=self)
+        dlg.exec()
+
+    def clear_marked_photos(self):
+        """Clear all photos marked for comparison."""
+        self.marked_for_compare.clear()
+        self._update_mark_button_state()
+        self._update_photo_list_marks()
+
+    def _update_mark_button_state(self):
+        """Update mark button text and styling based on current photo and count."""
+        count = len(self.marked_for_compare)
+        self.compare_marked_btn.setText(f"Compare Marked ({count})")
+        # Check if current photo is marked
+        if self.photos and 0 <= self.index < len(self.photos):
+            photo_id = self.photos[self.index].get("id")
+            if photo_id and photo_id in self.marked_for_compare:
+                self.mark_compare_btn.setText("Unmark (M)")
+                self.mark_compare_btn.setStyleSheet("background-color: #4a8; color: white;")
+            else:
+                self.mark_compare_btn.setText("Mark (M)")
+                self.mark_compare_btn.setStyleSheet("")
+        else:
+            self.mark_compare_btn.setText("Mark (M)")
+            self.mark_compare_btn.setStyleSheet("")
+
+    def _update_photo_list_marks(self):
+        """Update photo list to show which photos are marked."""
+        for row in range(self.photo_list_widget.count()):
+            item = self.photo_list_widget.item(row)
+            if not item:
+                continue
+            idx = item.data(Qt.ItemDataRole.UserRole)
+            if idx is None or idx >= len(self.photos):
+                continue
+            photo_id = self.photos[idx].get("id")
+            text = item.text()
+            # Remove existing mark indicator
+            if text.startswith("★ "):
+                text = text[2:]
+            # Add mark indicator if marked
+            if photo_id and photo_id in self.marked_for_compare:
+                item.setText("★ " + text)
+                item.setBackground(QColor(60, 100, 60))  # Subtle green
+            else:
+                item.setText(text)
+                item.setBackground(QColor(0, 0, 0, 0))  # Transparent
+
     def select_all_photos(self):
         """Select all photos in the list."""
         self.photo_list_widget.blockSignals(True)
@@ -4185,6 +4127,68 @@ class TrainerWindow(QMainWindow):
     def clear_selection(self):
         """Clear list selection."""
         self.photo_list_widget.clearSelection()
+
+    def archive_current_photo(self):
+        """Archive the current photo or selected photos."""
+        selected = self.photo_list_widget.selectedItems()
+        if selected and len(selected) > 1:
+            # Archive multiple selected photos
+            photo_ids = []
+            for item in selected:
+                idx = item.data(Qt.ItemDataRole.UserRole)
+                if idx is not None and idx < len(self.photos):
+                    pid = self.photos[idx].get("id")
+                    if pid:
+                        photo_ids.append(pid)
+            if photo_ids:
+                self.db.archive_photos(photo_ids)
+                # Update in-memory data
+                for p in self.photos:
+                    if p.get("id") in photo_ids:
+                        p["archived"] = 1
+                self._populate_photo_list()
+                QMessageBox.information(self, "Archived", f"Archived {len(photo_ids)} photos.")
+        elif self.photos and 0 <= self.index < len(self.photos):
+            # Archive single current photo
+            photo = self.photos[self.index]
+            pid = photo.get("id")
+            if pid:
+                self.db.archive_photo(pid)
+                photo["archived"] = 1
+                self._populate_photo_list()
+                # Move to next photo if available
+                if self.index < len(self.photos) - 1:
+                    self.next_photo()
+
+    def unarchive_current_photo(self):
+        """Unarchive the current photo or selected photos."""
+        selected = self.photo_list_widget.selectedItems()
+        if selected and len(selected) > 1:
+            # Unarchive multiple selected photos
+            photo_ids = []
+            for item in selected:
+                idx = item.data(Qt.ItemDataRole.UserRole)
+                if idx is not None and idx < len(self.photos):
+                    pid = self.photos[idx].get("id")
+                    if pid:
+                        photo_ids.append(pid)
+            if photo_ids:
+                for pid in photo_ids:
+                    self.db.unarchive_photo(pid)
+                # Update in-memory data
+                for p in self.photos:
+                    if p.get("id") in photo_ids:
+                        p["archived"] = 0
+                self._populate_photo_list()
+                QMessageBox.information(self, "Unarchived", f"Restored {len(photo_ids)} photos.")
+        elif self.photos and 0 <= self.index < len(self.photos):
+            # Unarchive single current photo
+            photo = self.photos[self.index]
+            pid = photo.get("id")
+            if pid:
+                self.db.unarchive_photo(pid)
+                photo["archived"] = 0
+                self._populate_photo_list()
 
     def _select_range(self, start: int, end: int):
         if self.photo_list_widget.count() == 0:
