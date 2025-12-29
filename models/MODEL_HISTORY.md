@@ -8,7 +8,7 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 
 | Model | Version | File | Last Updated |
 |-------|---------|------|--------------|
-| Species Classifier | 2.0 | species.onnx | Dec 21, 2024 |
+| Species Classifier | 3.0 | species.onnx | Dec 28, 2024 |
 | Buck/Doe Classifier | 1.0 | buckdoe.onnx | Dec 2024 |
 | Object Detector | 1.0 | detector.onnx | Dec 2024 |
 
@@ -17,6 +17,19 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 ## Version History
 
 ### Species Classifier (species.onnx)
+
+#### v3.0 (December 28, 2024)
+- **Training data**: 3,155 samples (2,682 train + 473 val) with bounding boxes, crops extracted on-the-fly
+- **Classes**: 12 individual species - Bobcat, Coyote, Deer, Fox, House Cat, Opossum, Person, Rabbit, Raccoon, Squirrel, Turkey, Vehicle
+- **Architecture**: ResNet18 pretrained, fine-tuned, 50 epochs
+- **Accuracy**: 97.0% overall (Deer 99%, Turkey 99%, Squirrel 96%, Raccoon 100%, Opossum 94%, Rabbit 100%, Person 100%)
+- **Training**: `train_species_crops.py` - crops from bounding boxes, no saved crop files
+- **Changes from v2.0**:
+  - Kept all 12 species separate (no grouping into Other_Mammal/Other)
+  - Excluded rare species with <5 samples (Dog, Quail, Armadillo, Chipmunk, Skunk, Ground Hog, Flicker, Turkey Buzzard, Other Bird)
+  - Increased training epochs from 15 to 50
+  - No "Other" class - AI suggests "Unknown" for uncertain predictions
+- **Notes**: Backed up v2.0 as species.onnx.backup_v2
 
 #### v2.0 (December 21, 2024)
 - **Training data**: 1,634 photos with bounding boxes, crops extracted on-the-fly

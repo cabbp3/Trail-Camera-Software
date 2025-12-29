@@ -6,6 +6,86 @@ Progressive improvement of AI models in 5 stages, where each stage builds on the
 
 ---
 
+## AI Pipeline Order of Operations
+
+Each photo flows through the AI pipeline in this order:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  1. SUBJECT DETECTION                                                   │
+│     - Run MegaDetector/detector on photo                                │
+│     - Output: Bounding boxes around animals                             │
+│     - If NO boxes found → Species = "Empty" (skip remaining steps)      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  2. SPECIES IDENTIFICATION                                              │
+│     - Run species classifier on each subject crop                       │
+│     - Output: Species tag (Deer, Turkey, Other_Mammal, Other)           │
+│     - Human labels override AI suggestions                              │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+                        (Only if Species = Deer)
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  3. DEER HEAD DETECTION                                                 │
+│     - Run deer head detector on Deer photos                             │
+│     - Output: Bounding box around deer head                             │
+│     - Prerequisite for buck/doe classification                          │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+                        (Only if head box exists)
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  4. BUCK/DOE CLASSIFICATION                                             │
+│     - Run buck/doe classifier on deer head crop                         │
+│     - Output: Buck, Doe, or Unknown                                     │
+│     - Uses head crop for better antler visibility                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+                          (Only if Buck)
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  5. ANTLER ANALYSIS (Future - Bucks only)                               │
+│     - Antler point counting (left/right, typical/abnormal)              │
+│     - Antler measurements (spread, beam length, tine lengths)           │
+│     - B&C score estimation (rough category or keypoint-based)           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  6. BODY CHARACTERISTICS (Future - TBD placement)                       │
+│     - May run on ALL deer photos (not just bucks)                       │
+│     - Age estimation from body proportions                              │
+│     - Body condition scoring                                            │
+│     - Individual deer re-identification                                 │
+│     - Placement in pipeline TBD - could branch after Step 3 or 4        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Rules
+- **No boxes = Empty**: If subject detection finds nothing, mark as Empty
+- **ai_person = Person**: MegaDetector person detection auto-suggests Person (no classifier needed)
+- **ai_vehicle = Vehicle**: MegaDetector vehicle detection auto-suggests Vehicle (no classifier needed)
+- **ai_animal = Run classifier**: Only animal detections go through species classifier
+- **Boxes + uncertain = Unknown**: If boxes exist but classifier can't identify species
+- **"Other" is manual-only**: AI never suggests "Other" (converts to Unknown)
+- **Train only on photos WITH boxes**: Photos without boxes excluded from training
+- **Deer triggers head detection**: Any photo with Deer (AI or human label) is eligible
+- **Head crops for buck/doe**: Classification accuracy improves with head-only crops
+- **Human labels always override**: AI suggestions are just suggestions
+
+### Current Status
+| Step | Model | Status |
+|------|-------|--------|
+| 1. Subject Detection | MegaDetector v5 | ✅ Working |
+| 2. Species ID | species.onnx v2.0 | ✅ Working (96.7%) |
+| 3. Deer Head Detection | - | ⚠️ Need 500+ labeled heads |
+| 4. Buck/Doe | buckdoe.onnx v1.0 | ✅ Working (93.8%), needs head crops |
+| 5. Antler Analysis | - | 🔜 Future |
+| 6. Body Characteristics | - | 🔜 Future |
+
+---
+
 ## Stage 1: Object Detection Boxes
 
 **Goal:** Reliably detect animals in photos (bounding boxes around subjects)
@@ -185,6 +265,42 @@ Stage 1 ──► Stage 2 ──► Stage 3 ──► Stage 4 ──► Stage 5
 - Achieved 96.7% accuracy (target was >90%)
 - Model deployed to `models/species.onnx` (v2.0)
 - Old model backed up as `models/species.onnx.backup`
+
+---
+
+## Session Notes (Dec 28, 2024)
+
+**Species Model v3.0 Trained:**
+- 50 epochs (increased from 15)
+- 97.0% accuracy (up from 96.7%)
+- 12 classes: Bobcat, Coyote, Deer, Fox, House Cat, Opossum, Person, Rabbit, Raccoon, Squirrel, Turkey, Vehicle
+- Rare species excluded from training (< 5 samples)
+- Note: Person and Vehicle can be removed in future training since MegaDetector auto-classifies them
+
+**AI Pipeline Updated:**
+- ai_person boxes → auto-suggest "Person" (no classifier needed)
+- ai_vehicle boxes → auto-suggest "Vehicle" (no classifier needed)
+- ai_animal boxes → run species classifier
+- No boxes → suggest "Empty"
+- Fixed 40 photos incorrectly marked Empty that had ai_person/ai_vehicle boxes
+
+---
+
+## Session Notes (Dec 27, 2024)
+
+**AI Pipeline Rules Refined:**
+- Fixed species classifier suggesting "Other" - now converts to "Unknown"
+- "Other" reserved for manual entry of custom species
+- Rare species (< 5 samples) excluded from training entirely, not lumped
+- Updated training script to skip species mapped to None
+- Added "Unknown" to SPECIES_OPTIONS and VALID_SPECIES
+- When MegaDetector finds boxes but classifier says "Empty", use "Unknown" with 50% confidence
+
+**Training Changes (train_species_crops.py):**
+- Rare species now mapped to `None` (excluded) instead of "Other"
+- Dog, Quail, Armadillo, Chipmunk, Skunk, Ground Hog, Flicker, Turkey Buzzard, Other Bird all excluded
+- Model will have 12 classes instead of 13 (no "Other" class)
+- Need to retrain model with these changes
 
 ---
 

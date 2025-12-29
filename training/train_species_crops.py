@@ -39,26 +39,38 @@ def main():
     # Configuration
     IMG_SIZE = 224
     BATCH_SIZE = 32
-    EPOCHS = 15  # Reduced for faster training
+    EPOCHS = 50  # Increased for better accuracy (overnight run)
     LR = 1e-3
     MODEL_NAME = "resnet18"  # Faster than convnext_tiny
     VAL_SPLIT = 0.15
 
-    # Species mapping - group rare species into categories
+    # Species mapping - keep each species separate
     # Note: Empty is excluded since crops are only from detected animals
     # If MegaDetector finds nothing, it's Empty (handled at detection stage)
+    # Species with very few samples (<5) are EXCLUDED from training (set to None)
+    # The AI will suggest "Unknown" for species it can't identify
     SPECIES_MAP = {
         "Deer": "Deer",
         "Turkey": "Turkey",
-        "Raccoon": "Other_Mammal",
-        "Rabbit": "Other_Mammal",
-        "Squirrel": "Other_Mammal",
-        "Coyote": "Other_Mammal",
-        "Bobcat": "Other_Mammal",
-        "Opossum": "Other_Mammal",
-        "Person": "Other",
-        "Vehicle": "Other",
-        "Quail": "Other",
+        "Raccoon": "Raccoon",
+        "Rabbit": "Rabbit",
+        "Squirrel": "Squirrel",
+        "Coyote": "Coyote",
+        "Bobcat": "Bobcat",
+        "Opossum": "Opossum",
+        "Fox": "Fox",
+        "Person": "Person",
+        "Vehicle": "Vehicle",
+        "House Cat": "House Cat",
+        "Dog": None,           # Excluded - only 3 samples
+        "Quail": None,         # Excluded - only 2 samples
+        "Armadillo": None,     # Excluded - only 2 samples
+        "Chipmunk": None,      # Excluded - only 2 samples
+        "Skunk": None,         # Excluded - only 2 samples
+        "Ground Hog": None,    # Excluded - only 4 samples
+        "Flicker": None,       # Excluded - only 3 samples
+        "Turkey Buzzard": None,  # Excluded - only 11 samples
+        "Other Bird": None,    # Excluded - too varied
     }
 
     # Device setup
@@ -78,35 +90,38 @@ def main():
 
     # Query photos with species tags and boxes
     cursor = db.conn.cursor()
-    cursor.execute("""
+    # Get all species from the mapping
+    species_list = list(SPECIES_MAP.keys())
+    placeholders = ','.join(['?' for _ in species_list])
+    cursor.execute(f"""
         SELECT DISTINCT p.id, p.file_path, t.tag_name
         FROM photos p
         JOIN tags t ON p.id = t.photo_id
         JOIN annotation_boxes b ON p.id = b.photo_id
-        WHERE t.tag_name IN ('Deer', 'Turkey', 'Raccoon', 'Rabbit',
-                             'Squirrel', 'Coyote', 'Bobcat', 'Opossum',
-                             'Person', 'Vehicle', 'Quail')
+        WHERE t.tag_name IN ({placeholders})
           AND b.label IN ('subject', 'ai_animal')
-    """)
+    """, species_list)
 
     # Build dataset entries: (photo_id, file_path, species, box)
     photo_data = {}
     for row in cursor.fetchall():
         photo_id = row[0]
         file_path = row[1]
-        species = SPECIES_MAP.get(row[2], "Other")
+        species = SPECIES_MAP.get(row[2])
+        # Skip species that are excluded from training (mapped to None)
+        if species is None:
+            continue
         if photo_id not in photo_data:
             photo_data[photo_id] = {"file_path": file_path, "species": species}
 
-    # Get boxes for each photo
+    # Get boxes for each photo - use ALL boxes to increase sample size
     samples = []
     for photo_id, data in photo_data.items():
         boxes = db.get_boxes(photo_id)
         # Filter to subject/ai_animal boxes
         boxes = [b for b in boxes if b.get("label") in ("subject", "ai_animal")]
-        if boxes:
-            # Use the first/largest box for simplicity
-            box = boxes[0]
+        # Add each box as a separate training sample (helps with flocks/groups)
+        for box in boxes:
             samples.append({
                 "photo_id": photo_id,
                 "file_path": data["file_path"],

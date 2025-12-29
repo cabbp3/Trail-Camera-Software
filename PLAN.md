@@ -1,6 +1,50 @@
 # Trail Camera Software - Project Plan
 
-**Last Updated:** December 26, 2024 (Session 12)
+**Last Updated:** December 27, 2024 (Session 13)
+
+---
+
+## Session 13 Progress (Dec 27, 2024)
+
+**Focus:** Review queue improvements, species model fixes, AI pipeline rules
+
+**Completed:**
+- [X] Supabase file_hash migration - ran SQL, pushed 4,422 photos with hashes
+- [X] Fixed species queue confidence display (was showing 0% for all)
+- [X] Fixed multi-species labeling - "Multiple species in photo" checkbox now works
+- [X] Added "Unknown" label for uncertain AI predictions
+- [X] Fixed AI suggesting "Other" - now suggests "Unknown" instead (Other is for manual entry only)
+- [X] Updated training script to exclude rare species (< 5 samples) instead of lumping into "Other"
+- [X] Added "Unknown" to SPECIES_OPTIONS and VALID_SPECIES
+- [X] Sorted species queue by suggested species name (alphabetical)
+- [X] Fixed queue advance to go to next photo (was jumping to beginning)
+- [X] Made bounding boxes thicker (5px) for visibility
+- [X] All quick labels now alphabetically sorted
+
+**AI Pipeline Rules Established:**
+1. **No boxes = Empty** - Only mark Empty when MegaDetector finds nothing
+2. **Boxes + uncertain = Unknown** - If MegaDetector finds boxes but classifier is unsure
+3. **"Other" is manual-only** - AI should never suggest "Other" (convert to Unknown)
+4. **Train only on photos with boxes** - Already enforced by SQL JOIN
+
+**Still TODO:**
+- [ ] On Windows: Run `python windows_fix.py` to sync labels
+- [ ] Fix AI suggestions not running in background (still blocking UI)
+- [ ] Remove Person and Vehicle from species model (auto-classified by MegaDetector now)
+
+**Needs Testing (Dec 28 fixes):**
+- [ ] Multi-species labeling - click second species, verify both are saved
+- [ ] Deer ID dropdown - verify it displays properly and dropdown works
+- [ ] Typing new deer ID - verify no auto-advance, saves after 3+ chars
+
+**Completed (Dec 28, 2024):**
+- [X] Retrained species model v3.0 - 12 classes, 97.0% accuracy (up from 96.7%)
+- [X] Fixed multi-species labeling - reads existing tags from DB when tags_edit field is empty
+- [X] Fixed Person/Vehicle auto-classification - MegaDetector detects, no classifier needed
+- [X] Fixed deer ID dropdown width - reduced min width, added max width, set popup width
+- [X] Fixed auto-advance when typing deer ID - blocked signals when auto-setting species
+- [X] Increased deer ID min length for autosave from 2 to 3 chars
+- [X] Cleaned up partial deer IDs from database (one-letter entries)
 
 ---
 
@@ -21,8 +65,8 @@
 - [X] Created `supabase_add_file_hash.sql` migration script
 
 **Still TODO (resume here):**
-- [ ] Run `supabase_add_file_hash.sql` in Supabase dashboard to add file_hash columns
-- [ ] Push from Mac to Supabase (will include file hashes)
+- [X] Run `supabase_add_file_hash.sql` in Supabase dashboard to add file_hash columns (Dec 27, 2024)
+- [X] Push from Mac to Supabase (will include file hashes) (Dec 27, 2024)
 - [ ] On Windows: Run `python windows_fix.py` to calculate hashes and pull labels
 
 **Supabase SQL to run:**
@@ -101,7 +145,7 @@ This software is intended to become a **marketable product** for hunters and wil
 - **macOS** standalone build working
 - **Windows** standalone build working (run windows_fix.py for sync)
 - **Supabase cloud sync** working via REST API with hash-based matching
-- **Species model:** 12 classes, 96.3% accuracy
+- **Species model:** 12 classes, 97.0% accuracy (v3.0)
 - **Buck/doe model:** 93.8% balanced accuracy
 - **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
 

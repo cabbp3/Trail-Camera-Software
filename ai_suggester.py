@@ -33,9 +33,10 @@ except ImportError:
 
 # Master list of valid species labels - predictions outside this set are rejected
 VALID_SPECIES = {
-    "Deer", "Empty", "Other", "Other_Mammal", "Other Mammal", "Turkey",
-    "Bobcat", "Coyote", "Opossum", "Other Bird", "Person",
-    "Quail", "Rabbit", "Raccoon", "Squirrel", "Vehicle", "Skunk"
+    "Deer", "Empty", "Other", "Other_Mammal", "Other Mammal", "Turkey", "Unknown",
+    "Bobcat", "Coyote", "Fox", "House Cat", "Opossum", "Other Bird", "Person",
+    "Quail", "Rabbit", "Raccoon", "Squirrel", "Vehicle", "Skunk",
+    "Armadillo", "Chipmunk", "Dog", "Ground Hog", "Flicker", "Turkey Buzzard"
 }
 
 

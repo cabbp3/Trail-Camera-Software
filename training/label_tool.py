@@ -117,7 +117,7 @@ class AnnotatableView(ImageGraphicsView):
             rect = QRectF(self._start_pos, end).normalized()
             if self._temp_rect is None:
                 pen = QPen(Qt.GlobalColor.red)
-                pen.setWidth(2)
+                pen.setWidth(5)
                 self._temp_rect = self.scene().addRect(rect, pen)
             else:
                 self._temp_rect.setRect(rect)
@@ -300,20 +300,18 @@ def _ensure_qt_plugin_paths():
 _ensure_qt_plugin_paths()
 
 
-SPECIES_OPTIONS = ["", "Deer", "Turkey", "Coyote", "Raccoon", "Person", "Vehicle", "Empty"]
+SPECIES_OPTIONS = ["", "Coyote", "Deer", "Empty", "Person", "Raccoon", "Turkey", "Unknown", "Vehicle"]
 SEX_TAGS = {"buck", "doe"}
 
 # Master list of valid species labels - ONLY these can be written to labels.txt
 # Includes both simplified model categories AND detailed species for manual tagging
 VALID_SPECIES = {
-    # Simplified model categories
-    "Deer", "Empty", "Other", "Other Mammal", "Turkey",
-    # Detailed species (for manual tagging)
-    "Bobcat", "Coyote", "Opossum", "Other Bird", "Person",
-    "Quail", "Rabbit", "Raccoon", "Squirrel", "Vehicle"
+    "Bobcat", "Coyote", "Deer", "Empty", "Opossum", "Other", "Other Bird",
+    "Other Mammal", "Person", "Quail", "Rabbit", "Raccoon", "Squirrel",
+    "Turkey", "Unknown", "Vehicle"
 }
 SEX_OPTIONS = ["", "Buck", "Doe", "Unknown"]
-AGE_OPTIONS = ["", "Fawn", "1.5", "2.5", "3.5", "4.5", "5.5+", "Mature", "Unknown"]
+AGE_OPTIONS = ["", "1.5", "2.5", "3.5", "4.5", "5.5+", "Fawn", "Mature", "Unknown"]
 
 # Simple modern QSS theme for a cleaner, less “Win95” look
 APP_STYLE = """
@@ -516,33 +514,50 @@ class AIWorker(QThread):
                 # Run detection if no boxes exist
                 self._ensure_detection_boxes(p, detector, names)
 
-                # Check for animal boxes
+                # Check detection boxes and auto-classify based on MegaDetector
                 boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
-                has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+                has_person = any(b.get("label") == "ai_person" for b in boxes)
+                has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
+                has_animal = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
 
-                if not has_animal_box:
-                    # No animals detected - suggest Empty
-                    self.db.set_suggested_tag(p["id"], "Empty", 0.95)
-                    result["species"] = "Empty"
-                    result["species_conf"] = 0.95
-                    species_count += 1
-                else:
-                    # Run classifier on crop
+                label = None
+                conf = None
+
+                if has_person:
+                    # MegaDetector found person - auto-classify as Person
+                    label, conf = "Person", 0.95
+                elif has_vehicle:
+                    # MegaDetector found vehicle - auto-classify as Vehicle
+                    label, conf = "Vehicle", 0.95
+                elif has_animal:
+                    # Run classifier on animal crop
                     crop = self._best_crop_for_photo(p)
                     path = str(crop) if crop else p.get("file_path")
                     res = self.suggester.predict(path)
-
                     if res:
                         label, conf = res
-                        # If classifier says Empty but detector found animals, skip
-                        if label != "Empty":
-                            self.db.set_suggested_tag(p["id"], label, conf)
-                            result["species"] = label
-                            result["species_conf"] = conf
-                            species_count += 1
+                        # If classifier says Empty but detector found animals, use Unknown
+                        # Also convert "Other" to "Unknown" - Other is for manual entry only
+                        if label in ("Empty", "Other"):
+                            label = "Unknown"
+                            conf = 0.5
+                    if crop:
+                        try:
+                            Path(crop).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    # No detections at all - suggest Empty
+                    label, conf = "Empty", 0.95
 
-                            # If Deer, also suggest buck/doe
-                            if label == "Deer":
+                if label:
+                    self.db.set_suggested_tag(p["id"], label, conf)
+                    result["species"] = label
+                    result["species_conf"] = conf
+                    species_count += 1
+
+                    # If Deer, also suggest buck/doe
+                    if label == "Deer":
                                 self._add_deer_head_boxes(p, detector, names)
                                 if self.suggester.buckdoe_ready:
                                     head_crop = self._best_head_crop_for_photo(p)
@@ -759,6 +774,7 @@ class TrainerWindow(QMainWindow):
 
         # Integrated queue mode (replaces modal dialogs)
         self.queue_mode = False  # True when viewing a filtered queue
+        self._loading_photo_data = False  # Flag to prevent auto-advance during photo load
         self.queue_type = None  # 'species', 'sex', 'boxes', etc.
         self.queue_photo_ids = []  # List of photo IDs in the queue
         self.queue_data = {}  # Extra data per photo (e.g., suggested species, confidence)
@@ -844,8 +860,11 @@ class TrainerWindow(QMainWindow):
         self.deer_id_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.deer_id_edit.setPlaceholderText("Deer ID")
         self.deer_id_edit.setMinimumHeight(28)
-        self.deer_id_edit.setMinimumWidth(220)
-        self.deer_id_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.deer_id_edit.setMinimumWidth(120)
+        self.deer_id_edit.setMaximumWidth(250)
+        self.deer_id_edit.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        # Make dropdown popup wider to show full deer IDs
+        self.deer_id_edit.view().setMinimumWidth(200)
         self._populate_deer_id_dropdown()
         self.deer_id_edit.currentTextChanged.connect(self._apply_buck_profile_to_ui)
         # Handle both typed and programmatic changes (e.g., quick buttons) for autosave/defaults.
@@ -1001,6 +1020,12 @@ class TrainerWindow(QMainWindow):
         row2.setSpacing(4)
         for idx, btn in enumerate(self.recent_species_btns):
             (row1 if idx < 5 else row2).addWidget(btn)
+        # Add "Other..." button to type custom species
+        self.other_species_btn = QToolButton()
+        self.other_species_btn.setText("Other...")
+        self.other_species_btn.setMinimumWidth(60)
+        self.other_species_btn.clicked.connect(self._on_other_species_clicked)
+        row2.addWidget(self.other_species_btn)
         row1.addStretch()
         row2.addStretch()
         quick_species_layout.addLayout(row1)
@@ -1348,20 +1373,25 @@ class TrainerWindow(QMainWindow):
         self.queue_progress_bar.hide()  # Hidden until AI processing starts
         queue_layout.addWidget(self.queue_progress_bar)
 
+        # Multiple species checkbox (disables auto-advance)
+        self.queue_multi_species = QCheckBox("Multiple species in photo")
+        self.queue_multi_species.setStyleSheet("color: #aaa; font-size: 11px;")
+        queue_layout.addWidget(self.queue_multi_species)
+
         # Queue action buttons
         queue_btn_layout = QHBoxLayout()
         queue_btn_layout.setSpacing(4)
         self.queue_accept_btn = QPushButton("Accept (A)")
         self.queue_accept_btn.setStyleSheet("background-color: #4a4; color: white; font-weight: bold;")
         self.queue_accept_btn.clicked.connect(self._queue_accept)
-        self.queue_skip_btn = QPushButton("Skip (S)")
-        self.queue_skip_btn.setStyleSheet("background-color: #666; color: white;")
-        self.queue_skip_btn.clicked.connect(self._queue_skip)
+        self.queue_reject_btn = QPushButton("Reject (R)")
+        self.queue_reject_btn.setStyleSheet("background-color: #a44; color: white;")
+        self.queue_reject_btn.clicked.connect(self._queue_reject)
         self.queue_exit_btn = QPushButton("Exit Queue")
-        self.queue_exit_btn.setStyleSheet("background-color: #a44; color: white;")
+        self.queue_exit_btn.setStyleSheet("background-color: #666; color: white;")
         self.queue_exit_btn.clicked.connect(self._exit_queue_mode)
         queue_btn_layout.addWidget(self.queue_accept_btn)
-        queue_btn_layout.addWidget(self.queue_skip_btn)
+        queue_btn_layout.addWidget(self.queue_reject_btn)
         queue_btn_layout.addWidget(self.queue_exit_btn)
         queue_layout.addLayout(queue_btn_layout)
 
@@ -1923,6 +1953,7 @@ class TrainerWindow(QMainWindow):
     def load_photo(self):
         if not self.photos:
             return
+        self._loading_photo_data = True  # Prevent auto-advance during load
         # Ensure index is within bounds
         if self.index < 0 or self.index >= len(self.photos):
             self.index = max(0, min(self.index, len(self.photos) - 1))
@@ -2070,6 +2101,8 @@ class TrainerWindow(QMainWindow):
         if self.queue_mode:
             self._update_queue_ui()
 
+        self._loading_photo_data = False  # Done loading, allow auto-advance
+
     def save_current(self):
         if not self.photos:
             return
@@ -2081,19 +2114,29 @@ class TrainerWindow(QMainWindow):
         sex = self._get_sex()
         deer_id = self.deer_id_edit.currentText().strip()
         age = self.age_combo.currentText().strip()
-        tags = [t.strip() for t in self.tags_edit.text().split(",") if t.strip()]
+        # Get tags from UI field, or from database if field is empty/hidden
+        tags_text = self.tags_edit.text().strip()
+        if tags_text:
+            tags = [t.strip() for t in tags_text.split(",") if t.strip()]
+        else:
+            # Field is empty (likely hidden in simple mode) - get from database
+            tags = self.db.get_tags(pid)
         # Remove prior sex tags so we don't end up with both buck and doe
         tags = [t for t in tags if t.lower() not in SEX_TAGS]
-        # Remove prior species tags - we'll add the current one if set
+        # Build species set for validation
         species_set = set(SPECIES_OPTIONS)
         try:
             species_set.update(self.db.list_custom_species())
         except Exception:
             pass
-        tags = [t for t in tags if t not in species_set]
-        # Add current species and sex
+        # Always keep existing species and add the new one (multi-species support)
+        existing_species = [t for t in tags if t in species_set]
+        # Only remove species tags if explicitly replacing (not adding)
+        # Add current species and sex (only if valid - known species or length >= 3)
         if species and species not in tags:
-            tags.append(species)
+            # Only save if it's a known species OR at least 3 characters (avoid partial typing)
+            if species in species_set or len(species) >= 3:
+                tags.append(species)
         if sex.lower() in ("buck", "doe") and sex not in tags:
             tags.append(sex)
         self.db.update_photo_tags(pid, tags)
@@ -2151,8 +2194,8 @@ class TrainerWindow(QMainWindow):
                 self._session_recent_species.remove(species)
             self._session_recent_species.insert(0, species)
             self._session_recent_species = self._session_recent_species[:20]  # Keep max 20
-            # persist custom species
-            if species not in SPECIES_OPTIONS:
+            # persist custom species (only if length >= 3 to avoid partial typing)
+            if species not in SPECIES_OPTIONS and len(species) >= 3:
                 self.db.add_custom_species(species)
                 # refresh dropdown with saved customs
                 self._populate_species_dropdown()
@@ -2227,6 +2270,24 @@ class TrainerWindow(QMainWindow):
         self.save_timer.stop()
         self.save_current()
 
+        # In queue mode, auto-advance when user selects a species (unless multi-species checked)
+        if self.queue_mode and not self._loading_photo_data:
+            # Don't auto-advance if "Multiple species" is checked
+            if hasattr(self, 'queue_multi_species') and self.queue_multi_species.isChecked():
+                return
+            species = self.species_combo.currentText().strip()
+            if species:  # Only advance if a species was actually selected
+                current_pid = None
+                if self.photos and self.index < len(self.photos):
+                    current_pid = self.photos[self.index].get("id")
+                if current_pid:
+                    # Mark as reviewed for green highlighting
+                    self.queue_reviewed.add(current_pid)
+                    # Clear AI suggestion since user made a decision
+                    self.db.set_suggested_tag(current_pid, None, None)
+                    self._mark_current_list_item_reviewed()
+                self._queue_advance()
+
     def _get_filtered_indices(self) -> List[int]:
         """Get list of photo indices that pass current filters."""
         return [idx for idx, _ in self._filtered_photos()]
@@ -2297,18 +2358,18 @@ class TrainerWindow(QMainWindow):
         down.triggered.connect(lambda: self._handle_nav(1))
         self.addAction(down)
 
-        # Queue mode shortcuts (A=Accept, S=Skip, Escape=Exit)
+        # Queue mode shortcuts (A=Accept, R=Reject, Escape=Exit)
         accept_action = QAction(self)
         accept_action.setShortcut(Qt.Key.Key_A)
         accept_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         accept_action.triggered.connect(self._queue_accept_if_active)
         self.addAction(accept_action)
 
-        skip_action = QAction(self)
-        skip_action.setShortcut(Qt.Key.Key_S)
-        skip_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        skip_action.triggered.connect(self._queue_skip_if_active)
-        self.addAction(skip_action)
+        reject_action = QAction(self)
+        reject_action.setShortcut(Qt.Key.Key_R)
+        reject_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        reject_action.triggered.connect(self._queue_reject_if_active)
+        self.addAction(reject_action)
 
         exit_queue_action = QAction(self)
         exit_queue_action.setShortcut(Qt.Key.Key_Escape)
@@ -2316,23 +2377,31 @@ class TrainerWindow(QMainWindow):
         exit_queue_action.triggered.connect(self._exit_queue_if_active)
         self.addAction(exit_queue_action)
 
+    def _is_typing_in_field(self) -> bool:
+        """Check if user is typing in a text field (should ignore hotkeys)."""
+        fw = self.focusWidget()
+        if isinstance(fw, (QLineEdit, QTextEdit, QComboBox)):
+            return True
+        # Check if focus is in a combo box's line edit (editable combo)
+        if fw and fw.parent() and isinstance(fw.parent(), QComboBox):
+            return True
+        return False
+
     def _queue_accept_if_active(self):
         """Accept queue item if in queue mode and focus is not in a text field."""
         if not self.queue_mode:
             return
-        fw = self.focusWidget()
-        if isinstance(fw, (QLineEdit, QTextEdit, QComboBox)):
+        if self._is_typing_in_field():
             return  # Let typing work normally
         self._queue_accept()
 
-    def _queue_skip_if_active(self):
-        """Skip queue item if in queue mode and focus is not in a text field."""
+    def _queue_reject_if_active(self):
+        """Reject queue item if in queue mode and focus is not in a text field."""
         if not self.queue_mode:
             return
-        fw = self.focusWidget()
-        if isinstance(fw, (QLineEdit, QTextEdit, QComboBox)):
+        if self._is_typing_in_field():
             return
-        self._queue_skip()
+        self._queue_reject()
 
     def _exit_queue_if_active(self):
         """Exit queue if in queue mode."""
@@ -2545,7 +2614,7 @@ class TrainerWindow(QMainWindow):
                 pen = QPen(Qt.GlobalColor.red)
             else:
                 pen = QPen(Qt.GlobalColor.green)
-            pen.setWidth(2)
+            pen.setWidth(5)
             item = DraggableBoxItem(idx, rect, pen, _on_change)
             self.scene.addItem(item)
             self.box_items.append(item)
@@ -3649,13 +3718,9 @@ class TrainerWindow(QMainWindow):
                 for sp in species_tags:
                     species_counts[sp] = species_counts.get(sp, 0) + 1
             self.species_filter_combo.addItem(f"Unlabeled ({unlabeled_count})", "__unlabeled__")
-            # Add Deer first
-            if "Deer" in species_counts:
-                self.species_filter_combo.addItem(f"Deer ({species_counts['Deer']})", "Deer")
-            # Add rest alphabetically
+            # Add all species alphabetically
             for sp in sorted(species_counts.keys()):
-                if sp != "Deer":
-                    self.species_filter_combo.addItem(f"{sp} ({species_counts[sp]})", sp)
+                self.species_filter_combo.addItem(f"{sp} ({species_counts[sp]})", sp)
         except Exception:
             self.species_filter_combo.addItem("Unlabeled", "__unlabeled__")
             self.species_filter_combo.addItem("Deer", "Deer")
@@ -4304,12 +4369,12 @@ class TrainerWindow(QMainWindow):
             data = self.queue_data[pid]
             if self.queue_type == "species":
                 species = data.get("species", "")
-                conf = data.get("confidence", 0)
+                conf = data.get("conf", 0)
                 if species:
                     queue_suffix = f" — {species} ({conf:.0%})"
             elif self.queue_type == "sex":
                 sex = data.get("sex", "")
-                conf = data.get("confidence", 0)
+                conf = data.get("conf", 0)
                 if sex:
                     queue_suffix = f" — {sex} ({conf:.0%})"
 
@@ -5496,29 +5561,41 @@ class TrainerWindow(QMainWindow):
             # Auto-detect boxes if none exist (enables head crops for buck/doe)
             self._ensure_detection_boxes(p, detector=detector, names=names)
 
-            # Check if MegaDetector found any animals
+            # Check detection boxes and auto-classify based on MegaDetector
             boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
-            has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+            has_person = any(b.get("label") == "ai_person" for b in boxes)
+            has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
+            has_animal = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
 
-            if not has_animal_box:
-                # No animals detected by MegaDetector - suggest Empty
-                self.db.set_suggested_tag(p["id"], "Empty", 0.95)
+            label = None
+            conf = None
+            crop = None
+
+            if has_person:
+                # MegaDetector found person - auto-classify as Person
+                label, conf = "Person", 0.95
+            elif has_vehicle:
+                # MegaDetector found vehicle - auto-classify as Vehicle
+                label, conf = "Vehicle", 0.95
+            elif has_animal:
+                # Run classifier on animal crop
+                detect_count += 1
+                crop = self._best_crop_for_photo(p)
+                path = str(crop) if crop else p.get("file_path")
+                res = self.suggester.predict(path)
+                if res:
+                    label, conf = res
+                    # If classifier says Empty but detector found animals, use Unknown
+                    if label in ("Empty", "Other"):
+                        label = "Unknown"
+                        conf = 0.5
+            else:
+                # No detections at all - suggest Empty
+                label, conf = "Empty", 0.95
+
+            if label:
+                self.db.set_suggested_tag(p["id"], label, conf)
                 species_count += 1
-                continue
-
-            # Has animal boxes - run classifier on crop
-            detect_count += 1
-            crop = self._best_crop_for_photo(p)
-            path = str(crop) if crop else p.get("file_path")
-            res = self.suggester.predict(path)
-            if res:
-                label, conf = res
-                # If classifier says Empty but MegaDetector found animals, skip
-                if label == "Empty":
-                    label = None  # Skip - classifier disagrees with detector
-                if label:
-                    self.db.set_suggested_tag(p["id"], label, conf)
-                    species_count += 1
                 # If Deer, add deer head boxes and suggest buck/doe
                 if label == "Deer":
                     self._add_deer_head_boxes(p, detector=detector, names=names)
@@ -5553,106 +5630,13 @@ class TrainerWindow(QMainWindow):
         self._populate_photo_list()
 
     def run_ai_suggestions_all(self):
-        """Run AI suggestions on all photos in DB.
+        """Run AI suggestions on all photos in DB (uses background thread).
 
         Automatically runs detection first if no boxes exist, then uses
         subject/head crops for better classification accuracy.
         """
-        if not self.suggester or not self.suggester.ready:
-            QMessageBox.information(self, "AI Model Not Available", "AI model not loaded.")
-            return
-        all_photos = self.db.get_all_photos()
-        # Filter to only unlabeled photos
-        unlabeled_photos = [p for p in all_photos if not self._photo_has_human_species(p)]
-        total = len(unlabeled_photos)
-
-        if total == 0:
-            QMessageBox.information(self, "AI Suggestions", "All photos already have species labels.")
-            return
-
-        # Get detector for auto-detection if needed
-        detector, names = self._get_detector_for_suggestions()
-        species_count = 0
-        sex_count = 0
-        detect_count = 0
-
-        # Create progress dialog
-        progress = QProgressDialog("Running AI suggestions on unlabeled photos...", "Cancel", 0, total, self)
-        progress.setWindowTitle("AI Suggestions - Unlabeled Photos")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
-
-        was_cancelled = False
-        for i, p in enumerate(unlabeled_photos):
-            # Update progress
-            progress.setValue(i)
-            progress.setLabelText(f"Processing photo {i + 1} of {total}...\nSpecies: {species_count} | Buck/Doe: {sex_count}")
-            QApplication.processEvents()
-
-            if progress.wasCanceled():
-                was_cancelled = True
-                break
-            # Auto-detect boxes if none exist (enables head crops for buck/doe)
-            self._ensure_detection_boxes(p, detector=detector, names=names)
-
-            # Check if MegaDetector found any animals
-            boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
-            has_animal_box = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
-
-            if not has_animal_box:
-                # No animals detected by MegaDetector - suggest Empty
-                self.db.set_suggested_tag(p["id"], "Empty", 0.95)
-                species_count += 1
-                continue
-
-            # Has animal boxes - run classifier on crop
-            detect_count += 1
-            crop = self._best_crop_for_photo(p)
-            path = str(crop) if crop else p.get("file_path")
-            res = self.suggester.predict(path)
-            if res:
-                label, conf = res
-                # If classifier says Empty but MegaDetector found animals, skip
-                if label == "Empty":
-                    label = None  # Skip - classifier disagrees with detector
-                if label:
-                    self.db.set_suggested_tag(p["id"], label, conf)
-                    species_count += 1
-                # If Deer, add deer head boxes and suggest buck/doe
-                if label == "Deer":
-                    self._add_deer_head_boxes(p, detector=detector, names=names)
-                    if self.suggester.buckdoe_ready:
-                        head_crop = self._best_head_crop_for_photo(p)
-                        if head_crop:
-                            sex_res = self.suggester.predict_sex(str(head_crop))
-                            if sex_res:
-                                sex_label, sex_conf = sex_res
-                                self.db.set_suggested_sex(p["id"], sex_label, sex_conf)
-                                sex_count += 1
-                            try:
-                                Path(head_crop).unlink(missing_ok=True)
-                            except Exception:
-                                pass
-            if crop:
-                try:
-                    Path(crop).unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        progress.setValue(total)
-        progress.close()
-
-        msg = f"Suggested species for {species_count} photo(s)."
-        if sex_count > 0:
-            msg += f"\nSuggested buck/doe for {sex_count} deer photo(s) (using head crops)."
-        if was_cancelled:
-            msg = f"Cancelled. " + msg
-        QMessageBox.information(self, "AI Suggestions", msg)
-        self.photos = self._sorted_photos(self.db.get_all_photos())
-        self._populate_species_dropdown()
-        self._populate_photo_list()
-        self._update_recent_species_buttons()
+        # Just call the background version - no need for blocking UI
+        self.run_ai_suggestions_background()
 
     def run_sex_suggestions_on_deer(self):
         """Run buck/doe suggestions on photos already tagged as Deer.
@@ -5876,8 +5860,8 @@ class TrainerWindow(QMainWindow):
         # Move to next or exit if done
         self._queue_advance()
 
-    def _queue_skip(self):
-        """Skip current photo without accepting suggestion."""
+    def _queue_reject(self):
+        """Reject AI suggestion and move to next photo."""
         if not self.queue_mode:
             return
 
@@ -5886,9 +5870,21 @@ class TrainerWindow(QMainWindow):
             current_pid = self.photos[self.index].get("id")
 
         if current_pid:
+            # Clear the AI suggestion since user rejected it
+            if self.queue_type == "species":
+                self.db.set_suggested_tag(current_pid, None, None)
+            elif self.queue_type == "sex":
+                self.db.set_suggested_sex(current_pid, None, None)
             self.queue_reviewed.add(current_pid)
+            self._mark_current_list_item_reviewed()
 
         self._queue_advance()
+
+    def _mark_current_list_item_reviewed(self):
+        """Quickly mark current list item green without rebuilding list."""
+        current_item = self.photo_list_widget.currentItem()
+        if current_item:
+            current_item.setBackground(QColor(144, 238, 144))  # Light green
 
     def _queue_advance(self):
         """Move to next unreviewed photo in queue, or exit if done."""
@@ -5896,23 +5892,39 @@ class TrainerWindow(QMainWindow):
             self._exit_queue_mode()
             return
 
-        # Refresh the photo list with remaining queue items
-        self._populate_photo_list()
+        # Find current photo's position in queue
+        current_pid = None
+        if self.photos and self.index < len(self.photos):
+            current_pid = self.photos[self.index].get("id")
 
-        # Find next unreviewed photo
-        for pid in self.queue_photo_ids:
+        current_queue_idx = -1
+        if current_pid and current_pid in self.queue_photo_ids:
+            try:
+                current_queue_idx = self.queue_photo_ids.index(current_pid)
+            except ValueError:
+                current_queue_idx = -1
+
+        # Look for next unreviewed photo AFTER current position
+        # Start from current+1, then wrap around if needed
+        queue_len = len(self.queue_photo_ids)
+        for offset in range(1, queue_len + 1):
+            check_idx = (current_queue_idx + offset) % queue_len
+            pid = self.queue_photo_ids[check_idx]
             if pid not in self.queue_reviewed:
                 # Find this photo in the list
                 for i, p in enumerate(self.photos):
                     if p.get("id") == pid:
                         self.index = i
                         self.load_photo()
-                        # Select in list
+                        # Select in list without rebuilding
                         for row in range(self.photo_list_widget.count()):
                             item = self.photo_list_widget.item(row)
                             idx = item.data(Qt.ItemDataRole.UserRole)
                             if idx is not None and self.photos[idx].get("id") == pid:
+                                self.photo_list_widget.blockSignals(True)
                                 self.photo_list_widget.setCurrentItem(item)
+                                self.photo_list_widget.scrollToItem(item)
+                                self.photo_list_widget.blockSignals(False)
                                 break
                         self._update_queue_ui()
                         return
@@ -6631,7 +6643,7 @@ class TrainerWindow(QMainWindow):
                 SELECT id, original_name, file_path, suggested_tag, suggested_confidence
                 FROM photos
                 WHERE suggested_tag IS NOT NULL AND suggested_tag != ''
-                ORDER BY suggested_confidence DESC
+                ORDER BY suggested_tag ASC, suggested_confidence DESC
             """)
             for row in cursor.fetchall():
                 pid, name, path, species, conf = row
@@ -8114,16 +8126,21 @@ class TrainerWindow(QMainWindow):
         """Handle deer ID edits: default species/sex and autosave when length is reasonable."""
         deer_id = text.strip()
         if deer_id:
+            # Block signals to prevent queue advance when auto-setting species
+            self.species_combo.blockSignals(True)
             if not self.species_combo.currentText().strip():
                 self.species_combo.setCurrentText("Deer")
+            self.species_combo.blockSignals(False)
             if self._get_sex() == "Unknown":
                 self._set_sex("Buck")
         else:
             # If cleared back to unknown, default species to Deer
+            self.species_combo.blockSignals(True)
             if self._get_sex() == "Unknown" and not self.species_combo.currentText().strip():
                 self.species_combo.setCurrentText("Deer")
-        # Autosave when user has typed at least 2 chars, OR when field is cleared
-        if len(deer_id) >= 2 or deer_id == "":
+            self.species_combo.blockSignals(False)
+        # Autosave when user has typed at least 3 chars (avoid saving partial IDs), OR when field is cleared
+        if len(deer_id) >= 3 or deer_id == "":
             self.schedule_save()
 
     def _populate_species_dropdown(self):
@@ -8212,7 +8229,9 @@ class TrainerWindow(QMainWindow):
         recents = self._recent_species(limit=10)
         # Fallback to defaults if nothing labeled yet
         if not recents:
-            recents = SPECIES_OPTIONS[:10]
+            recents = [s for s in SPECIES_OPTIONS if s]  # Skip empty string
+        # Sort alphabetically
+        recents = sorted([s for s in recents if s])
         for idx, btn in enumerate(self.recent_species_btns):
             if idx < len(recents):
                 btn.setText(recents[idx])
@@ -8229,6 +8248,8 @@ class TrainerWindow(QMainWindow):
         if not hasattr(self, "recent_suggest_btns"):
             return
         recents = self._recent_suggested_species(limit=5)
+        # Sort alphabetically
+        recents = sorted([s for s in recents if s])
         for idx, btn in enumerate(self.recent_suggest_btns):
             if idx < len(recents):
                 btn.setText(recents[idx])
@@ -8253,7 +8274,25 @@ class TrainerWindow(QMainWindow):
             return
         species = btn.text()
         self.species_combo.setCurrentText(species)
+        # save_current() now handles multi-species mode automatically
         self.schedule_save()
+
+    def _on_other_species_clicked(self):
+        """Open dialog to type a custom species name."""
+        from PyQt6.QtWidgets import QInputDialog
+        species, ok = QInputDialog.getText(
+            self, "Custom Species", "Enter species name:",
+            text=""
+        )
+        if ok and species and len(species.strip()) >= 3:
+            species = species.strip()
+            self.species_combo.setCurrentText(species)
+            # Add to custom species if not already known
+            if species not in SPECIES_OPTIONS:
+                self.db.add_custom_species(species)
+                self._populate_species_dropdown()
+            # save_current() now handles multi-species mode automatically
+            self.save_current()
 
     def _update_current_species_label(self, species_list: List[str]):
         """Update the label showing all current species tags."""
@@ -8286,8 +8325,8 @@ class TrainerWindow(QMainWindow):
             self.db.add_tag(pid, species)
             current_species.append(species)
             self._update_current_species_label(current_species)
-            # Persist custom species if needed
-            if species not in SPECIES_OPTIONS:
+            # Persist custom species if needed (only if length >= 3)
+            if species not in SPECIES_OPTIONS and len(species) >= 3:
                 self.db.add_custom_species(species)
                 self._populate_species_dropdown()
             self._update_recent_species_buttons()

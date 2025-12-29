@@ -12,4 +12,5 @@ Rabbit
 Raccoon
 Squirrel
 Turkey
+Unknown
 Vehicle

@@ -176,7 +176,7 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ---
 
-## Current State (Dec 25, 2024)
+## Current State (Dec 28, 2024)
 
 **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
 
