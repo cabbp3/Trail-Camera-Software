@@ -57,8 +57,12 @@ class TableQuery:
         self._filters.append(f"{column}=eq.{value}")
         return self
 
-    def execute(self) -> SupabaseResponse:
-        """Execute the query."""
+    def execute(self, fetch_all: bool = False) -> SupabaseResponse:
+        """Execute the query.
+
+        Args:
+            fetch_all: If True, paginate through all results (bypasses 1000 row limit)
+        """
         url = f"{self.client.url}/rest/v1/{self.table_name}"
         headers = self.client._get_headers()
 
@@ -69,9 +73,28 @@ class TableQuery:
                 for f in self._filters:
                     key, val = f.split("=", 1)
                     params[key] = val
-                response = requests.get(url, headers=headers, params=params, timeout=30)
-                response.raise_for_status()
-                return SupabaseResponse(response.json())
+
+                if fetch_all:
+                    # Paginate through all results
+                    all_data = []
+                    page_size = 1000
+                    offset = 0
+                    while True:
+                        headers_with_range = headers.copy()
+                        headers_with_range["Range"] = f"{offset}-{offset + page_size - 1}"
+                        headers_with_range["Prefer"] = "count=exact"
+                        response = requests.get(url, headers=headers_with_range, params=params, timeout=60)
+                        response.raise_for_status()
+                        page_data = response.json()
+                        all_data.extend(page_data)
+                        if len(page_data) < page_size:
+                            break  # Last page
+                        offset += page_size
+                    return SupabaseResponse(all_data)
+                else:
+                    response = requests.get(url, headers=headers, params=params, timeout=30)
+                    response.raise_for_status()
+                    return SupabaseResponse(response.json())
 
             elif self._upsert_data is not None:
                 # UPSERT query

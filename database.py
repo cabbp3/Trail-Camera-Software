@@ -1920,8 +1920,8 @@ class TrailCamDatabase:
 
         cursor = self.conn.cursor()
 
-        # Pull photos_sync - update local photo metadata
-        result = supabase_client.table("photos_sync").select("*").execute()
+        # Pull photos_sync - update local photo metadata (fetch_all to bypass 1000 row limit)
+        result = supabase_client.table("photos_sync").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
@@ -1934,8 +1934,8 @@ class TrailCamDatabase:
                 """, (row.get("camera_location"), row.get("favorite"), row.get("notes"), photo["id"]))
                 counts["photos"] += 1
 
-        # Pull tags
-        result = supabase_client.table("tags").select("*").execute()
+        # Pull tags (fetch_all to bypass 1000 row limit)
+        result = supabase_client.table("tags").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
@@ -1944,8 +1944,8 @@ class TrailCamDatabase:
                 """, (photo["id"], row["tag_name"]))
                 counts["tags"] += 1
 
-        # Pull deer_metadata
-        result = supabase_client.table("deer_metadata").select("*").execute()
+        # Pull deer_metadata (fetch_all to bypass 1000 row limit)
+        result = supabase_client.table("deer_metadata").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
@@ -1966,8 +1966,8 @@ class TrailCamDatabase:
                       row.get("broken_antler_side"), row.get("broken_antler_note")))
                 counts["deer_metadata"] += 1
 
-        # Pull deer_additional
-        result = supabase_client.table("deer_additional").select("*").execute()
+        # Pull deer_additional (fetch_all to bypass 1000 row limit)
+        result = supabase_client.table("deer_additional").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo and row.get("deer_id"):
@@ -1988,8 +1988,8 @@ class TrailCamDatabase:
                       row.get("broken_antler_side"), row.get("broken_antler_note")))
                 counts["deer_additional"] += 1
 
-        # Pull buck_profiles
-        result = supabase_client.table("buck_profiles").select("*").execute()
+        # Pull buck_profiles (fetch_all to bypass 1000 row limit)
+        result = supabase_client.table("buck_profiles").select("*").execute(fetch_all=True)
         for row in result.data:
             if row.get("deer_id"):
                 cursor.execute("""
@@ -1998,8 +1998,8 @@ class TrailCamDatabase:
                 """, (row["deer_id"], row.get("display_name"), row.get("notes")))
                 counts["buck_profiles"] += 1
 
-        # Pull buck_profile_seasons
-        result = supabase_client.table("buck_profile_seasons").select("*").execute()
+        # Pull buck_profile_seasons (fetch_all to bypass 1000 row limit)
+        result = supabase_client.table("buck_profile_seasons").select("*").execute(fetch_all=True)
         for row in result.data:
             if row.get("deer_id") and row.get("season_year"):
                 cursor.execute("""
