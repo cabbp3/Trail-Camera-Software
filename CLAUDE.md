@@ -176,13 +176,13 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ---
 
-## Current State (Dec 28, 2024)
+## Current State (Jan 1, 2026)
 
 **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
 
 **AI Pipeline:**
 1. MegaDetector detects animals → `ai_animal` boxes
-2. ONNX species classifier runs on cropped boxes
+2. ONNX species classifier runs on cropped boxes (per-box classification)
 3. If Deer → deer head detection → buck/doe classifier
 
 **Key Features Working:**
@@ -191,12 +191,71 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 - CuddeLink photo downloads with retry logic
 - Integrated queue mode for reviewing AI suggestions
 - Background AI processing with live updates
+- Per-box tabbed interface for labeling multiple detections
+- Box labels on image showing species/suggestions
 
 **Known Issues:**
-- Queue mode performance slower than old modal dialogs
-- `training/label_tool.py` is 3500+ lines (could be split)
+- `training/label_tool.py` is 9000+ lines (could be split)
 
 **Supabase:** Working via REST API (`supabase_rest.py`). Run `supabase_setup.sql` once to create tables.
+
+---
+
+## Recent Session (Jan 1, 2026)
+
+### Work Completed This Session
+
+**Per-Box Labeling UI:**
+- Restructured photo info pane with QTabWidget - each detection box gets its own tab
+- Box labels on image show "Box 1: Species" or "Box 1: Species?" for suggestions
+- "Apply to All" applies species/sex/age to all boxes (except deer ID which must be unique)
+
+**Bug Fixes:**
+1. **Species typing glitch** - Typing species name was advancing to next photo after each letter
+   - Fixed by connecting `editTextChanged` to `schedule_save` (debounced) instead of `_on_species_changed`
+   - Also filtered single-letter species from dropdown
+
+2. **Review queue losing suggestions** - Clicking on photo and clicking out was clearing suggestions
+   - Added `_original_saved_species` tracking when loading photo
+   - Only clear suggestion when a NEW species tag is actually added (not already saved)
+
+3. **Queue not advancing when accepting suggestion** - Selecting species didn't push to next photo
+   - Added `activated` signal connection to species combo (fires when explicitly selecting item)
+   - Rebuilt photo list after removing resolved photo (refreshes UserRole indices)
+   - Added guard against double-advance when multiple signals fire
+
+### Key Code Changes (training/label_tool.py)
+
+**Box Tab Bar** (around line 1059):
+```python
+self.box_tab_bar = QTabWidget()
+self.box_tab_bar.currentChanged.connect(self._on_box_tab_switched)
+```
+
+**Species Signal Connections** (around line 1641):
+```python
+self.species_combo.currentIndexChanged.connect(self._on_species_changed)
+self.species_combo.activated.connect(self._on_species_changed)  # For explicit selection
+self.species_combo.editTextChanged.connect(self.schedule_save)  # Debounced for typing
+```
+
+**Original Species Tracking** (in load_photo, around line 2131):
+```python
+self._original_saved_species = set(current_species)
+```
+
+**New Species Check** (in save_current, around line 2273):
+```python
+original_species = getattr(self, "_original_saved_species", set())
+is_new_species = species and species not in original_species
+if is_new_species:
+    self.db.set_suggested_tag(pid, None, None)  # Only clear if NEW
+```
+
+### Testing Notes
+- Review queue advancement: Select species from dropdown, should advance to next unreviewed photo
+- Box labels: Should show "Box 1: Deer" (confirmed) or "Box 1: Deer?" (suggestion)
+- Suggestions preserved: Click between photos without selecting species, suggestions should remain
 
 ---
 

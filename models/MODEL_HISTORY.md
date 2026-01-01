@@ -8,7 +8,7 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 
 | Model | Version | File | Last Updated |
 |-------|---------|------|--------------|
-| Species Classifier | 3.0 | species.onnx | Dec 28, 2024 |
+| Species Classifier | 4.0 | species.onnx | Jan 1, 2026 |
 | Buck/Doe Classifier | 1.0 | buckdoe.onnx | Dec 2024 |
 | Object Detector | 1.0 | detector.onnx | Dec 2024 |
 
@@ -17,6 +17,17 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 ## Version History
 
 ### Species Classifier (species.onnx)
+
+#### v4.0 (January 1, 2026)
+- **Training data**: 4,100 samples (3,485 train + 615 val) with bounding boxes, crops extracted on-the-fly
+- **Classes**: 10 species - Bobcat, Coyote, Deer, Fox, House Cat, Opossum, Rabbit, Raccoon, Squirrel, Turkey
+- **Architecture**: ResNet18 pretrained, fine-tuned, 50 epochs
+- **Accuracy**: 97.2% overall (Deer 99%, Turkey 97%, Squirrel 96%, Raccoon 90%, Opossum 91%, Rabbit 92%, Coyote 56%)
+- **Changes from v3.0**:
+  - **Removed Person and Vehicle classes** - MegaDetector handles these via ai_person/ai_vehicle detection boxes
+  - Species model should now NEVER suggest "Person" - if it does, it's converted to "Unknown"
+  - This fixes the issue where subjects were incorrectly classified as "Person" by the species model
+- **Notes**: Backed up v3.0 as species.onnx.backup_v3. Person/Vehicle now handled by MegaDetector auto-classification.
 
 #### v3.0 (December 28, 2024)
 - **Training data**: 3,155 samples (2,682 train + 473 val) with bounding boxes, crops extracted on-the-fly

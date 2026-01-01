@@ -434,6 +434,16 @@ class TrailCamDatabase:
         row = cursor.fetchone()
         return row['file_path'] if row else None
 
+    def get_photo_by_path(self, file_path: str) -> Optional[Dict]:
+        """Get photo information by file path."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT id, file_path, original_name, date_taken, camera_model, thumbnail_path, favorite, notes, season_year, camera_location, key_characteristics, suggested_tag, suggested_confidence, suggested_sex, suggested_sex_confidence
+            FROM photos WHERE file_path = ?
+        """, (file_path,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
     def set_camera_model(self, photo_id: int, camera_model: str):
         """Update camera_model for a photo."""
         cursor = self.conn.cursor()
@@ -1098,14 +1108,27 @@ class TrailCamDatabase:
 
     def get_boxes(self, photo_id: int) -> List[Dict[str, float]]:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, label, x1, y1, x2, y2, confidence FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
+        cursor.execute("SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
         out = []
         for row in cursor.fetchall():
             box = {"id": row[0], "label": row[1], "x1": row[2], "y1": row[3], "x2": row[4], "y2": row[5]}
             if row[6] is not None:
                 box["confidence"] = row[6]
+            if row[7] is not None:
+                box["species"] = row[7]
+            if row[8] is not None:
+                box["species_conf"] = row[8]
             out.append(box)
         return out
+
+    def set_box_species(self, box_id: int, species: str, confidence: float = None):
+        """Set species classification for a specific box."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE annotation_boxes SET species = ?, species_conf = ? WHERE id = ?",
+            (species, confidence, box_id)
+        )
+        self.conn.commit()
 
     def has_detection_boxes(self, photo_id: int) -> bool:
         """Check if photo has any detection boxes (AI or human-labeled)."""

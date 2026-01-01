@@ -1,16 +1,10 @@
 Bobcat
 Coyote
 Deer
-Empty
+Fox
+House Cat
 Opossum
-Other
-Other Bird
-Other Mammal
-Person
-Quail
 Rabbit
 Raccoon
 Squirrel
 Turkey
-Unknown
-Vehicle

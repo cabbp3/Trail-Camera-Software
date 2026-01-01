@@ -49,6 +49,11 @@ def main():
     # If MegaDetector finds nothing, it's Empty (handled at detection stage)
     # Species with very few samples (<5) are EXCLUDED from training (set to None)
     # The AI will suggest "Unknown" for species it can't identify
+    #
+    # IMPORTANT: Person and Vehicle are EXCLUDED from training!
+    # MegaDetector already detects ai_person and ai_vehicle boxes directly.
+    # The species classifier should NOT predict these - they are auto-classified
+    # based on MegaDetector detection labels, not the species model.
     SPECIES_MAP = {
         "Deer": "Deer",
         "Turkey": "Turkey",
@@ -59,9 +64,9 @@ def main():
         "Bobcat": "Bobcat",
         "Opossum": "Opossum",
         "Fox": "Fox",
-        "Person": "Person",
-        "Vehicle": "Vehicle",
         "House Cat": "House Cat",
+        "Person": None,        # Excluded - MegaDetector handles this via ai_person
+        "Vehicle": None,       # Excluded - MegaDetector handles this via ai_vehicle
         "Dog": None,           # Excluded - only 3 samples
         "Quail": None,         # Excluded - only 2 samples
         "Armadillo": None,     # Excluded - only 2 samples
@@ -239,11 +244,35 @@ def main():
     train_ds = CachedCropDataset(train_crops, train_labels, train_transform)
     val_ds = CachedCropDataset(val_crops, val_labels, val_transform)
 
-    # No weighted sampling - let the model learn natural distribution
-    # (88% Deer is fine - we care most about identifying Deer correctly)
+    # Square root weighted sampling - balances between natural distribution and uniform
+    # This down-weights abundant classes (Deer) while still giving them more weight than rare ones
+    # Weight = 1 / sqrt(class_count) - gives rare classes a fighting chance
     train_class_counts = Counter(train_labels)
+    print(f"\n[train] Class distribution:", flush=True)
+    for cls_idx, cls_name in enumerate(classes):
+        count = train_class_counts.get(cls_idx, 0)
+        print(f"  {cls_name}: {count}", flush=True)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    # Calculate per-sample weights using square root of inverse frequency
+    class_weights = {}
+    for cls_idx in range(len(classes)):
+        count = train_class_counts.get(cls_idx, 1)
+        class_weights[cls_idx] = 1.0 / (count ** 0.5)  # Square root weighting
+
+    # Normalize weights so they sum to num_classes (keeps learning rate stable)
+    weight_sum = sum(class_weights.values())
+    for cls_idx in class_weights:
+        class_weights[cls_idx] = class_weights[cls_idx] * len(classes) / weight_sum
+
+    print(f"\n[train] Square root weights (normalized):", flush=True)
+    for cls_idx, cls_name in enumerate(classes):
+        print(f"  {cls_name}: {class_weights[cls_idx]:.3f}", flush=True)
+
+    # Create per-sample weights for the sampler
+    sample_weights = [class_weights[label] for label in train_labels]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(train_labels), replacement=True)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,
                               num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                             num_workers=0)

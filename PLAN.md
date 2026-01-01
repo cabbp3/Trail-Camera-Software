@@ -1,6 +1,88 @@
 # Trail Camera Software - Project Plan
 
-**Last Updated:** December 27, 2024 (Session 13)
+**Last Updated:** January 1, 2026 (Session 16)
+
+---
+
+## Session 16 Progress (Jan 1, 2026)
+
+**Focus:** Photo import from Hunting Club, misc fixes
+
+**Completed:**
+- [X] Imported ~1,405 photos from Hunting Club collection (Stealth Cam + Bushnell SD cards)
+- [X] Total photos now: Brooke Farm (3,866), Hunting Club (1,405), Tightwad House (1,167)
+
+**Discovered Issues:**
+- [ ] Collection filter dropdown doesn't refresh after import - requires app restart to see new collections
+- [ ] App has single-instance protection - cannot open two windows simultaneously
+
+**TODO (Future):**
+- [ ] Auto-refresh collection dropdown after photo import completes
+- [ ] Consider allowing multiple app instances (or add option to disable single-instance check)
+
+---
+
+## Session 15 Progress (Dec 31, 2024)
+
+**Focus:** UI cleanup - compact filter bar, button cleanup, fix AI freezing
+
+**Completed:**
+- [X] Removed unnecessary buttons from nav bar:
+  - Prev/Next (use arrow keys), Save/Save Next (auto-save), Export Training CSVs
+  - Mark/Select, Compare Marked, Clear Marks, Review Queue, Exit Review
+  - Select All, Clear Selection, Set Species on Selected
+- [X] Added "Select Multiple" toggle button - changes selection mode
+- [X] Moved Archive/Unarchive buttons to bottom nav bar
+- [X] Hide box controls (Accept/Reject boxes) unless in AI box review mode
+- [X] Photo list now shows most specific label (Buck ID > Buck/Doe > Species > AI Suggestion)
+- [X] AI suggestions shown with "?" suffix and red text
+- [X] Moved filters to compact top pane (single horizontal row, 26px height)
+- [X] Filters spread evenly with wider dropdowns (90px min width)
+- [X] Throttled AI photo list refresh (every 10 photos instead of every photo)
+
+**Bug Fixes:**
+- Fixed `simple_mode` attribute error - added initialization early in __init__
+- Fixed `deer_id` None causing `.strip()` error - changed to `(deer.get("deer_id") or "").strip()`
+- Fixed black text on selected items after multi-select toggle - clear selection when disabling
+
+**Additional Fixes (later in session):**
+- [X] Removed broken background AI processing menu options (kept working foreground method)
+- [X] Removed "?" suffix from AI suggestion labels in photo list
+- [X] Fixed photo list not updating after AI suggestions (reload photos from DB)
+- [X] Fixed Accept button not highlighting photos green in species review queue (was only working for Reject)
+
+**Code Changes:**
+- `training/label_tool.py`: Major UI restructuring, filter pane, button cleanup, AI menu simplification
+
+**Current State:**
+- App is working and stable
+- Single "Suggest Tags (AI)..." menu option uses foreground processing with progress bar
+- Species review queue highlights both Accept and Reject actions in green
+- Filters are in a compact top bar (single row, 26px height)
+- Photo list shows: Buck ID > Buck/Doe > Species > AI Suggestion (red text for suggestions)
+
+---
+
+## Session 14 Progress (Dec 30, 2024)
+
+**Focus:** GitHub release for Windows distribution
+
+**Completed:**
+- [X] Synced latest source code from Mac to KEXIN drive
+- [X] Created Windows zip (167 MB) from KEXIN dist folder
+- [X] Published GitHub Release v1.0.0: https://github.com/cabbp3/Trail-Camera-Software/releases/tag/v1.0.0
+- [X] Installed GitHub CLI (`gh`) on Mac for release management
+
+**Windows User Instructions:**
+1. Download `TrailCamOrganizer-Windows.zip` from GitHub release
+2. Extract and run `TrailCamOrganizer.exe`
+3. File → Download from CuddeLink (enter login)
+4. File → Pull from Cloud (syncs labels via hash matching)
+
+**Notes:**
+- App not code-signed yet - users may see SmartScreen/antivirus warnings
+- Hash-based sync already built into app (no Python needed for users)
+- Future: Add auto-updater to check GitHub for new versions
 
 ---
 
@@ -28,7 +110,7 @@
 4. **Train only on photos with boxes** - Already enforced by SQL JOIN
 
 **Still TODO:**
-- [ ] On Windows: Run `python windows_fix.py` to sync labels
+- [X] ~~On Windows: Run `python windows_fix.py` to sync labels~~ - Not needed, hash sync built into app
 - [ ] Fix AI suggestions not running in background (still blocking UI)
 - [ ] Remove Person and Vehicle from species model (auto-classified by MegaDetector now)
 
@@ -141,7 +223,7 @@ This software is intended to become a **marketable product** for hunters and wil
 
 ## Current Status Summary
 
-- **4,422 photos** in the database (all with file hashes calculated)
+- **6,439 photos** in the database (Brooke Farm: 3,866 | Hunting Club: 1,405 | Tightwad House: 1,167)
 - **macOS** standalone build working
 - **Windows** standalone build working (run windows_fix.py for sync)
 - **Supabase cloud sync** working via REST API with hash-based matching
@@ -413,8 +495,11 @@ Key capabilities needed:
 - [X] **Replace supabase package with REST API calls** - DONE (supabase_rest.py)
 - [X] **Finalize PyInstaller Windows build** - DONE (run build_windows.bat on Windows)
 - [X] **Create macOS .app bundle** - DONE (TrailCamOrganizer.app, 489MB standalone)
-- [ ] **Code signing (optional)** - Removes "unidentified developer" warnings
-- [ ] **Auto-updater** - Check for new versions on startup
+- [ ] **Code signing (optional)** - Removes "unidentified developer" warnings (~$300/year)
+- [ ] **Auto-updater** - Check GitHub releases for new versions on startup
+  - Compare local version to latest GitHub release tag
+  - Show notification if update available with download link
+  - Could auto-download and prompt to restart (future enhancement)
 
 **Estimated effort:** 6-10 hours total
 

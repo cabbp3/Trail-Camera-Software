@@ -15,10 +15,16 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from version import __version__
+import updater
+
 logger = logging.getLogger(__name__)
 
 from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QCoreApplication, QSettings, QPoint, QRect, QSize, QThread, QDate
-from PyQt6.QtGui import QPixmap, QIcon, QAction, QPen, QShortcut, QKeySequence, QColor
+from PyQt6.QtGui import QPixmap, QIcon, QAction, QPen, QShortcut, QKeySequence, QColor, QBrush, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -61,6 +67,7 @@ from PyQt6.QtWidgets import (
     QLayout,
     QWidgetItem,
     QDateEdit,
+    QTabWidget,
 )
 import PyQt6  # used for plugin path detection
 import sysconfig
@@ -740,6 +747,82 @@ class AIWorker(QThread):
         pass
 
 
+class AIOptionsDialog(QDialog):
+    """Dialog for selecting AI processing options."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI Processing Options")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+
+        # === Photo Scope Section ===
+        scope_label = QLabel("<b>Which photos to process:</b>")
+        layout.addWidget(scope_label)
+
+        self.scope_group = QButtonGroup(self)
+
+        self.scope_no_suggestions = QCheckBox("Photos without any AI suggestions")
+        self.scope_no_suggestions.setChecked(True)
+        self.scope_group.addButton(self.scope_no_suggestions, 0)
+        layout.addWidget(self.scope_no_suggestions)
+
+        self.scope_all_unlabeled = QCheckBox("All unlabeled photos (re-run existing suggestions)")
+        self.scope_group.addButton(self.scope_all_unlabeled, 1)
+        layout.addWidget(self.scope_all_unlabeled)
+
+        # Make them mutually exclusive like radio buttons
+        self.scope_no_suggestions.toggled.connect(lambda checked: self.scope_all_unlabeled.setChecked(not checked) if checked else None)
+        self.scope_all_unlabeled.toggled.connect(lambda checked: self.scope_no_suggestions.setChecked(not checked) if checked else None)
+
+        layout.addSpacing(15)
+
+        # === AI Steps Section ===
+        steps_label = QLabel("<b>AI steps to run:</b>")
+        layout.addWidget(steps_label)
+
+        self.step_detect_boxes = QCheckBox("Detect subject boxes (MegaDetector)")
+        self.step_detect_boxes.setChecked(True)
+        self.step_detect_boxes.setToolTip("Run MegaDetector to find animals/people/vehicles in photos")
+        layout.addWidget(self.step_detect_boxes)
+
+        self.step_species_id = QCheckBox("Identify species")
+        self.step_species_id.setChecked(True)
+        self.step_species_id.setToolTip("Classify detected animals by species (Deer, Turkey, Raccoon, etc.)")
+        layout.addWidget(self.step_species_id)
+
+        self.step_deer_head_boxes = QCheckBox("Detect deer head boxes")
+        self.step_deer_head_boxes.setChecked(True)
+        self.step_deer_head_boxes.setToolTip("Find deer heads in Deer photos for buck/doe classification")
+        layout.addWidget(self.step_deer_head_boxes)
+
+        self.step_buck_doe = QCheckBox("Identify buck vs doe")
+        self.step_buck_doe.setChecked(True)
+        self.step_buck_doe.setToolTip("Classify deer as Buck or Doe using head crops")
+        layout.addWidget(self.step_buck_doe)
+
+        layout.addSpacing(15)
+
+        # === Buttons ===
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def get_options(self) -> dict:
+        """Return the selected options."""
+        return {
+            "scope": "no_suggestions" if self.scope_no_suggestions.isChecked() else "all_unlabeled",
+            "detect_boxes": self.step_detect_boxes.isChecked(),
+            "species_id": self.step_species_id.isChecked(),
+            "deer_head_boxes": self.step_deer_head_boxes.isChecked(),
+            "buck_doe": self.step_buck_doe.isChecked(),
+        }
+
+
 class TrainerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -749,7 +832,8 @@ class TrainerWindow(QMainWindow):
             icon = QIcon(str(icon_path))
             self.setWindowIcon(icon)
         self.db = TrailCamDatabase()
-        self._write_species_labels_file()
+        # Don't overwrite labels.txt - it should match the trained model's classes
+        # self._write_species_labels_file()
         self.suggester = CombinedSuggester()
         self.auto_enhance_all = True
         self.photos = self._sorted_photos(self.db.get_all_photos())
@@ -766,6 +850,7 @@ class TrainerWindow(QMainWindow):
         self.box_items = []
         self.box_mode = None
         self.boxes_hidden = False
+        self.box_tab_widgets = []  # Tab widget references for per-box labeling
         self.ai_review_mode = False
         self.ai_review_queue = []
         self.ai_reviewed_photos = set()  # Track reviewed photo IDs for green highlighting
@@ -780,6 +865,7 @@ class TrainerWindow(QMainWindow):
         self.queue_data = {}  # Extra data per photo (e.g., suggested species, confidence)
         self.queue_reviewed = set()  # Photo IDs that have been reviewed
         self.queue_pre_filter_index = 0  # Remember position before entering queue
+        self.simple_mode = False  # Simple mode hides advanced AI features
 
         # Background AI processing
         self.ai_worker = None  # AIWorker instance when running
@@ -976,12 +1062,24 @@ class TrainerWindow(QMainWindow):
             w.setPlaceholderText("e.g. 8")
             w.setMaximumWidth(80)
 
+        # Box tabs container - shows tabs for each detection box
+        self.current_box_index = 0  # Which box is currently being edited
+        self.box_tab_bar = QTabWidget()
+        self.box_tab_bar.setTabPosition(QTabWidget.TabPosition.North)
+        self.box_tab_bar.setDocumentMode(True)  # Cleaner look
+        self.box_tab_bar.currentChanged.connect(self._on_box_tab_switched)
+        self.box_tab_bar.setMaximumHeight(30)
+        self.box_tab_bar.setStyleSheet("QTabBar::tab { padding: 4px 12px; }")
+
         form_widget = QWidget()
         form = QFormLayout(form_widget)
         form.setContentsMargins(10, 12, 10, 12)
         form.setSpacing(8)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # Add box tab bar at top of form
+        form.addRow("Box:", self.box_tab_bar)
         species_row_widget = QWidget()
         species_row = QHBoxLayout(species_row_widget)
         species_row.setContentsMargins(0, 0, 0, 0)
@@ -993,8 +1091,12 @@ class TrainerWindow(QMainWindow):
         # Suggested tag display + apply button + recent species quick buttons
         self.suggest_label = QLabel("Suggested: —")
         self.apply_suggest_btn = QToolButton()
-        self.apply_suggest_btn.setText("Apply suggestion")
+        self.apply_suggest_btn.setText("Apply")
         self.apply_suggest_btn.clicked.connect(self._apply_suggestion)
+        self.apply_all_suggest_btn = QToolButton()
+        self.apply_all_suggest_btn.setText("Apply to All")
+        self.apply_all_suggest_btn.setToolTip("Apply all pending AI suggestions to unlabeled photos")
+        self.apply_all_suggest_btn.clicked.connect(self._apply_all_suggestions)
         # Quick buttons reuse the same recent species buttons
         suggest_row = QVBoxLayout()
         suggest_row.setContentsMargins(0, 0, 0, 0)
@@ -1004,6 +1106,7 @@ class TrainerWindow(QMainWindow):
         top_row.setSpacing(6)
         top_row.addWidget(self.suggest_label)
         top_row.addWidget(self.apply_suggest_btn)
+        top_row.addWidget(self.apply_all_suggest_btn)
         top_row.addStretch()
         suggest_row.addLayout(top_row)
         form.addRow("Species:", species_row_widget)
@@ -1108,6 +1211,10 @@ class TrainerWindow(QMainWindow):
         self.box_container_bottom.setLayout(box_row_bottom)
         form.addRow("Boxes:", self.box_container_top)
         form.addRow("", self.box_container_bottom)
+        # Hide box controls by default - only show during box queue review
+        self.box_container_top.hide()
+        self.box_container_bottom.hide()
+
         # Antler/age details (collapsible)
         self.antler_toggle = QToolButton()
         self.antler_toggle.setText("Antler details ▸")
@@ -1158,44 +1265,23 @@ class TrainerWindow(QMainWindow):
         # Hide the text edit - we use it for data storage only
         self.char_edit.hide()
 
-        self.save_btn = QPushButton("Save")
-        self.save_btn.clicked.connect(self.save_current)
-        self.save_next_btn = QPushButton("Save & Next →")
-        self.save_next_btn.clicked.connect(self.save_and_next)
-        self.prev_btn = QPushButton("← Prev")
-        self.prev_btn.clicked.connect(self.prev_photo)
-        self.next_btn = QPushButton("Next →")
-        self.next_btn.clicked.connect(self.next_photo)
-        self.export_btn = QPushButton("Export training CSVs")
-        self.export_btn.clicked.connect(self.export_csvs)
+        # Removed: Save, Save Next, Prev, Next, Export Training CSVs buttons
         self.compare_btn = QPushButton("Compare Selected")
         self.compare_btn.clicked.connect(self.compare_selected)
-        # Mark for Compare feature - easier than Ctrl+Click
-        self.mark_compare_btn = QPushButton("Mark (M)")
-        self.mark_compare_btn.setToolTip("Mark current photo for comparison (keyboard: M)")
-        self.mark_compare_btn.clicked.connect(self.toggle_mark_for_compare)
-        self.compare_marked_btn = QPushButton("Compare Marked (0)")
-        self.compare_marked_btn.setToolTip("Compare all marked photos")
-        self.compare_marked_btn.clicked.connect(self.compare_marked_photos)
-        self.clear_marks_btn = QPushButton("Clear Marks")
-        self.clear_marks_btn.clicked.connect(self.clear_marked_photos)
-        self.priority_btn = QPushButton("Label Next (priority)")
-        self.priority_btn.clicked.connect(self.prioritize_for_labeling)
-        self.suggest_review_btn = QPushButton("Suggest & Review")
-        self.suggest_review_btn.clicked.connect(self.suggest_and_review)
-        self.review_queue_btn = QPushButton("Review Queue")
-        self.review_queue_btn.clicked.connect(self.enter_review_queue)
-        self.exit_review_btn = QToolButton()
-        self.exit_review_btn.setText("Exit Review")
-        self.exit_review_btn.clicked.connect(self.exit_review_modes)
-        self.retrain_btn = QPushButton("Retrain Model")
-        self.retrain_btn.clicked.connect(self.retrain_model)
-        self.select_all_btn = QPushButton("Select All")
-        self.select_all_btn.clicked.connect(self.select_all_photos)
-        self.clear_sel_btn = QPushButton("Clear Selection")
-        self.clear_sel_btn.clicked.connect(self.clear_selection)
-        self.bulk_species_btn = QPushButton("Set Species on Selected")
-        self.bulk_species_btn.clicked.connect(self.apply_species_to_selected)
+        # Multi-select toggle - allows clicking to select multiple photos
+        self.multi_select_toggle = QToolButton()
+        self.multi_select_toggle.setText("Select Multiple")
+        self.multi_select_toggle.setCheckable(True)
+        self.multi_select_toggle.setChecked(False)
+        self.multi_select_toggle.toggled.connect(self._toggle_multi_select)
+        # Archive/Unarchive buttons
+        self.archive_btn = QPushButton("Archive")
+        self.archive_btn.setToolTip("Archive selected photo(s) - hides from default view")
+        self.archive_btn.clicked.connect(self.archive_current_photo)
+        self.unarchive_btn = QPushButton("Unarchive")
+        self.unarchive_btn.setToolTip("Restore archived photo(s) to default view")
+        self.unarchive_btn.clicked.connect(self.unarchive_current_photo)
+        # Removed buttons: Select/Mark, Review Queue, Exit Review, Select All, Clear Selection, Set Species
         self.details_toggle = QToolButton()
         self.details_toggle.setText("Hide Details")
         self.details_toggle.setCheckable(True)
@@ -1203,24 +1289,11 @@ class TrainerWindow(QMainWindow):
         self.details_toggle.toggled.connect(self._toggle_details_panel)
 
         nav = QHBoxLayout()
-        nav.addWidget(self.prev_btn)
-        nav.addWidget(self.next_btn)
-        nav.addStretch()
-        nav.addWidget(self.save_btn)
-        nav.addWidget(self.save_next_btn)
-        nav.addWidget(self.export_btn)
         nav.addWidget(self.compare_btn)
-        nav.addWidget(self.mark_compare_btn)
-        nav.addWidget(self.compare_marked_btn)
-        nav.addWidget(self.clear_marks_btn)
-        nav.addWidget(self.priority_btn)
-        nav.addWidget(self.suggest_review_btn)
-        nav.addWidget(self.review_queue_btn)
-        nav.addWidget(self.exit_review_btn)
-        nav.addWidget(self.retrain_btn)
-        nav.addWidget(self.select_all_btn)
-        nav.addWidget(self.clear_sel_btn)
-        nav.addWidget(self.bulk_species_btn)
+        nav.addWidget(self.multi_select_toggle)
+        nav.addWidget(self.archive_btn)
+        nav.addWidget(self.unarchive_btn)
+        nav.addStretch()
         nav.addWidget(self.details_toggle)
 
         # Wrap form in a container with stretch to fill vertical space
@@ -1315,54 +1388,34 @@ class TrainerWindow(QMainWindow):
         self._populate_year_filter_options()
         self._populate_collection_filter_options()
 
-        # Filter layout - two rows
-        filter_layout = QVBoxLayout()
-        filter_layout.setContentsMargins(2, 2, 2, 2)
+        # Single row filter bar - ultra compact, spread horizontally
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(8, 0, 8, 0)
         filter_layout.setSpacing(4)
-
-        filter_row1 = QHBoxLayout()
-        filter_row1.setSpacing(4)
-        filter_row1.addWidget(QLabel("Species:"))
-        filter_row1.addWidget(self.species_filter_combo, 1)
-        filter_row1.addWidget(QLabel("Sex:"))
-        filter_row1.addWidget(self.sex_filter_combo, 1)
-
-        filter_row2 = QHBoxLayout()
-        filter_row2.setSpacing(4)
-        filter_row2.addWidget(QLabel("Deer ID:"))
-        filter_row2.addWidget(self.deer_id_filter_combo, 1)
-        filter_row2.addWidget(QLabel("Location:"))
-        filter_row2.addWidget(self.site_filter_combo, 1)
-
-        filter_row3 = QHBoxLayout()
-        filter_row3.setSpacing(4)
-        filter_row3.addWidget(QLabel("Year:"))
-        filter_row3.addWidget(self.year_filter_combo, 1)
-        filter_row3.addWidget(QLabel("Collection:"))
-        filter_row3.addWidget(self.collection_filter_combo, 1)
-        filter_row3.addWidget(QLabel("Sort:"))
-        filter_row3.addWidget(self.sort_combo, 1)
-
-        filter_row4 = QHBoxLayout()
-        filter_row4.setSpacing(4)
-        filter_row4.addWidget(QLabel("Show:"))
-        filter_row4.addWidget(self.archive_filter_combo, 1)
-        self.archive_btn = QPushButton("Archive")
-        self.archive_btn.setToolTip("Archive selected photo(s) - hides from default view")
-        self.archive_btn.clicked.connect(self.archive_current_photo)
-        self.unarchive_btn = QPushButton("Unarchive")
-        self.unarchive_btn.setToolTip("Restore archived photo(s) to default view")
-        self.unarchive_btn.clicked.connect(self.unarchive_current_photo)
-        filter_row4.addWidget(self.archive_btn)
-        filter_row4.addWidget(self.unarchive_btn)
-
-        filter_layout.addLayout(filter_row1)
-        filter_layout.addLayout(filter_row2)
-        filter_layout.addLayout(filter_row3)
-        filter_layout.addLayout(filter_row4)
+        for combo in [self.species_filter_combo, self.sex_filter_combo, self.deer_id_filter_combo,
+                      self.site_filter_combo, self.year_filter_combo, self.collection_filter_combo,
+                      self.sort_combo, self.archive_filter_combo]:
+            combo.setMaximumHeight(22)
+            combo.setMinimumWidth(90)
+            combo.setStyleSheet("QComboBox { padding: 1px 3px; font-size: 11px; }")
+        label_style = "QLabel { font-size: 11px; }"
+        filters = [("Species:", self.species_filter_combo), ("Sex:", self.sex_filter_combo),
+                   ("Deer ID:", self.deer_id_filter_combo), ("Loc:", self.site_filter_combo),
+                   ("Year:", self.year_filter_combo), ("Col:", self.collection_filter_combo),
+                   ("Sort:", self.sort_combo), ("Show:", self.archive_filter_combo)]
+        for i, (text, combo) in enumerate(filters):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(label_style)
+            filter_layout.addWidget(lbl)
+            filter_layout.addWidget(combo)
+            if i < len(filters) - 1:
+                filter_layout.addSpacing(12)  # Fixed spacing between filter pairs
+        filter_layout.addStretch()  # Push everything left, remaining space on right
 
         self.filter_row_container = QWidget()
         self.filter_row_container.setLayout(filter_layout)
+        self.filter_row_container.setMaximumHeight(26)
+        self.filter_row_container.setStyleSheet("QWidget { background-color: #2d2d2d; border-bottom: 1px solid #444; }")
         self._populate_site_filter_options()
 
         # Queue control panel (hidden by default, shown when in queue mode)
@@ -1438,7 +1491,7 @@ class TrainerWindow(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
-        left_layout.addWidget(self.filter_row_container)
+        # filter_row_container moved to top pane
         left_layout.addWidget(self.queue_panel)
         left_layout.addWidget(self.photo_list_widget, 1)
         self._populate_photo_list()
@@ -1514,10 +1567,6 @@ class TrainerWindow(QMainWindow):
         clear_ai_action.triggered.connect(self.clear_all_ai_data)
         ai_action = self.tools_menu.addAction("Suggest Tags (AI)...")
         ai_action.triggered.connect(self.run_ai_suggestions)
-        ai_all_action = self.tools_menu.addAction("Suggest Tags (AI) — All Photos")
-        ai_all_action.triggered.connect(self.run_ai_suggestions_all)
-        ai_bg_action = self.tools_menu.addAction("Suggest Tags (AI) — Background + Live Queue")
-        ai_bg_action.triggered.connect(self.run_ai_suggestions_background)
         self.tools_menu.addSeparator()
         sex_suggest_action = self.tools_menu.addAction("Suggest Buck/Doe (AI) on Deer Photos...")
         sex_suggest_action.triggered.connect(self.run_sex_suggestions_on_deer)
@@ -1557,7 +1606,7 @@ class TrainerWindow(QMainWindow):
 
         # Store AI-related actions for simple mode hiding
         self.advanced_menu_actions = [
-            clear_ai_action, ai_action, ai_all_action, sex_suggest_action,
+            clear_ai_action, ai_action, sex_suggest_action,
             review_label, box_review_action, species_review_action,
             sex_review_action, site_review_action, profiles_action,
             site_label, auto_site_action, manage_sites_action
@@ -1577,12 +1626,26 @@ class TrainerWindow(QMainWindow):
         self.enhance_toggle_action.setChecked(True)
         self.enhance_toggle_action.toggled.connect(self.toggle_global_enhance)
         settings_menu.addSeparator()
+        photo_locations_action = settings_menu.addAction("Photo Storage Locations...")
+        photo_locations_action.triggered.connect(self._manage_photo_locations)
+        settings_menu.addSeparator()
         supabase_setup_action = settings_menu.addAction("Setup Supabase Cloud...")
         supabase_setup_action.triggered.connect(self.setup_supabase_credentials)
         reset_sync_prefs_action = settings_menu.addAction("Reset Cloud Sync Preferences...")
         reset_sync_prefs_action.triggered.connect(self._reset_cloud_sync_preferences)
         menubar.addMenu(settings_menu)
+
+        # Help menu
+        help_menu = QMenu("Help", self)
+        check_updates_action = help_menu.addAction("Check for Updates...")
+        check_updates_action.triggered.connect(self._check_for_updates)
+        help_menu.addSeparator()
+        about_action = help_menu.addAction("About Trail Camera Software")
+        about_action.triggered.connect(self._show_about)
+        menubar.addMenu(help_menu)
+
         layout.setMenuBar(menubar)
+        layout.addWidget(self.filter_row_container)  # Top filter pane
         layout.addWidget(split)
         layout.addLayout(nav)
         self.setCentralWidget(container)
@@ -1595,7 +1658,12 @@ class TrainerWindow(QMainWindow):
 
         # Autosave on edits
         self.species_combo.currentIndexChanged.connect(self._on_species_changed)
-        self.species_combo.editTextChanged.connect(self._on_species_changed)
+        # Also connect activated signal - fires when user explicitly selects an item from dropdown
+        # This is needed because currentIndexChanged doesn't fire if clicking same item
+        self.species_combo.activated.connect(self._on_species_changed)
+        # Don't connect editTextChanged - it fires on every keystroke and causes glitches
+        # Instead, use schedule_save for typed text (debounced)
+        self.species_combo.editTextChanged.connect(self.schedule_save)
         self.age_combo.currentIndexChanged.connect(self.schedule_save)
         self.tags_edit.textChanged.connect(self.schedule_save)
         self.camera_combo.currentTextChanged.connect(self.schedule_save)
@@ -2039,6 +2107,8 @@ class TrainerWindow(QMainWindow):
             logger.debug(f"Failed to load boxes for photo {photo.get('id')}: {e}")
             self.current_boxes = []
         self._draw_boxes()
+        # Update box tab bar
+        self._update_box_tab_bar()
         # Only auto-advance if photo not already reviewed (user may be clicking back to view)
         if self.ai_review_mode and not self._photo_has_ai_boxes(self.current_boxes):
             if photo.get("id") not in self.ai_reviewed_photos:
@@ -2079,6 +2149,8 @@ class TrainerWindow(QMainWindow):
         # Show first species in combo, all in label
         species = current_species[0] if current_species else ""
         self.species_combo.setCurrentText(species)
+        # Track original saved species to know if user added NEW tag
+        self._original_saved_species = set(current_species)
         self._update_current_species_label(current_species)
 
         # crude sex inference from tags
@@ -2220,7 +2292,10 @@ class TrainerWindow(QMainWindow):
                     "abnormal_points_max": None,
                 })
         self.db.set_additional_deer(pid, extras)
-        if species:
+        # Only clear suggestion if a NEW species tag was added (not already saved)
+        original_species = getattr(self, "_original_saved_species", set())
+        is_new_species = species and species not in original_species
+        if is_new_species:
             # Official tag applied; clear suggestion
             self.db.set_suggested_tag(pid, None, None)
             # Bump to session recent species list
@@ -2233,6 +2308,8 @@ class TrainerWindow(QMainWindow):
                 self.db.add_custom_species(species)
                 # refresh dropdown with saved customs
                 self._populate_species_dropdown()
+            # Update original species so subsequent saves don't re-trigger
+            self._original_saved_species.add(species)
         # Refresh camera location dropdown if new location was added
         cam_loc = self.camera_combo.currentText().strip()
         if cam_loc and self.camera_combo.findText(cam_loc) == -1:
@@ -2245,12 +2322,7 @@ class TrainerWindow(QMainWindow):
         self._update_photo_list_item(self.index)
         # If in review mode and resolved, remove from queue and advance
         if self.in_review_mode and self._current_photo_resolved(pid):
-            self.photo_list_widget.blockSignals(True)
-            item = self.photo_list_widget.item(self.index)
-            if item:
-                self.photo_list_widget.takeItem(self.index)
-            self.photo_list_widget.blockSignals(False)
-            # Remove photo from list at current index before adjusting
+            # Remove photo from list at current index
             try:
                 if 0 <= self.index < len(self.photos):
                     self.photos.pop(self.index)
@@ -2259,6 +2331,8 @@ class TrainerWindow(QMainWindow):
             # Adjust index if we were at the end
             if self.index >= len(self.photos):
                 self.index = max(0, len(self.photos) - 1)
+            # Rebuild the photo list to refresh UserRole indices
+            self._populate_photo_list()
             self._exit_review_queue_if_done()
             if self.photos:
                 self.load_photo()
@@ -2284,7 +2358,7 @@ class TrainerWindow(QMainWindow):
             msg = proc.stdout.strip() or "Model retrained."
             QMessageBox.information(self, "Retrain Model", msg)
             # Reload suggester so the new model is picked up.
-            self._write_species_labels_file()
+            # Note: training script already outputs correct labels.txt
             self.suggester = CombinedSuggester()
         except subprocess.CalledProcessError as exc:
             err = exc.stderr or exc.stdout or str(exc)
@@ -2315,6 +2389,9 @@ class TrainerWindow(QMainWindow):
                 if self.photos and self.index < len(self.photos):
                     current_pid = self.photos[self.index].get("id")
                 if current_pid:
+                    # Check if already reviewed (prevents double-advance from multiple signals)
+                    if current_pid in self.queue_reviewed:
+                        return
                     # Mark as reviewed for green highlighting
                     self.queue_reviewed.add(current_pid)
                     # Clear AI suggestion since user made a decision
@@ -2609,6 +2686,174 @@ class TrainerWindow(QMainWindow):
         if hasattr(self, "antler_toggle"):
             self.antler_toggle.setText("Antler details ▼" if checked else "Antler details ▸")
 
+    def _on_box_tab_switched(self, index: int):
+        """Handle when user switches to a different box tab.
+
+        Saves current box data, then loads the new box's data into form fields.
+        """
+        if index < 0 or not hasattr(self, "current_boxes"):
+            return
+        if index >= len(self.current_boxes):
+            return
+
+        # Save current box data before switching
+        if hasattr(self, "current_box_index") and self.current_box_index < len(self.current_boxes):
+            self._save_current_box_data()
+
+        # Update current box index
+        self.current_box_index = index
+
+        # Load new box data into form
+        self._load_box_data(index)
+
+        # Highlight the selected box on the image
+        if hasattr(self, "box_items") and self.box_items:
+            for i, item in enumerate(self.box_items):
+                if hasattr(item, "idx"):  # DraggableBoxItem
+                    item.setSelected(item.idx == index)
+
+    def _save_current_box_data(self):
+        """Save form field values to the current box."""
+        if not hasattr(self, "current_boxes") or not self.current_boxes:
+            return
+        if self.current_box_index >= len(self.current_boxes):
+            return
+
+        box = self.current_boxes[self.current_box_index]
+
+        # Save species
+        box["species"] = self.species_combo.currentText().strip()
+
+        # Save sex
+        box["sex"] = self._get_sex()
+
+        # Save deer ID
+        box["deer_id"] = self.deer_id_edit.currentText().strip()
+
+        # Save age
+        box["age_class"] = self.age_combo.currentText().strip()
+
+        # Save antler points
+        box["left_points_min"] = self._get_int_field(self.left_min)
+        box["right_points_min"] = self._get_int_field(self.right_min)
+        box["left_points_uncertain"] = self.left_uncertain.isChecked()
+        box["right_points_uncertain"] = self.right_uncertain.isChecked()
+
+        # Persist boxes to database
+        self._persist_boxes()
+
+        # Update tab name
+        self._update_box_tab_name(self.current_box_index)
+
+    def _load_box_data(self, box_idx: int):
+        """Load box data into the form fields."""
+        if not hasattr(self, "current_boxes") or box_idx >= len(self.current_boxes):
+            return
+
+        box = self.current_boxes[box_idx]
+
+        # Block signals to prevent save loops
+        self.species_combo.blockSignals(True)
+        self.deer_id_edit.blockSignals(True)
+        self.age_combo.blockSignals(True)
+
+        # Load species
+        self.species_combo.setCurrentText(box.get("species", ""))
+
+        # Load sex
+        sex = box.get("sex", "Unknown")
+        if sex not in ("Buck", "Doe"):
+            sex = "Unknown"
+        self._set_sex(sex)
+
+        # Load deer ID
+        self.deer_id_edit.setCurrentText(box.get("deer_id", ""))
+
+        # Load age
+        self.age_combo.setCurrentText(box.get("age_class", ""))
+
+        # Load antler points
+        self._set_int_field(self.left_min, box.get("left_points_min"))
+        self._set_int_field(self.right_min, box.get("right_points_min"))
+        self.left_uncertain.setChecked(box.get("left_points_uncertain", False))
+        self.right_uncertain.setChecked(box.get("right_points_uncertain", False))
+
+        # Unblock signals
+        self.species_combo.blockSignals(False)
+        self.deer_id_edit.blockSignals(False)
+        self.age_combo.blockSignals(False)
+
+    def _update_box_tab_bar(self):
+        """Update the box tab bar based on current_boxes."""
+        if not hasattr(self, "box_tab_bar"):
+            return
+
+        self.box_tab_bar.blockSignals(True)
+        self.box_tab_bar.clear()
+
+        if not hasattr(self, "current_boxes") or not self.current_boxes:
+            # No boxes - add single "Photo" tab
+            self.box_tab_bar.addTab(QWidget(), "Photo")
+            self.current_box_index = 0
+            self.box_tab_bar.blockSignals(False)
+            return
+
+        # Create a tab for each box
+        for idx, box in enumerate(self.current_boxes):
+            box_num = idx + 1
+            species = box.get("species", "")
+            if species:
+                tab_name = f"Box {box_num}: {species}"
+            else:
+                tab_name = f"Box {box_num}"
+            self.box_tab_bar.addTab(QWidget(), tab_name)
+
+        # Select first tab
+        self.current_box_index = 0
+        self.box_tab_bar.setCurrentIndex(0)
+        self.box_tab_bar.blockSignals(False)
+
+        # Load first box data
+        self._load_box_data(0)
+
+    def _update_box_tab_name(self, box_idx: int):
+        """Update a single box tab's name based on its data."""
+        if not hasattr(self, "box_tab_bar") or box_idx >= self.box_tab_bar.count():
+            return
+        if box_idx >= len(self.current_boxes):
+            return
+
+        box = self.current_boxes[box_idx]
+        box_num = box_idx + 1
+        species = box.get("species", "")
+        if species:
+            tab_name = f"Box {box_num}: {species}"
+        else:
+            tab_name = f"Box {box_num}"
+        self.box_tab_bar.setTabText(box_idx, tab_name)
+
+    def _get_int_field(self, field) -> int:
+        """Get integer value from a QLineEdit, or None if empty/invalid."""
+        try:
+            text = field.text().strip()
+            if text:
+                return int(text)
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    def _on_box_species_changed_from_form(self):
+        """Handle species change from the main form - update current box."""
+        if not hasattr(self, "current_boxes") or not self.current_boxes:
+            return
+        if self.current_box_index >= len(self.current_boxes):
+            return
+
+        species = self.species_combo.currentText().strip()
+        self.current_boxes[self.current_box_index]["species"] = species
+        self._update_box_tab_name(self.current_box_index)
+        self._draw_boxes()  # Update box labels on image
+
     def _on_box_created(self, payload: dict):
         if not self.current_pixmap:
             return
@@ -2625,6 +2870,8 @@ class TrainerWindow(QMainWindow):
         self.current_boxes.append({"label": label, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
         self._draw_boxes()
         self._persist_boxes()
+        # Update box tab bar
+        self._update_box_tab_bar()
         # Exit draw mode so boxes can be selected/edited
         self._set_box_mode(None)
         if self.ai_review_mode and not self._photo_has_ai_boxes(self.current_boxes):
@@ -2654,16 +2901,47 @@ class TrainerWindow(QMainWindow):
             lbl = b.get("label")
             if str(lbl) == "ai_deer_head":
                 pen = QPen(Qt.GlobalColor.magenta)
+                box_color = Qt.GlobalColor.magenta
             elif str(lbl).startswith("ai_"):
                 pen = QPen(Qt.GlobalColor.yellow)
+                box_color = Qt.GlobalColor.yellow
             elif lbl == "deer_head":
                 pen = QPen(Qt.GlobalColor.red)
+                box_color = Qt.GlobalColor.red
             else:
                 pen = QPen(Qt.GlobalColor.green)
+                box_color = Qt.GlobalColor.green
             pen.setWidth(5)
             item = DraggableBoxItem(idx, rect, pen, _on_change)
             self.scene.addItem(item)
             self.box_items.append(item)
+
+            # Add box label text (Box 1, Box 2, etc.) with species if known
+            box_num = idx + 1
+            species = b.get("species", "")
+            # If no per-box species, check for photo-level suggestion
+            if not species and self.photos and self.index < len(self.photos):
+                photo = self.photos[self.index]
+                species = photo.get("suggested_tag", "")
+                if species:
+                    species = f"{species}?"  # Add ? to indicate it's a suggestion
+            if species:
+                label_text = f"Box {box_num}: {species}"
+            else:
+                label_text = f"Box {box_num}"
+
+            # Create text item ABOVE the box for visibility
+            text_item = self.scene.addSimpleText(label_text)
+            font = QFont("Arial", 14, QFont.Weight.Bold)
+            text_item.setFont(font)
+            text_item.setBrush(QBrush(box_color))
+            # Position above the box (offset by ~20px for font size 14)
+            label_y = rect.top() - 22
+            if label_y < 0:  # If box is near top of image, put label inside
+                label_y = rect.top() + 5
+            text_item.setPos(rect.left() + 5, label_y)
+            text_item.setZValue(100)  # Draw on top
+            self.box_items.append(text_item)
 
     def _persist_boxes(self):
         """Persist boxes immediately for the current photo."""
@@ -2684,6 +2962,8 @@ class TrainerWindow(QMainWindow):
         del self.current_boxes[idx]
         self._draw_boxes()
         self._persist_boxes()
+        # Update box tab bar
+        self._update_box_tab_bar()
         if self.ai_review_mode and not self._photo_has_ai_boxes(self.current_boxes):
             self._advance_ai_review()
 
@@ -2693,6 +2973,9 @@ class TrainerWindow(QMainWindow):
         self.ai_review_mode = False
         self.ai_review_queue = []
         self._advancing_review = False
+        # Hide box controls when exiting review
+        self.box_container_top.hide()
+        self.box_container_bottom.hide()
         self.photos = self._sorted_photos(self.db.get_all_photos())
         if not self.photos:
             self.photo_list_widget.clear()
@@ -3163,6 +3446,26 @@ class TrainerWindow(QMainWindow):
             else:
                 self.splitter.setSizes([220, 900, 400])
 
+    def _toggle_multi_select(self, enabled: bool):
+        """Toggle multi-select mode - clicking photos toggles their selection."""
+        if enabled:
+            self.photo_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+            self.multi_select_toggle.setText("Select Multiple ✓")
+            self.multi_select_toggle.setStyleSheet("QToolButton { background-color: #4a90d9; color: white; padding: 4px 8px; border-radius: 4px; }")
+        else:
+            # Clear selection and refresh to fix text colors
+            self.photo_list_widget.clearSelection()
+            self.photo_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.multi_select_toggle.setText("Select Multiple")
+            self.multi_select_toggle.setStyleSheet("")
+            # Re-select current item
+            if 0 <= self.index < self.photo_list_widget.count():
+                for i in range(self.photo_list_widget.count()):
+                    item = self.photo_list_widget.item(i)
+                    if item and item.data(Qt.ItemDataRole.UserRole) == self.index:
+                        self.photo_list_widget.setCurrentItem(item)
+                        break
+
     def _toggle_additional_buck(self, enabled: bool):
         """Show/hide the second-buck fields."""
         self.add_buck_container.setVisible(enabled)
@@ -3199,6 +3502,7 @@ class TrainerWindow(QMainWindow):
         # Box annotation tools (AI feature)
         self.box_container_top.setVisible(show_advanced)
         self.box_container_bottom.setVisible(show_advanced)
+        self.box_tab_bar.setVisible(show_advanced)
 
         # AI suggestion rows
         self.suggest_row_widget.setVisible(show_advanced)
@@ -3216,14 +3520,7 @@ class TrainerWindow(QMainWindow):
         # Bulk operations (merge, bulk assign)
         self.bulk_container.setVisible(show_advanced)
 
-        # Training/AI navigation buttons
-        self.export_btn.setVisible(show_advanced)
-        self.priority_btn.setVisible(show_advanced)
-        self.suggest_review_btn.setVisible(show_advanced)
-        self.review_queue_btn.setVisible(show_advanced)
-        self.exit_review_btn.setVisible(show_advanced)
-        self.retrain_btn.setVisible(show_advanced)
-        self.bulk_species_btn.setVisible(show_advanced)
+        # Removed: Training/AI navigation buttons (now in menus/dropdowns)
 
         # AI suggestion filter in left panel
         self.suggest_filter_combo.setVisible(show_advanced)
@@ -3256,6 +3553,50 @@ class TrainerWindow(QMainWindow):
             return
         self.species_combo.setCurrentText(tag)
         self.schedule_save()
+
+    def _apply_all_suggestions(self):
+        """Apply current form values (species, sex, age) to all boxes.
+
+        Note: Deer ID is NOT copied since each buck must have unique ID.
+        """
+        if not hasattr(self, "current_boxes") or not self.current_boxes:
+            QMessageBox.information(self, "Apply to All", "No boxes in this photo.")
+            return
+
+        if len(self.current_boxes) < 2:
+            QMessageBox.information(self, "Apply to All", "Only one box - nothing to apply to.")
+            return
+
+        # Get current form values (these apply to current box)
+        species = self.species_combo.currentText().strip()
+        sex = self._get_sex()
+        age = self.age_combo.currentText().strip()
+        left_pts = self._get_int_field(self.left_min)
+        right_pts = self._get_int_field(self.right_min)
+        left_unc = self.left_uncertain.isChecked()
+        right_unc = self.right_uncertain.isChecked()
+
+        # Apply to all boxes (except deer_id which must be unique)
+        for box in self.current_boxes:
+            box["species"] = species
+            box["sex"] = sex
+            box["age_class"] = age
+            box["left_points_min"] = left_pts
+            box["right_points_min"] = right_pts
+            box["left_points_uncertain"] = left_unc
+            box["right_points_uncertain"] = right_unc
+            # NOTE: deer_id is intentionally NOT copied
+
+        # Persist boxes
+        self._persist_boxes()
+
+        # Update tab bar to show new species on all tabs
+        self._update_box_tab_bar()
+
+        # Redraw boxes to show labels
+        self._draw_boxes()
+
+        QMessageBox.information(self, "Apply to All", f"Applied to all {len(self.current_boxes)} boxes.\n(Deer IDs not changed)")
 
     def _update_sex_suggestion_display(self, photo: dict):
         """Show AI sex suggestion (buck/doe) with confidence."""
@@ -3974,12 +4315,15 @@ class TrainerWindow(QMainWindow):
 
         target_item = None
         for row, (idx, p) in enumerate(filtered):
-            display = self._build_photo_label(idx)
+            display, is_suggestion = self._build_photo_label(idx)
             item = QListWidgetItem(display)
             item.setData(Qt.ItemDataRole.UserRole, idx)
             self.photo_list_widget.addItem(item)
             if idx == self.index:
                 target_item = item
+            # Red text for AI suggestions (unverified)
+            if is_suggestion:
+                item.setForeground(QColor(200, 50, 50))  # Red
             # Green highlight for reviewed items in AI box review mode
             if self.ai_review_mode and p.get("id") in self.ai_reviewed_photos:
                 item.setBackground(QColor(144, 238, 144))  # Light green
@@ -4079,21 +4423,8 @@ class TrainerWindow(QMainWindow):
         self._update_photo_list_marks()
 
     def _update_mark_button_state(self):
-        """Update mark button text and styling based on current photo and count."""
-        count = len(self.marked_for_compare)
-        self.compare_marked_btn.setText(f"Compare Marked ({count})")
-        # Check if current photo is marked
-        if self.photos and 0 <= self.index < len(self.photos):
-            photo_id = self.photos[self.index].get("id")
-            if photo_id and photo_id in self.marked_for_compare:
-                self.mark_compare_btn.setText("Unmark (M)")
-                self.mark_compare_btn.setStyleSheet("background-color: #4a8; color: white;")
-            else:
-                self.mark_compare_btn.setText("Mark (M)")
-                self.mark_compare_btn.setStyleSheet("")
-        else:
-            self.mark_compare_btn.setText("Mark (M)")
-            self.mark_compare_btn.setStyleSheet("")
+        """No-op - mark buttons removed from UI."""
+        pass
 
     def _update_photo_list_marks(self):
         """Update photo list to show which photos are marked."""
@@ -4246,6 +4577,9 @@ class TrainerWindow(QMainWindow):
         self.ai_review_queue = queue
         self.ai_reviewed_photos = set()  # Clear reviewed tracking
         self._advancing_review = False  # Reset guard
+        # Show box controls during review
+        self.box_container_top.show()
+        self.box_container_bottom.show()
         # jump to first queued photo
         self.index = queue[0]
         self.load_photo()
@@ -4271,6 +4605,9 @@ class TrainerWindow(QMainWindow):
             if not remaining:
                 self.ai_review_mode = False
                 self.ai_review_queue = []
+                # Hide box controls when review complete
+                self.box_container_top.hide()
+                self.box_container_bottom.hide()
                 QMessageBox.information(self, "AI Review", "AI review complete.")
                 return
             self.index = remaining[0]
@@ -4316,8 +4653,9 @@ class TrainerWindow(QMainWindow):
         QMessageBox.information(self, "Bulk Set", f"Assigned species '{species}' to {len(selected)} photo(s).")
         self._populate_photo_list()
 
-    def _build_photo_label(self, idx: int) -> str:
-        """Build list label with markers for species (*) and buck (^)"""
+    def _build_photo_label(self, idx: int) -> tuple:
+        """Build list label: date + most specific identifier (buck ID > buck/doe > species).
+        Returns (display_string, is_suggestion) tuple."""
         p = self.photos[idx]
         pid = p.get("id")
         # Format date as m/d/yyyy time
@@ -4335,37 +4673,41 @@ class TrainerWindow(QMainWindow):
                 label = date_taken
         else:
             label = os.path.basename(p.get("file_path", ""))
-        has_species = False
-        has_buck = False
-        verified = False
-        auto_suggest = False
-        species_labels = set(SPECIES_OPTIONS)
+
+        # Get the most specific identifier: buck ID > buck/doe > species
+        detail = ""
+        is_suggestion = False
         try:
-            species_labels.update(self.db.list_custom_species())
-        except Exception:
-            pass
-        try:
-            tags = set(self.db.get_tags(pid))
-            if p.get("suggested_tag"):
-                auto_suggest = True
-            if p.get("suggested_tag"):
-                tags.add(p.get("suggested_tag"))
-            has_species = any(t in species_labels for t in tags if t)
+            # First priority: Buck ID (verified)
             deer = self.db.get_deer_metadata(pid)
-            has_buck = bool(deer.get("deer_id"))
-            boxes = self.db.get_boxes(pid)
-            verified = bool(boxes)
+            deer_id = (deer.get("deer_id") or "").strip() if deer else ""
+            if deer_id:
+                detail = deer_id
+            else:
+                # Second priority: Buck or Doe tag (verified)
+                tags = set(self.db.get_tags(pid))
+                if "Buck" in tags:
+                    detail = "Buck"
+                elif "Doe" in tags:
+                    detail = "Doe"
+                else:
+                    # Third priority: Species (verified)
+                    species_labels = set(SPECIES_OPTIONS)
+                    try:
+                        species_labels.update(self.db.list_custom_species())
+                    except Exception:
+                        pass
+                    species_found = [t for t in tags if t in species_labels]
+                    if species_found:
+                        detail = species_found[0]
+                    else:
+                        # Fourth priority: AI suggestion (not verified)
+                        suggested = p.get("suggested_tag", "")
+                        if suggested and suggested in species_labels:
+                            detail = suggested
+                            is_suggestion = True
         except Exception:
             pass
-        suffix = ""
-        if has_species:
-            suffix += "*"
-        if has_buck:
-            suffix += "^"
-        if verified:
-            suffix += "V"
-        elif auto_suggest:
-            suffix += "A"
 
         # In queue mode, append the suggestion to the display
         queue_suffix = ""
@@ -4382,15 +4724,24 @@ class TrainerWindow(QMainWindow):
                 if sex:
                     queue_suffix = f" — {sex} ({conf:.0%})"
 
-        display = f"{label} {suffix}{queue_suffix}".strip()
-        return display
+        if detail:
+            display = f"{label} - {detail}{queue_suffix}"
+        else:
+            display = f"{label}{queue_suffix}"
+        return display, is_suggestion
 
     def _update_photo_list_item(self, idx: int):
         """Update a single list item label without resetting selection."""
         for i in range(self.photo_list_widget.count()):
             item = self.photo_list_widget.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == idx:
-                item.setText(self._build_photo_label(idx))
+                display, is_suggestion = self._build_photo_label(idx)
+                item.setText(display)
+                if is_suggestion:
+                    item.setForeground(QColor(200, 50, 50))  # Red for unverified
+                else:
+                    # Reset to default (no explicit color - lets selection styling work)
+                    item.setData(Qt.ItemDataRole.ForegroundRole, None)
                 break
 
     # closeEvent is defined earlier in the class - removed duplicate
@@ -4565,6 +4916,28 @@ class TrainerWindow(QMainWindow):
             w, h = img.size
             x1 = int(chosen["x1"] * w); x2 = int(chosen["x2"] * w)
             y1 = int(chosen["y1"] * h); y2 = int(chosen["y2"] * h)
+            x1 = max(0, min(w, x1)); x2 = max(0, min(w, x2))
+            y1 = max(0, min(h, y1)); y2 = max(0, min(h, y2))
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                return None
+            import tempfile
+            tmp = Path(tempfile.mkstemp(suffix=".jpg")[1])
+            img.crop((x1, y1, x2, y2)).save(tmp, "JPEG", quality=90)
+            return tmp
+        except Exception:
+            return None
+
+    def _crop_box(self, photo: dict, box: dict) -> Optional[Path]:
+        """Crop a specific box from a photo and return temp file path."""
+        path = photo.get("file_path")
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            from PIL import Image
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+            x1 = int(box["x1"] * w); x2 = int(box["x2"] * w)
+            y1 = int(box["y1"] * h); y2 = int(box["y2"] * h)
             x1 = max(0, min(w, x1)); x2 = max(0, min(w, x2))
             y1 = max(0, min(h, y1)); y2 = max(0, min(h, y2))
             if x2 - x1 < 5 or y2 - y1 < 5:
@@ -5523,27 +5896,70 @@ class TrainerWindow(QMainWindow):
         self.auto_enhance_all = checked
 
     def run_ai_suggestions(self):
-        """Run AI suggestions on current view (all photos in list).
+        """Run AI suggestions on current view with options dialog.
 
-        Automatically runs detection first if no boxes exist, then uses
-        subject/head crops for better classification accuracy.
+        Shows a dialog to let user choose:
+        - Which photos to process (without suggestions vs all unlabeled)
+        - Which AI steps to run (detect boxes, species ID, deer heads, buck/doe)
         """
-        if not self.suggester or not self.suggester.ready:
-            QMessageBox.information(self, "AI Model Not Available", "AI model not loaded.")
+        # Show options dialog
+        dialog = AIOptionsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        # Filter to only unlabeled photos
-        unlabeled_photos = [p for p in self.photos if not self._photo_has_human_species(p)]
-        total = len(unlabeled_photos)
+
+        options = dialog.get_options()
+
+        # Check if any steps are selected
+        if not any([options["detect_boxes"], options["species_id"],
+                    options["deer_head_boxes"], options["buck_doe"]]):
+            QMessageBox.information(self, "AI Suggestions", "No AI steps selected.")
+            return
+
+        # Check model availability for selected steps
+        if options["species_id"] and (not self.suggester or not self.suggester.ready):
+            QMessageBox.information(self, "AI Model Not Available",
+                "Species classifier not loaded. Uncheck 'Identify species' or add models/species.onnx")
+            return
+
+        if options["buck_doe"] and (not self.suggester or not self.suggester.buckdoe_ready):
+            QMessageBox.information(self, "AI Model Not Available",
+                "Buck/doe classifier not loaded. Uncheck 'Identify buck vs doe' or add models/buckdoe.onnx")
+            return
+
+        # Filter photos based on scope
+        if options["scope"] == "no_suggestions":
+            # Only photos without any AI suggestions
+            target_photos = [p for p in self.photos
+                           if not self._photo_has_human_species(p)
+                           and not p.get("suggested_tag")]
+        else:
+            # All unlabeled photos (including those with existing suggestions)
+            target_photos = [p for p in self.photos if not self._photo_has_human_species(p)]
+            # Clear existing suggestions for these photos before re-running
+            for p in target_photos:
+                pid = p.get("id")
+                if pid:
+                    if options["species_id"]:
+                        self.db.set_suggested_tag(pid, None, None)
+                    if options["buck_doe"]:
+                        self.db.set_suggested_sex(pid, None, None)
+
+        total = len(target_photos)
 
         if total == 0:
-            QMessageBox.information(self, "AI Suggestions", "All photos in current view already have species labels.")
+            QMessageBox.information(self, "AI Suggestions",
+                "No photos to process based on selected scope.")
             return
 
         # Get detector for auto-detection if needed
-        detector, names = self._get_detector_for_suggestions()
-        species_count = 0
-        sex_count = 0
+        detector, names = None, None
+        if options["detect_boxes"] or options["deer_head_boxes"]:
+            detector, names = self._get_detector_for_suggestions()
+
         detect_count = 0
+        species_count = 0
+        head_count = 0
+        sex_count = 0
 
         # Create progress dialog
         progress = QProgressDialog("Running AI suggestions...", "Cancel", 0, total, self)
@@ -5553,83 +5969,135 @@ class TrainerWindow(QMainWindow):
         progress.show()
 
         was_cancelled = False
-        for i, p in enumerate(unlabeled_photos):
+        for i, p in enumerate(target_photos):
             # Update progress
             progress.setValue(i)
-            progress.setLabelText(f"Processing photo {i + 1} of {total}...\nSpecies: {species_count} | Buck/Doe: {sex_count}")
+            status_parts = []
+            if options["detect_boxes"]:
+                status_parts.append(f"Boxes: {detect_count}")
+            if options["species_id"]:
+                status_parts.append(f"Species: {species_count}")
+            if options["deer_head_boxes"]:
+                status_parts.append(f"Heads: {head_count}")
+            if options["buck_doe"]:
+                status_parts.append(f"Buck/Doe: {sex_count}")
+            progress.setLabelText(f"Processing photo {i + 1} of {total}...\n" + " | ".join(status_parts))
             QApplication.processEvents()
 
             if progress.wasCanceled():
                 was_cancelled = True
                 break
-            # Auto-detect boxes if none exist (enables head crops for buck/doe)
-            self._ensure_detection_boxes(p, detector=detector, names=names)
 
-            # Check detection boxes and auto-classify based on MegaDetector
-            boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
-            has_person = any(b.get("label") == "ai_person" for b in boxes)
-            has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
-            has_animal = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+            # Step 1: Detect subject boxes (MegaDetector)
+            if options["detect_boxes"]:
+                if self._ensure_detection_boxes(p, detector=detector, names=names):
+                    detect_count += 1
 
+            # Step 2: Species ID - classify EACH box individually
             label = None
             conf = None
-            crop = None
+            photo_species = []  # Collect all species found in this photo
+            if options["species_id"]:
+                boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
 
-            if has_person:
-                # MegaDetector found person - auto-classify as Person
-                label, conf = "Person", 0.95
-            elif has_vehicle:
-                # MegaDetector found vehicle - auto-classify as Vehicle
-                label, conf = "Vehicle", 0.95
-            elif has_animal:
-                # Run classifier on animal crop
-                detect_count += 1
-                crop = self._best_crop_for_photo(p)
-                path = str(crop) if crop else p.get("file_path")
-                res = self.suggester.predict(path)
-                if res:
-                    label, conf = res
-                    # If classifier says Empty but detector found animals, use Unknown
-                    if label in ("Empty", "Other"):
-                        label = "Unknown"
-                        conf = 0.5
-            else:
-                # No detections at all - suggest Empty
-                label, conf = "Empty", 0.95
+                if not boxes:
+                    # No detections at all - suggest Empty
+                    label, conf = "Empty", 0.95
+                    self.db.set_suggested_tag(p["id"], label, conf)
+                    species_count += 1
+                else:
+                    # Classify each box individually
+                    for box in boxes:
+                        box_id = box.get("id")
+                        box_label = box.get("label", "")
+                        box_species = None
+                        box_conf = None
 
-            if label:
-                self.db.set_suggested_tag(p["id"], label, conf)
-                species_count += 1
-                # If Deer, add deer head boxes and suggest buck/doe
-                if label == "Deer":
-                    self._add_deer_head_boxes(p, detector=detector, names=names)
-                    if self.suggester.buckdoe_ready:
-                        head_crop = self._best_head_crop_for_photo(p)
-                        if head_crop:
-                            sex_res = self.suggester.predict_sex(str(head_crop))
-                            if sex_res:
-                                sex_label, sex_conf = sex_res
-                                self.db.set_suggested_sex(p["id"], sex_label, sex_conf)
-                                sex_count += 1
-                            try:
-                                Path(head_crop).unlink(missing_ok=True)
-                            except Exception:
-                                pass
-            if crop:
-                try:
-                    Path(crop).unlink(missing_ok=True)
-                except Exception:
-                    pass
+                        if box_label == "ai_person":
+                            box_species, box_conf = "Person", 0.95
+                        elif box_label == "ai_vehicle":
+                            box_species, box_conf = "Vehicle", 0.95
+                        elif box_label in ("ai_animal", "ai_subject", "subject"):
+                            # Crop this specific box and classify
+                            crop_path = self._crop_box(p, box)
+                            if crop_path:
+                                res = self.suggester.predict(str(crop_path))
+                                if res:
+                                    box_species, box_conf = res
+                                    # If classifier returns invalid species, use Unknown
+                                    if box_species in ("Empty", "Other", "Person", "Vehicle"):
+                                        box_species = "Unknown"
+                                        box_conf = 0.5
+                                try:
+                                    Path(crop_path).unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+
+                        # Store species on the box
+                        if box_species and box_id:
+                            self.db.set_box_species(box_id, box_species, box_conf)
+                            photo_species.append((box_species, box_conf))
+
+                    # Set photo-level suggestion from box species
+                    if photo_species:
+                        # Use the most common species, or highest confidence if tie
+                        from collections import Counter
+                        species_counts = Counter(s for s, c in photo_species)
+                        most_common = species_counts.most_common(1)[0][0]
+                        best_conf = max(c for s, c in photo_species if s == most_common)
+                        self.db.set_suggested_tag(p["id"], most_common, best_conf)
+                        species_count += 1
+                        label = most_common  # For deer check below
+
+            # For deer head boxes and buck/doe, check if this is a Deer
+            is_deer = False
+            if label == "Deer":
+                is_deer = True
+            elif not options["species_id"]:
+                # If species ID not run, check existing tags/suggestions
+                tags = set(t.lower() for t in self.db.get_tags(p["id"]))
+                is_deer = "deer" in tags or (p.get("suggested_tag") or "").lower() == "deer"
+
+            # Step 3: Detect deer head boxes
+            if options["deer_head_boxes"] and is_deer:
+                if self._add_deer_head_boxes(p, detector=detector, names=names):
+                    head_count += 1
+
+            # Step 4: Buck vs Doe ID
+            if options["buck_doe"] and is_deer and self.suggester.buckdoe_ready:
+                head_crop = self._best_head_crop_for_photo(p)
+                if head_crop:
+                    sex_res = self.suggester.predict_sex(str(head_crop))
+                    if sex_res:
+                        sex_label, sex_conf = sex_res
+                        self.db.set_suggested_sex(p["id"], sex_label, sex_conf)
+                        sex_count += 1
+                    try:
+                        Path(head_crop).unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         progress.setValue(total)
         progress.close()
 
-        msg = f"Suggested species for {species_count} photo(s)."
-        if sex_count > 0:
-            msg += f"\nSuggested buck/doe for {sex_count} deer photo(s) (using head crops)."
+        # Build result message
+        msg_parts = []
+        if options["detect_boxes"]:
+            msg_parts.append(f"Detected boxes on {detect_count} photo(s)")
+        if options["species_id"]:
+            msg_parts.append(f"Suggested species for {species_count} photo(s)")
+        if options["deer_head_boxes"]:
+            msg_parts.append(f"Added deer head boxes on {head_count} photo(s)")
+        if options["buck_doe"]:
+            msg_parts.append(f"Suggested buck/doe for {sex_count} deer photo(s)")
+
+        msg = "\n".join(msg_parts) if msg_parts else "No processing done."
         if was_cancelled:
-            msg = f"Cancelled. " + msg
+            msg = "Cancelled.\n" + msg
+
         QMessageBox.information(self, "AI Suggestions", msg)
+        # Reload photos from database to get updated suggested_tag values
+        self.photos = self._sorted_photos(self.db.get_all_photos())
         self._populate_species_dropdown()
         self._populate_photo_list()
 
@@ -5856,6 +6324,9 @@ class TrainerWindow(QMainWindow):
                     if current_pid in self.queue_photo_ids:
                         self.queue_photo_ids.remove(current_pid)
 
+            # Mark as reviewed (green highlight)
+            self._mark_current_list_item_reviewed()
+
             # Refresh display
             self._populate_species_dropdown()
             self._update_recent_species_buttons()
@@ -6041,11 +6512,11 @@ class TrainerWindow(QMainWindow):
                     "sex_conf": result.get("sex_conf", 0)
                 }
 
-            # Refresh photo list if in queue mode
-            if self.queue_mode:
+            # Throttled list refresh - only update every 10 photos to avoid UI freeze
+            if self.queue_mode and len(self.queue_photo_ids) % 10 == 0:
                 self._populate_photo_list()
 
-            # Update suggestion label
+            # Update suggestion label (lightweight, always do this)
             remaining = len(self.queue_photo_ids) - len(self.queue_reviewed)
             self.queue_count_label.setText(f"{remaining} to review")
 
@@ -6066,6 +6537,7 @@ class TrainerWindow(QMainWindow):
         if self.queue_photo_ids:
             self.queue_title_label.setText(f"Species Review ({len(self.queue_photo_ids)})")
             self.queue_suggestion_label.setText(f"AI complete: {species_count} species, {sex_count} buck/doe")
+            self._populate_photo_list()  # Final refresh to show all processed photos
             self._update_queue_ui()
         else:
             self._exit_queue_mode()
@@ -8152,27 +8624,28 @@ class TrainerWindow(QMainWindow):
         self.species_combo.blockSignals(True)
         current = self.species_combo.currentText()
         self.species_combo.clear()
-        # defaults always available
+        # defaults always available (skip single-letter names)
         for s in SPECIES_OPTIONS:
-            self.species_combo.addItem(s)
+            if len(s) >= 2:  # Skip single-letter species
+                self.species_combo.addItem(s)
         # gather used species from applied tags AND custom_species table
         used = set()
         try:
             # Include all custom species
             for s in self.db.list_custom_species():
-                if s and s.lower() not in SEX_TAGS:
+                if s and len(s) >= 2 and s.lower() not in SEX_TAGS:
                     used.add(s)
             # Also scan tags for any species-like tags not in custom_species
             # (catches species that were saved but not registered)
             all_tags = self.db.get_all_distinct_tags()
             skip_tags = SEX_TAGS | {"buck", "doe", "favorite"}
             for t in all_tags:
-                if t and t.lower() not in skip_tags and t not in SPECIES_OPTIONS:
+                if t and len(t) >= 2 and t.lower() not in skip_tags and t not in SPECIES_OPTIONS:
                     used.add(t)
         except Exception:
             pass
         for s in sorted(used):
-            if s not in SPECIES_OPTIONS:
+            if s not in SPECIES_OPTIONS and len(s) >= 2:
                 self.species_combo.addItem(s)
         if current:
             self.species_combo.setCurrentText(current)
@@ -9287,6 +9760,301 @@ class TrainerWindow(QMainWindow):
         delete_btn.clicked.connect(delete_site)
 
         dlg.exec()
+
+    # ====== PHOTO STORAGE LOCATIONS ======
+
+    def _manage_photo_locations(self):
+        """Manage folders where photos are stored (no import/copy needed)."""
+        from PyQt6.QtWidgets import QDialog, QListWidget, QFileDialog
+
+        settings = QSettings("TrailCam", "Trainer")
+        locations = settings.value("photo_locations", []) or []
+        if isinstance(locations, str):
+            locations = [locations] if locations else []
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Photo Storage Locations")
+        dlg.setMinimumSize(500, 400)
+        layout = QVBoxLayout(dlg)
+
+        # Instructions
+        info = QLabel(
+            "Add folders containing your trail camera photos.\n"
+            "Photos will be added to the database without copying.\n"
+            "The app will scan these folders for new photos."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # List of locations
+        list_widget = QListWidget()
+        for loc in locations:
+            list_widget.addItem(loc)
+        layout.addWidget(list_widget)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        add_btn = QPushButton("Add Folder...")
+        remove_btn = QPushButton("Remove Selected")
+        scan_btn = QPushButton("Scan for New Photos")
+
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(remove_btn)
+        btn_layout.addWidget(scan_btn)
+        layout.addLayout(btn_layout)
+
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        def add_folder():
+            folder = QFileDialog.getExistingDirectory(
+                dlg, "Select Photo Folder", str(Path.home())
+            )
+            if folder and folder not in locations:
+                locations.append(folder)
+                list_widget.addItem(folder)
+                settings.setValue("photo_locations", locations)
+
+        def remove_selected():
+            current = list_widget.currentItem()
+            if current:
+                path = current.text()
+                if path in locations:
+                    locations.remove(path)
+                    settings.setValue("photo_locations", locations)
+                list_widget.takeItem(list_widget.row(current))
+
+        def scan_folders():
+            if not locations:
+                QMessageBox.information(dlg, "Scan", "No folders configured. Add a folder first.")
+                return
+
+            # Scan all configured folders for photos
+            from PyQt6.QtWidgets import QProgressDialog
+
+            progress = QProgressDialog("Scanning folders...", "Cancel", 0, 0, dlg)
+            progress.setWindowTitle("Scanning for Photos")
+            progress.setMinimumDuration(0)
+            progress.show()
+
+            added_count = 0
+            skipped_count = 0
+            photo_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif'}
+
+            for folder in locations:
+                if progress.wasCanceled():
+                    break
+
+                folder_path = Path(folder)
+                if not folder_path.exists():
+                    continue
+
+                progress.setLabelText(f"Scanning: {folder}")
+                QApplication.processEvents()
+
+                # Find all image files
+                for file_path in folder_path.rglob("*"):
+                    if progress.wasCanceled():
+                        break
+
+                    if file_path.suffix.lower() in photo_extensions:
+                        # Check if already in database
+                        existing = self.db.get_photo_by_path(str(file_path))
+                        if existing:
+                            skipped_count += 1
+                            continue
+
+                        # Add to database without copying
+                        try:
+                            from image_processor import extract_exif_datetime
+
+                            date_taken = extract_exif_datetime(str(file_path))
+                            photo_id = self.db.add_photo(
+                                file_path=str(file_path),
+                                original_name=file_path.name,
+                                date_taken=date_taken.isoformat() if date_taken else None,
+                                camera_model=None,
+                                thumbnail_path=None
+                            )
+                            if photo_id:
+                                added_count += 1
+
+                                # Update progress every 10 photos
+                                if added_count % 10 == 0:
+                                    progress.setLabelText(f"Added {added_count} photos...")
+                                    QApplication.processEvents()
+
+                        except Exception as e:
+                            logger.warning(f"Failed to add {file_path}: {e}")
+
+            progress.close()
+
+            # Refresh photo list
+            self.photos = self._sorted_photos(self.db.get_all_photos())
+            self._populate_photo_list()
+            if self.photos:
+                self.index = 0
+                self.load_photo()
+
+            QMessageBox.information(
+                dlg,
+                "Scan Complete",
+                f"Added {added_count} new photos.\n"
+                f"Skipped {skipped_count} already in database."
+            )
+
+        add_btn.clicked.connect(add_folder)
+        remove_btn.clicked.connect(remove_selected)
+        scan_btn.clicked.connect(scan_folders)
+
+        dlg.exec()
+
+    # ====== UPDATE & ABOUT ======
+
+    def _check_for_updates(self):
+        """Check GitHub for software updates."""
+        try:
+            # Show checking message
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            update_info = updater.check_for_updates()
+            QApplication.restoreOverrideCursor()
+
+            if update_info is None:
+                QMessageBox.information(
+                    self,
+                    "Check for Updates",
+                    f"You're running the latest version ({__version__})."
+                )
+                return
+
+            # New version available
+            version = update_info.get("version", "unknown")
+            notes = update_info.get("release_notes", "")
+            download_url = update_info.get("download_url")
+            html_url = update_info.get("html_url", "")
+
+            msg = f"A new version is available!\n\n"
+            msg += f"Current version: {__version__}\n"
+            msg += f"New version: {version}\n"
+
+            if notes:
+                # Truncate long release notes
+                if len(notes) > 500:
+                    notes = notes[:500] + "..."
+                msg += f"\nRelease notes:\n{notes}\n"
+
+            if download_url:
+                reply = QMessageBox.question(
+                    self,
+                    "Update Available",
+                    msg + "\nWould you like to download and install the update?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._download_and_install_update(update_info)
+            else:
+                # No direct download - open release page
+                msg += f"\nVisit the release page to download:\n{html_url}"
+                QMessageBox.information(self, "Update Available", msg)
+                if html_url:
+                    import webbrowser
+                    webbrowser.open(html_url)
+
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(
+                self,
+                "Update Check Failed",
+                f"Could not check for updates:\n{str(e)}"
+            )
+
+    def _download_and_install_update(self, update_info: dict):
+        """Download and install the update."""
+        download_url = update_info.get("download_url")
+        if not download_url:
+            QMessageBox.warning(self, "Update Error", "No download URL available.")
+            return
+
+        try:
+            # Create progress dialog
+            from PyQt6.QtWidgets import QProgressDialog
+
+            progress = QProgressDialog(
+                "Downloading update...", "Cancel", 0, 100, self
+            )
+            progress.setWindowTitle("Downloading Update")
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+
+            def update_progress(downloaded, total):
+                if total > 0:
+                    pct = int(downloaded / total * 100)
+                    progress.setValue(pct)
+                    progress.setLabelText(f"Downloading... {downloaded // 1024} / {total // 1024} KB")
+                QApplication.processEvents()
+
+            # Download
+            update_file = updater.download_update(download_url, update_progress)
+            progress.close()
+
+            # Confirm install
+            reply = QMessageBox.question(
+                self,
+                "Install Update",
+                "Download complete. Install now?\n\n"
+                "The application will restart after installation.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+
+            if reply == QMessageBox.StandardButton.Yes:
+                # Install
+                if updater.install_update(update_file):
+                    QMessageBox.information(
+                        self,
+                        "Update",
+                        "Update is being installed. The application will restart."
+                    )
+                    QApplication.quit()
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Update Error",
+                        "Failed to install update. Please try again or install manually."
+                    )
+
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Update Error",
+                f"Failed to download/install update:\n{str(e)}"
+            )
+
+    def _show_about(self):
+        """Show about dialog."""
+        about_text = f"""
+<h2>Trail Camera Software</h2>
+<p><b>Version:</b> {__version__}</p>
+<p>A desktop application for organizing trail camera photos with AI-assisted wildlife labeling, deer tracking, and custom model training.</p>
+<p><b>Features:</b></p>
+<ul>
+<li>AI-powered species identification</li>
+<li>Buck/doe classification</li>
+<li>Individual deer tracking</li>
+<li>Antler point counting</li>
+<li>Cloud sync via Supabase</li>
+</ul>
+<p><b>GitHub:</b> <a href="https://github.com/cabbp3/Trail-Camera-Software">github.com/cabbp3/Trail-Camera-Software</a></p>
+"""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("About Trail Camera Software")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText(about_text)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.exec()
 
 
 def main():
