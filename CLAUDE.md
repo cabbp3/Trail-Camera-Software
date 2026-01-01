@@ -205,10 +205,21 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ### Work Completed This Session
 
-**Per-Box Labeling UI:**
-- Restructured photo info pane with QTabWidget - each detection box gets its own tab
-- Box labels on image show "Box 1: Species" or "Box 1: Species?" for suggestions
-- "Apply to All" applies species/sex/age to all boxes (except deer ID which must be unique)
+**New Features:**
+1. **Auto-Update System** (Help → Check for Updates)
+   - Checks GitHub releases API for new versions
+   - Downloads and installs updates automatically
+   - Version tracking via `version.py`
+
+2. **Photo Storage Locations** (Settings → Photo Storage Locations)
+   - Add folders where photos are stored
+   - Scans for photos without copying them
+   - Supports multiple locations
+
+3. **Per-Box Labeling UI**
+   - Restructured photo info pane with QTabWidget - each detection box gets its own tab
+   - Box labels on image show "Box 1: Species" or "Box 1: Species?" for suggestions
+   - "Apply to All" applies species/sex/age to all boxes (except deer ID which must be unique)
 
 **Bug Fixes:**
 1. **Species typing glitch** - Typing species name was advancing to next photo after each letter
