@@ -1078,8 +1078,17 @@ class TrainerWindow(QMainWindow):
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        # Add box tab bar at top of form
-        form.addRow("Box:", self.box_tab_bar)
+        # Add box tab bar at top of form with delete button
+        box_row_widget = QWidget()
+        box_row = QHBoxLayout(box_row_widget)
+        box_row.setContentsMargins(0, 0, 0, 0)
+        box_row.setSpacing(6)
+        box_row.addWidget(self.box_tab_bar, 1)
+        self.delete_box_btn = QPushButton("Delete Box")
+        self.delete_box_btn.setMaximumWidth(80)
+        self.delete_box_btn.clicked.connect(self._delete_current_box)
+        box_row.addWidget(self.delete_box_btn)
+        form.addRow("Box:", box_row_widget)
         species_row_widget = QWidget()
         species_row = QHBoxLayout(species_row_widget)
         species_row.setContentsMargins(0, 0, 0, 0)
@@ -2376,15 +2385,26 @@ class TrainerWindow(QMainWindow):
         """Handle species combo changes - save immediately to ensure changes persist."""
         # Save immediately instead of debouncing to ensure tag changes are saved
         self.save_timer.stop()
+
+        # Update box species and tab name
+        species = self.species_combo.currentText().strip()
+        if hasattr(self, "current_boxes") and self.current_boxes:
+            if self.current_box_index < len(self.current_boxes):
+                self.current_boxes[self.current_box_index]["species"] = species
+                self._update_box_tab_name(self.current_box_index)
+
         self.save_current()
 
-        # In queue mode, auto-advance when user selects a species (unless multi-species checked)
+        # In queue mode, auto-advance when ALL boxes are labeled (not just current box)
         if self.queue_mode and not self._loading_photo_data:
             # Don't auto-advance if "Multiple species" is checked
             if hasattr(self, 'queue_multi_species') and self.queue_multi_species.isChecked():
                 return
             species = self.species_combo.currentText().strip()
-            if species:  # Only advance if a species was actually selected
+            if species:  # Only check if a species was actually selected
+                # Only advance when ALL boxes are labeled
+                if not self._all_boxes_labeled():
+                    return  # Still have unlabeled boxes
                 current_pid = None
                 if self.photos and self.index < len(self.photos):
                     current_pid = self.photos[self.index].get("id")
@@ -2406,9 +2426,11 @@ class TrainerWindow(QMainWindow):
     def prev_photo(self):
         if not self.photos:
             return
+        # Always save current box data before navigating
+        self._save_current_box_data()
         if self.save_timer.isActive():
             self.save_timer.stop()
-            self.save_current()
+        self.save_current()
         # Navigate within filtered photos only
         filtered_indices = self._get_filtered_indices()
         if not filtered_indices:
@@ -2425,9 +2447,11 @@ class TrainerWindow(QMainWindow):
     def next_photo(self):
         if not self.photos:
             return
+        # Always save current box data before navigating
+        self._save_current_box_data()
         if self.save_timer.isActive():
             self.save_timer.stop()
-            self.save_current()
+        self.save_current()
         # Navigate within filtered photos only
         filtered_indices = self._get_filtered_indices()
         if not filtered_indices:
@@ -2686,14 +2710,18 @@ class TrainerWindow(QMainWindow):
         if hasattr(self, "antler_toggle"):
             self.antler_toggle.setText("Antler details ▼" if checked else "Antler details ▸")
 
-    def _on_box_tab_switched(self, index: int):
+    def _on_box_tab_switched(self, tab_index: int):
         """Handle when user switches to a different box tab.
 
         Saves current box data, then loads the new box's data into form fields.
+        Tab index is converted to actual box index (head boxes don't have tabs).
         """
-        if index < 0 or not hasattr(self, "current_boxes"):
+        if tab_index < 0 or not hasattr(self, "current_boxes"):
             return
-        if index >= len(self.current_boxes):
+
+        # Convert tab index to actual box index
+        box_index = self._tab_index_to_box_index(tab_index)
+        if box_index >= len(self.current_boxes):
             return
 
         # Save current box data before switching
@@ -2701,16 +2729,16 @@ class TrainerWindow(QMainWindow):
             self._save_current_box_data()
 
         # Update current box index
-        self.current_box_index = index
+        self.current_box_index = box_index
 
         # Load new box data into form
-        self._load_box_data(index)
+        self._load_box_data(box_index)
 
         # Highlight the selected box on the image
         if hasattr(self, "box_items") and self.box_items:
             for i, item in enumerate(self.box_items):
                 if hasattr(item, "idx"):  # DraggableBoxItem
-                    item.setSelected(item.idx == index)
+                    item.setSelected(item.idx == box_index)
 
     def _save_current_box_data(self):
         """Save form field values to the current box."""
@@ -2783,24 +2811,57 @@ class TrainerWindow(QMainWindow):
         self.deer_id_edit.blockSignals(False)
         self.age_combo.blockSignals(False)
 
+    def _is_head_box(self, box: dict) -> bool:
+        """Check if a box is a deer head box (not a subject box)."""
+        label = str(box.get("label", "")).lower()
+        return "deer_head" in label or "head" in label
+
+    def _get_subject_boxes(self) -> list:
+        """Get only subject boxes (not head boxes) for tab display."""
+        if not hasattr(self, "current_boxes") or not self.current_boxes:
+            return []
+        return [b for b in self.current_boxes if not self._is_head_box(b)]
+
+    def _get_subject_box_indices(self) -> list:
+        """Get indices of subject boxes in current_boxes."""
+        if not hasattr(self, "current_boxes") or not self.current_boxes:
+            return []
+        return [i for i, b in enumerate(self.current_boxes) if not self._is_head_box(b)]
+
+    def _tab_index_to_box_index(self, tab_idx: int) -> int:
+        """Convert tab index to actual box index in current_boxes."""
+        indices = self._get_subject_box_indices()
+        if 0 <= tab_idx < len(indices):
+            return indices[tab_idx]
+        return 0
+
+    def _box_index_to_tab_index(self, box_idx: int) -> int:
+        """Convert box index to tab index (-1 if box is a head box)."""
+        indices = self._get_subject_box_indices()
+        if box_idx in indices:
+            return indices.index(box_idx)
+        return -1
+
     def _update_box_tab_bar(self):
-        """Update the box tab bar based on current_boxes."""
+        """Update the box tab bar based on current_boxes (excluding head boxes)."""
         if not hasattr(self, "box_tab_bar"):
             return
 
         self.box_tab_bar.blockSignals(True)
         self.box_tab_bar.clear()
 
-        if not hasattr(self, "current_boxes") or not self.current_boxes:
-            # No boxes - add single "Photo" tab
+        subject_boxes = self._get_subject_boxes()
+
+        if not subject_boxes:
+            # No subject boxes - add single "Photo" tab
             self.box_tab_bar.addTab(QWidget(), "Photo")
             self.current_box_index = 0
             self.box_tab_bar.blockSignals(False)
             return
 
-        # Create a tab for each box
-        for idx, box in enumerate(self.current_boxes):
-            box_num = idx + 1
+        # Create a tab for each subject box (skip head boxes)
+        for tab_idx, box in enumerate(subject_boxes):
+            box_num = tab_idx + 1
             species = box.get("species", "")
             if species:
                 tab_name = f"Box {box_num}: {species}"
@@ -2808,29 +2869,34 @@ class TrainerWindow(QMainWindow):
                 tab_name = f"Box {box_num}"
             self.box_tab_bar.addTab(QWidget(), tab_name)
 
-        # Select first tab
-        self.current_box_index = 0
+        # Select first tab and set corresponding box index
         self.box_tab_bar.setCurrentIndex(0)
+        self.current_box_index = self._tab_index_to_box_index(0)
         self.box_tab_bar.blockSignals(False)
 
         # Load first box data
-        self._load_box_data(0)
+        self._load_box_data(self.current_box_index)
 
     def _update_box_tab_name(self, box_idx: int):
         """Update a single box tab's name based on its data."""
-        if not hasattr(self, "box_tab_bar") or box_idx >= self.box_tab_bar.count():
+        if not hasattr(self, "box_tab_bar"):
             return
         if box_idx >= len(self.current_boxes):
             return
 
+        # Convert box index to tab index (head boxes don't have tabs)
+        tab_idx = self._box_index_to_tab_index(box_idx)
+        if tab_idx < 0 or tab_idx >= self.box_tab_bar.count():
+            return  # This is a head box or invalid index
+
         box = self.current_boxes[box_idx]
-        box_num = box_idx + 1
+        box_num = tab_idx + 1  # Tab number, not box number
         species = box.get("species", "")
         if species:
             tab_name = f"Box {box_num}: {species}"
         else:
             tab_name = f"Box {box_num}"
-        self.box_tab_bar.setTabText(box_idx, tab_name)
+        self.box_tab_bar.setTabText(tab_idx, tab_name)
 
     def _get_int_field(self, field) -> int:
         """Get integer value from a QLineEdit, or None if empty/invalid."""
@@ -2853,6 +2919,41 @@ class TrainerWindow(QMainWindow):
         self.current_boxes[self.current_box_index]["species"] = species
         self._update_box_tab_name(self.current_box_index)
         self._draw_boxes()  # Update box labels on image
+
+    def _delete_current_box(self):
+        """Delete the currently selected box."""
+        if not hasattr(self, "current_boxes") or not self.current_boxes:
+            return
+
+        # Get the actual box index (not tab index)
+        box_idx = self.current_box_index
+        if box_idx < 0 or box_idx >= len(self.current_boxes):
+            return
+
+        # Don't allow deleting if only one subject box left
+        subject_boxes = self._get_subject_boxes()
+        if len(subject_boxes) <= 1 and not self._is_head_box(self.current_boxes[box_idx]):
+            return
+
+        # Remove the box
+        del self.current_boxes[box_idx]
+
+        # Persist changes
+        self._persist_boxes()
+
+        # Update current box index
+        if self.current_boxes:
+            subject_indices = self._get_subject_box_indices()
+            if subject_indices:
+                self.current_box_index = subject_indices[0]
+            else:
+                self.current_box_index = 0
+        else:
+            self.current_box_index = 0
+
+        # Refresh UI
+        self._update_box_tab_bar()
+        self._draw_boxes()
 
     def _on_box_created(self, payload: dict):
         if not self.current_pixmap:
@@ -2887,6 +2988,14 @@ class TrainerWindow(QMainWindow):
             return
         w = self.current_pixmap.width()
         h = self.current_pixmap.height()
+
+        # Scale line thickness and font size based on image size
+        # Use smaller dimension as reference for consistent scaling
+        ref_size = min(w, h)
+        line_width = max(2, int(ref_size * 0.004))  # 0.4% of image, min 2px
+        font_size = max(12, int(ref_size * 0.018))  # 1.8% of image, min 12pt
+        label_offset = max(16, int(ref_size * 0.025))  # 2.5% of image, min 16px
+
         def _on_change(idx, scene_rect: QRectF):
             if idx < 0 or idx >= len(self.current_boxes):
                 return
@@ -2911,7 +3020,7 @@ class TrainerWindow(QMainWindow):
             else:
                 pen = QPen(Qt.GlobalColor.green)
                 box_color = Qt.GlobalColor.green
-            pen.setWidth(5)
+            pen.setWidth(line_width)
             item = DraggableBoxItem(idx, rect, pen, _on_change)
             self.scene.addItem(item)
             self.box_items.append(item)
@@ -2932,11 +3041,11 @@ class TrainerWindow(QMainWindow):
 
             # Create text item ABOVE the box for visibility
             text_item = self.scene.addSimpleText(label_text)
-            font = QFont("Arial", 14, QFont.Weight.Bold)
+            font = QFont("Arial", font_size, QFont.Weight.Bold)
             text_item.setFont(font)
             text_item.setBrush(QBrush(box_color))
-            # Position above the box (offset by ~20px for font size 14)
-            label_y = rect.top() - 22
+            # Position above the box (scaled offset)
+            label_y = rect.top() - label_offset
             if label_y < 0:  # If box is near top of image, put label inside
                 label_y = rect.top() + 5
             text_item.setPos(rect.left() + 5, label_y)
@@ -3555,20 +3664,34 @@ class TrainerWindow(QMainWindow):
         self.schedule_save()
 
     def _apply_all_suggestions(self):
-        """Apply current form values (species, sex, age) to all boxes.
+        """Apply label (or AI suggestion if no labels) to all subject boxes.
 
+        Priority: Any existing box label > AI suggestion
         Note: Deer ID is NOT copied since each buck must have unique ID.
+        Head boxes are skipped (they're internal only).
         """
-        if not hasattr(self, "current_boxes") or not self.current_boxes:
+        subject_boxes = self._get_subject_boxes()
+
+        if not subject_boxes:
             QMessageBox.information(self, "Apply to All", "No boxes in this photo.")
             return
 
-        if len(self.current_boxes) < 2:
-            QMessageBox.information(self, "Apply to All", "Only one box - nothing to apply to.")
+        # First check if ANY box has a label
+        species = ""
+        for box in subject_boxes:
+            box_species = box.get("species", "").strip()
+            if box_species:
+                species = box_species
+                break  # Use the first labeled box
+
+        if not species:
+            # No labels found - fall back to AI suggestion
+            species = getattr(self, "current_suggested_tag", "") or ""
+
+        if not species:
+            QMessageBox.information(self, "Apply to All", "No species to apply. Label a box or wait for AI suggestion.")
             return
 
-        # Get current form values (these apply to current box)
-        species = self.species_combo.currentText().strip()
         sex = self._get_sex()
         age = self.age_combo.currentText().strip()
         left_pts = self._get_int_field(self.left_min)
@@ -3576,8 +3699,9 @@ class TrainerWindow(QMainWindow):
         left_unc = self.left_uncertain.isChecked()
         right_unc = self.right_uncertain.isChecked()
 
-        # Apply to all boxes (except deer_id which must be unique)
-        for box in self.current_boxes:
+        # Apply to all subject boxes (skip head boxes, skip deer_id)
+        for idx in self._get_subject_box_indices():
+            box = self.current_boxes[idx]
             box["species"] = species
             box["sex"] = sex
             box["age_class"] = age
@@ -3587,8 +3711,21 @@ class TrainerWindow(QMainWindow):
             box["right_points_uncertain"] = right_unc
             # NOTE: deer_id is intentionally NOT copied
 
+        # Update form field to match
+        self.species_combo.setCurrentText(species)
+
         # Persist boxes
         self._persist_boxes()
+
+        # Save species as a tag (critical for queue filtering)
+        self.save_current()
+
+        # Clear the suggested_tag so photo doesn't reappear in queue
+        if self.photos and self.index < len(self.photos):
+            current_pid = self.photos[self.index].get("id")
+            if current_pid:
+                self.db.set_suggested_tag(current_pid, None, None)
+                self.queue_reviewed.add(current_pid)
 
         # Update tab bar to show new species on all tabs
         self._update_box_tab_bar()
@@ -3596,7 +3733,19 @@ class TrainerWindow(QMainWindow):
         # Redraw boxes to show labels
         self._draw_boxes()
 
-        QMessageBox.information(self, "Apply to All", f"Applied to all {len(self.current_boxes)} boxes.\n(Deer IDs not changed)")
+        # In queue mode, advance to next photo after applying to all
+        if self.queue_mode:
+            self._queue_advance()
+
+    def _all_boxes_labeled(self) -> bool:
+        """Check if all subject boxes have a species label."""
+        subject_boxes = self._get_subject_boxes()
+        if not subject_boxes:
+            return True  # No boxes = nothing to label
+        for box in subject_boxes:
+            if not box.get("species", "").strip():
+                return False
+        return True
 
     def _update_sex_suggestion_display(self, photo: dict):
         """Show AI sex suggestion (buck/doe) with confidence."""

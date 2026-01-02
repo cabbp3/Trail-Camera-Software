@@ -1084,12 +1084,14 @@ class TrailCamDatabase:
 
     # Annotation boxes
     def set_boxes(self, photo_id: int, boxes: List[Dict[str, float]]):
-        """Replace boxes for a photo. Boxes use relative coords 0-1 and optional confidence."""
+        """Replace boxes for a photo. Boxes use relative coords 0-1 and optional per-box data."""
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
         to_insert = []
         for b in boxes:
             conf = b.get("confidence")
+            species = b.get("species", "")
+            species_conf = b.get("species_conf")
             to_insert.append((
                 photo_id,
                 b.get("label", ""),
@@ -1097,11 +1099,13 @@ class TrailCamDatabase:
                 float(b["y1"]),
                 float(b["x2"]),
                 float(b["y2"]),
-                float(conf) if conf is not None else None
+                float(conf) if conf is not None else None,
+                species if species else None,
+                float(species_conf) if species_conf is not None else None
             ))
         if to_insert:
             cursor.executemany(
-                "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 to_insert,
             )
         self.conn.commit()
