@@ -10069,15 +10069,19 @@ class TrainerWindow(QMainWindow):
             # Show checking message
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             update_info = updater.check_for_updates()
-            QApplication.restoreOverrideCursor()
 
             if update_info is None:
+                QApplication.restoreOverrideCursor()
                 QMessageBox.information(
                     self,
                     "Check for Updates",
                     f"You're running the latest version ({__version__})."
                 )
                 return
+
+            # Check for delta update possibility
+            delta_info = updater.check_delta_update(update_info)
+            QApplication.restoreOverrideCursor()
 
             # New version available
             version = update_info.get("version", "unknown")
@@ -10088,6 +10092,14 @@ class TrainerWindow(QMainWindow):
             msg = f"A new version is available!\n\n"
             msg += f"Current version: {__version__}\n"
             msg += f"New version: {version}\n"
+
+            # Show delta update info if available
+            if delta_info:
+                download_size = delta_info.get("download_size", 0)
+                file_count = delta_info.get("download_count", 0)
+                size_mb = download_size / 1024 / 1024
+                msg += f"\nDelta update: {file_count} files changed ({size_mb:.1f} MB)\n"
+                update_info["delta_info"] = delta_info
 
             if notes:
                 # Truncate long release notes
@@ -10122,19 +10134,21 @@ class TrainerWindow(QMainWindow):
             )
 
     def _download_and_install_update(self, update_info: dict):
-        """Download and install the update."""
+        """Download and install the update (using delta if available)."""
         download_url = update_info.get("download_url")
         if not download_url:
             QMessageBox.warning(self, "Update Error", "No download URL available.")
             return
 
+        delta_info = update_info.get("delta_info")
+        is_delta = delta_info is not None
+
         try:
             # Create progress dialog
             from PyQt6.QtWidgets import QProgressDialog
 
-            progress = QProgressDialog(
-                "Downloading update...", "Cancel", 0, 100, self
-            )
+            label = "Downloading delta update..." if is_delta else "Downloading update..."
+            progress = QProgressDialog(label, "Cancel", 0, 100, self)
             progress.setWindowTitle("Downloading Update")
             progress.setMinimumDuration(0)
             progress.setValue(0)
@@ -10146,22 +10160,37 @@ class TrainerWindow(QMainWindow):
                     progress.setLabelText(f"Downloading... {downloaded // 1024} / {total // 1024} KB")
                 QApplication.processEvents()
 
-            # Download
-            update_file = updater.download_update(download_url, update_progress)
+            # Download (delta or full)
+            if is_delta:
+                extract_dir = updater.download_delta_update(download_url, delta_info, update_progress)
+            else:
+                update_file = updater.download_update(download_url, update_progress)
             progress.close()
+
+            # Build install message
+            if is_delta:
+                file_count = delta_info.get("download_count", 0)
+                install_msg = f"Download complete. Install {file_count} changed files now?\n\n"
+            else:
+                install_msg = "Download complete. Install now?\n\n"
+            install_msg += "The application will restart after installation."
 
             # Confirm install
             reply = QMessageBox.question(
                 self,
                 "Install Update",
-                "Download complete. Install now?\n\n"
-                "The application will restart after installation.",
+                install_msg,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
 
             if reply == QMessageBox.StandardButton.Yes:
-                # Install
-                if updater.install_update(update_file):
+                # Install (delta or full)
+                if is_delta:
+                    success = updater.install_delta_update(extract_dir, delta_info)
+                else:
+                    success = updater.install_update(update_file)
+
+                if success:
                     QMessageBox.information(
                         self,
                         "Update",
