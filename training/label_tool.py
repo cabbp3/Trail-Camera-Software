@@ -845,6 +845,9 @@ class TrainerWindow(QMainWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save_current)
         self._known_hashes = None  # lazy-populated MD5 set for duplicate skip
+        # Photo list cache to reduce database calls
+        self._photos_cache = None
+        self._photos_cache_time = 0
 
         self._save_pending = False
         self.current_boxes = []
@@ -2000,7 +2003,7 @@ class TrainerWindow(QMainWindow):
         except Exception as e:
             QApplication.restoreOverrideCursor()
             # Don't show error on close, just log it
-            print(f"Cloud push failed: {e}")
+            logger.warning(f"Cloud push failed: {e}")
 
     def _reset_cloud_sync_preferences(self):
         """Reset the cloud sync and CuddeLink preferences so the app will ask again."""
@@ -2243,7 +2246,45 @@ class TrainerWindow(QMainWindow):
         # Update mark button state for current photo
         self._update_mark_button_state()
 
+        # Preload thumbnails for nearby photos in the filtered list
+        self._preload_nearby_thumbnails()
+
         self._loading_photo_data = False  # Done loading, allow auto-advance
+
+    def _preload_nearby_thumbnails(self, buffer: int = 10):
+        """Preload thumbnails for photos adjacent to current one in filtered list.
+
+        This ensures smooth scrolling by generating thumbnails for nearby photos
+        based on the current sort/filter order.
+        """
+        from image_processor import create_thumbnail
+
+        filtered = self._filtered_photos()
+        if not filtered:
+            return
+
+        # Find current position in filtered list
+        current_pos = None
+        for i, (idx, _) in enumerate(filtered):
+            if idx == self.index:
+                current_pos = i
+                break
+
+        if current_pos is None:
+            return
+
+        # Get range of photos to preload (buffer before and after)
+        start = max(0, current_pos - buffer)
+        end = min(len(filtered), current_pos + buffer + 1)
+
+        # Generate thumbnails for nearby photos (skips existing ones)
+        for i in range(start, end):
+            if i == current_pos:
+                continue  # Skip current photo
+            _, photo = filtered[i]
+            path = photo.get("file_path")
+            if path and os.path.exists(path):
+                create_thumbnail(path)  # Will skip if already exists
 
     def save_current(self):
         if not self.photos:
@@ -2307,7 +2348,7 @@ class TrainerWindow(QMainWindow):
         try:
             self.db.set_boxes(pid, self.current_boxes)
         except Exception as exc:
-            print(f"Box save failed: {exc}")
+            logger.error(f"Box save failed: {exc}")
         # Save second buck if toggled
         extras = []
         if self.add_buck_toggle.isChecked():
@@ -3173,7 +3214,7 @@ class TrainerWindow(QMainWindow):
         try:
             self.db.set_boxes(pid, self.current_boxes)
         except Exception as exc:
-            print(f"Box save failed: {exc}")
+            logger.error(f"Box save failed: {exc}")
 
     def _delete_box_by_idx(self, idx: int):
         """Remove a box by index (used by Delete key)."""
@@ -3239,9 +3280,9 @@ class TrainerWindow(QMainWindow):
             with labels_path.open("w", encoding="utf-8") as f:
                 for lbl in labels:
                     f.write(lbl + "\n")
-            print(f"[AI] Wrote {len(labels)} valid species to labels.txt")
+            logger.info(f"Wrote {len(labels)} valid species to labels.txt")
         except Exception as exc:
-            print(f"[AI] Failed to write labels.txt: {exc}")
+            logger.error(f"Failed to write labels.txt: {exc}")
 
     # ====== Suggestion review ======
     def _species_set(self) -> set:
@@ -3496,6 +3537,23 @@ class TrainerWindow(QMainWindow):
                 parsed = None
             return (parsed or datetime.min, p.get("file_path") or "")
         return sorted(photos, key=key)
+
+    def _get_all_photos_cached(self, force_refresh: bool = False) -> list:
+        """Get all photos with caching to reduce database calls.
+
+        Cache is valid for 5 seconds unless force_refresh is True.
+        """
+        import time
+        now = time.time()
+        if force_refresh or self._photos_cache is None or (now - self._photos_cache_time) > 5:
+            self._photos_cache = self.db.get_all_photos()
+            self._photos_cache_time = now
+        return self._photos_cache
+
+    def _invalidate_photos_cache(self):
+        """Invalidate the photos cache after modifications."""
+        self._photos_cache = None
+        self._photos_cache_time = 0
 
     def _maybe_autofill_exif(self, photo: dict):
         """Try to read EXIF to set camera model and date if missing."""
@@ -5101,7 +5159,7 @@ class TrainerWindow(QMainWindow):
             try:
                 dest_path, original_name, date_taken, camera_model = import_photo(str(file_path))
             except Exception as exc:
-                print(f"Import failed for {file_path}: {exc}")
+                logger.error(f"Import failed for {file_path}: {exc}")
                 continue
             if self.db.get_photo_id(dest_path):
                 # Already imported.
@@ -5113,7 +5171,7 @@ class TrainerWindow(QMainWindow):
                     self._known_hashes.add(file_hash)
                 imported += 1
             except Exception as exc:
-                print(f"DB insert failed for {dest_path}: {exc}")
+                logger.error(f"DB insert failed for {dest_path}: {exc}")
         return imported
 
     def _hash_file(self, path: Path) -> Optional[str]:
@@ -5125,7 +5183,7 @@ class TrainerWindow(QMainWindow):
                     h.update(chunk)
             return h.hexdigest()
         except Exception as exc:
-            print(f"Hash failed for {path}: {exc}")
+            logger.warning(f"Hash failed for {path}: {exc}")
             return None
 
     def _load_known_hashes(self) -> set:

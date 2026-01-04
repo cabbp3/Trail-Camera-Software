@@ -3,11 +3,14 @@ Image processing module for EXIF extraction and file operations.
 """
 import os
 import shutil
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple
 from PIL import Image
 from PIL.ExifTags import TAGS
+
+logger = logging.getLogger(__name__)
 
 # EXIF tag numbers (direct values for Pillow 11.3.0 compatibility)
 EXIF_MODEL = 0x0110  # 272 - Camera model
@@ -191,30 +194,40 @@ def import_photo(source_path: str) -> Tuple[str, str, str, str]:
     return (str(dest_path), source_path.name, date_taken or "", camera_model or "")
 
 
-def create_thumbnail(image_path: str, size: Tuple[int, int] = (250, 250)) -> Optional[str]:
+def create_thumbnail(image_path: str, size: Tuple[int, int] = (250, 250),
+                     force: bool = False) -> Optional[str]:
     """Create a thumbnail for an image.
-    
+
     Args:
         image_path: Path to source image
         size: Thumbnail size (width, height)
-        
+        force: If True, regenerate even if thumbnail exists
+
     Returns:
         Path to thumbnail file, or None if failed
     """
     try:
         thumb_dir = get_library_path() / ".thumbnails"
         thumb_dir.mkdir(parents=True, exist_ok=True)
-        
+
         source_path = Path(image_path)
         thumb_filename = f"{source_path.stem}_thumb.jpg"
         thumb_path = thumb_dir / thumb_filename
-        
+
+        # Skip if thumbnail already exists (unless forced)
+        if thumb_path.exists() and not force:
+            return str(thumb_path)
+
         with Image.open(image_path) as img:
+            # Convert RGBA/P mode to RGB for JPEG compatibility
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
             img.thumbnail(size, Image.Resampling.LANCZOS)
-            img.save(thumb_path, "JPEG", quality=85)
-        
+            # Lower quality (75) and optimize for smaller file size
+            img.save(thumb_path, "JPEG", quality=75, optimize=True)
+
         return str(thumb_path)
     except Exception as e:
-        print(f"Error creating thumbnail for {image_path}: {e}")
+        logger.warning(f"Error creating thumbnail for {image_path}: {e}")
         return None
 

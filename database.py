@@ -33,6 +33,8 @@ class TrailCamDatabase:
         self._lock = threading.RLock()  # Reentrant lock for thread safety
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Enable WAL mode for better concurrent access and performance
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self._init_database()
 
     def _execute_with_lock(self, func):
@@ -173,6 +175,11 @@ class TrailCamDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_deer_id ON deer_metadata(deer_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_deer_additional_photo ON deer_additional(photo_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_deer_additional_id ON deer_additional(deer_id)")
+        # Additional indexes for common query patterns
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_archived ON photos(archived)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_suggested_tag ON photos(suggested_tag)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_season ON photos(season_year)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_composite ON tags(photo_id, tag_name)")
         # Annotation boxes: store relative coords (0-1), label, and optional confidence
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS annotation_boxes (
@@ -1396,10 +1403,12 @@ class TrailCamDatabase:
         self.conn.commit()
 
     def archive_photos(self, photo_ids: List[int]):
-        """Archive multiple photos."""
+        """Archive multiple photos using batch update."""
+        if not photo_ids:
+            return
         cursor = self.conn.cursor()
-        for pid in photo_ids:
-            cursor.execute("UPDATE photos SET archived = 1 WHERE id = ?", (pid,))
+        placeholders = ",".join(["?"] * len(photo_ids))
+        cursor.execute(f"UPDATE photos SET archived = 1 WHERE id IN ({placeholders})", photo_ids)
         self.conn.commit()
 
     def get_archived_count(self) -> int:
