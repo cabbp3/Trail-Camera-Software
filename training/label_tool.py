@@ -3555,6 +3555,16 @@ class TrainerWindow(QMainWindow):
         self._photos_cache = None
         self._photos_cache_time = 0
 
+    def _refresh_photos(self, force: bool = False):
+        """Refresh self.photos from database with sorting.
+
+        Uses cache for efficiency. Call with force=True after modifications.
+        """
+        photos = self._get_all_photos_cached(force_refresh=force)
+        self.photos = self._sorted_photos(photos)
+        if self.index >= len(self.photos):
+            self.index = max(0, len(self.photos) - 1)
+
     def _maybe_autofill_exif(self, photo: dict):
         """Try to read EXIF to set camera model and date if missing."""
         from PIL import Image, ExifTags
@@ -4049,7 +4059,7 @@ class TrainerWindow(QMainWindow):
         """Fill characteristic dropdown from existing DB values."""
         try:
             options = []
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 kc = photo.get("key_characteristics") or ""
                 norm = self._normalize_tags_text(kc)
                 for tok in norm.split(","):
@@ -4079,7 +4089,7 @@ class TrainerWindow(QMainWindow):
         try:
             # Get unique camera locations from photos
             locations = set()
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 loc = photo.get("camera_location")
                 if loc and loc.strip():
                     locations.add(loc.strip())
@@ -4115,7 +4125,7 @@ class TrainerWindow(QMainWindow):
         # Get known locations from database
         try:
             locations = set()
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 loc = photo.get("camera_location")
                 if loc and loc.strip():
                     locations.add(loc.strip())
@@ -4193,7 +4203,7 @@ class TrainerWindow(QMainWindow):
         """Fill deer ID dropdown from existing IDs."""
         try:
             ids = set()
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 meta = self.db.get_deer_metadata(photo["id"])
                 did = meta.get("deer_id") or ""
                 if did:
@@ -4219,7 +4229,7 @@ class TrainerWindow(QMainWindow):
         """Keep the second-buck dropdown in sync with known IDs."""
         try:
             ids = set()
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 meta = self.db.get_deer_metadata(photo["id"])
                 if meta.get("deer_id"):
                     ids.add(meta["deer_id"])
@@ -4249,7 +4259,7 @@ class TrainerWindow(QMainWindow):
         self.suggest_filter_combo.addItem("All photos", "")
         self.suggest_filter_combo.addItem("Has suggestion", "__has__")
         try:
-            suggestions = sorted({p.get("suggested_tag") for p in self.db.get_all_photos() if p.get("suggested_tag")})
+            suggestions = sorted({p.get("suggested_tag") for p in self._get_all_photos_cached() if p.get("suggested_tag")})
         except Exception:
             suggestions = []
         for s in suggestions:
@@ -4271,7 +4281,7 @@ class TrainerWindow(QMainWindow):
             # Count photos by species
             species_counts = {}
             unlabeled_count = 0
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 tags = set(self.db.get_tags(photo["id"]))
                 species_tags = tags & VALID_SPECIES
                 if not species_tags:
@@ -4301,7 +4311,7 @@ class TrainerWindow(QMainWindow):
             buck_count = 0
             doe_count = 0
             unknown_count = 0
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 tags = set(self.db.get_tags(photo["id"]))
                 if "Buck" in tags:
                     buck_count += 1
@@ -4332,7 +4342,7 @@ class TrainerWindow(QMainWindow):
             id_counts = {}
             has_id_count = 0
             no_id_count = 0
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 meta = self.db.get_deer_metadata(photo["id"])
                 deer_id = meta.get("deer_id")
                 if deer_id:
@@ -4363,7 +4373,7 @@ class TrainerWindow(QMainWindow):
         try:
             # Count photos by camera_location
             location_counts = {}
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 loc = photo.get("camera_location")
                 if loc and loc.strip():
                     loc = loc.strip()
@@ -4390,7 +4400,7 @@ class TrainerWindow(QMainWindow):
         try:
             # Count photos by antler year
             year_counts = {}
-            for photo in self.db.get_all_photos():
+            for photo in self._get_all_photos_cached():
                 date_taken = photo.get("date_taken")
                 if date_taken:
                     season_year = TrailCamDatabase.compute_season_year(date_taken)
