@@ -176,9 +176,15 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ---
 
-## Current State (Jan 1, 2026)
+## Current State (Jan 2, 2026)
 
 **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
+
+**Database Stats:**
+- 6,588 total photos
+- 5,008 tagged photos
+- 1,584 with AI suggestions
+- 0 missing files
 
 **AI Pipeline:**
 1. MegaDetector detects animals → `ai_animal` boxes
@@ -191,17 +197,21 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 - CuddeLink photo downloads with retry logic
 - Integrated queue mode for reviewing AI suggestions
 - Background AI processing with live updates
-- Per-box tabbed interface for labeling multiple detections
-- Box labels on image showing species/suggestions
+- Per-box tabbed interface for labeling multiple detections ("Subject 1", "Subject 2", etc.)
+- Subject labels on image showing species/suggestions
+- Special one-time review queues (stored in `~/.trailcam/*_review_queue.json`)
+- "Re-run AI on Current Photo" option in Tools menu
+- "Clear" button to reset all labels on a photo
 
 **Known Issues:**
-- `training/label_tool.py` is 9000+ lines (could be split)
+- `training/label_tool.py` is 9500+ lines (could be split)
+- MegaDetector struggles with small birds (quail: only 22% detection rate)
 
 **Supabase:** Working via REST API (`supabase_rest.py`). Run `supabase_setup.sql` once to create tables.
 
 ---
 
-## Recent Session (Jan 1, 2026)
+## Recent Session (Jan 2, 2026)
 
 ### Work Completed This Session
 

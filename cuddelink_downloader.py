@@ -206,23 +206,40 @@ def _request_download_guid(session: requests.Session, photo_ids: List[str]) -> s
     return guid
 
 
-def _download_zip(session: requests.Session, guid: str) -> Path:
-    """Download the zip using the provided GUID."""
+def _download_zip(session: requests.Session, guid: str, progress_callback=None) -> Path:
+    """Download the zip using the provided GUID with optional progress reporting."""
     # If guid already points to a file path (direct zip), just return it.
     zip_path = Path(guid)
     if zip_path.exists():
         return zip_path
     params = {"fileGuid": guid, "filename": "CuddebackPhotos"}
     print(f"[CuddeLink] Downloading zip file (this may take a while)...")
+
+    # Stream the download to report progress
     resp = _retry_request(
         session.get,
         DOWNLOAD_FILE_URL,
         params=params,
-        timeout=600  # 10 minutes for large downloads
+        timeout=600,  # 10 minutes for large downloads
+        stream=True
     )
     resp.raise_for_status()
+
+    # Get content length if available
+    total_size = int(resp.headers.get('content-length', 0))
+
     zip_path = Path(tempfile.mkstemp(suffix=".zip")[1])
-    zip_path.write_bytes(resp.content)
+    downloaded = 0
+    chunk_size = 8192
+
+    with open(zip_path, 'wb') as f:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback and total_size > 0:
+                    progress_callback(downloaded, total_size, "download")
+
     return zip_path
 
 
@@ -327,7 +344,7 @@ def check_server_status() -> dict:
         }
 
 
-def _download_single_day(session: requests.Session, destination: Path, day_str: str) -> List[Path]:
+def _download_single_day(session: requests.Session, destination: Path, day_str: str, progress_callback=None) -> List[Path]:
     """Download photos for a single day. Returns list of extracted paths."""
     temp_extract = destination / ".cuddelink_tmp"
 
@@ -340,7 +357,7 @@ def _download_single_day(session: requests.Session, destination: Path, day_str: 
         return []
 
     guid = _request_download_guid(session, photo_ids)
-    zip_path = _download_zip(session, guid)
+    zip_path = _download_zip(session, guid, progress_callback)
     extracted = _extract_images(zip_path, temp_extract)
     print(f"[CuddeLink]   Extracted {len(extracted)} images for {day_str}")
 
@@ -353,7 +370,8 @@ def _download_single_day(session: requests.Session, destination: Path, day_str: 
 
 
 def download_new_photos(destination: Path, user: str = None, password: str = None,
-                        start_date: str = None, end_date: str = None) -> List[Path]:
+                        start_date: str = None, end_date: str = None,
+                        progress_callback=None) -> List[Path]:
     """
     Download photos from CuddeLink and extract them.
 
@@ -365,6 +383,10 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
         password: CuddeLink password (falls back to CUDDE_PASS env var)
         start_date: Start date for photo filter (YYYY-MM-DD format, default: 2025-12-11)
         end_date: End date for photo filter (YYYY-MM-DD format, default: today)
+        progress_callback: Optional callback(current, total, stage, message) for progress updates
+            - stage: "login", "day", "download", "done"
+            - For "day" stage: current=day_num, total=num_days
+            - For "download" stage: current=bytes_downloaded, total=total_bytes
 
     Returns:
         List of extracted image file paths (caller should import + clean up if desired).
@@ -398,6 +420,8 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
 
     try:
         print("[CuddeLink] Logging in...")
+        if progress_callback:
+            progress_callback(0, 1, "login", "Logging in...")
         _login(session, user, pw)
         print("[CuddeLink] Login successful!")
 
@@ -411,8 +435,16 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
             day_str = current_dt.strftime("%Y-%m-%d")
             print(f"[CuddeLink] Day {day_num}/{num_days}: {day_str}")
 
+            if progress_callback:
+                progress_callback(day_num, num_days, "day", f"Day {day_num}/{num_days}: {day_str}")
+
             try:
-                day_photos = _download_single_day(session, destination, day_str)
+                # Create a download progress callback that includes day context
+                def day_download_callback(downloaded, total, stage):
+                    if progress_callback:
+                        progress_callback(downloaded, total, "download", f"Downloading {day_str}...")
+
+                day_photos = _download_single_day(session, destination, day_str, day_download_callback)
                 all_extracted.extend(day_photos)
             except Exception as e:
                 print(f"[CuddeLink] Warning: Failed to download {day_str}: {e}")
@@ -425,6 +457,8 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
                 time.sleep(1)
 
         print(f"[CuddeLink] Done! Total extracted: {len(all_extracted)} images")
+        if progress_callback:
+            progress_callback(num_days, num_days, "done", f"Done! {len(all_extracted)} photos extracted")
         return all_extracted
 
     except requests.exceptions.HTTPError as e:

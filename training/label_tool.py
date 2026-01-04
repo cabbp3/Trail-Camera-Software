@@ -68,6 +68,7 @@ from PyQt6.QtWidgets import (
     QWidgetItem,
     QDateEdit,
     QTabWidget,
+    QGridLayout,
 )
 import PyQt6  # used for plugin path detection
 import sysconfig
@@ -1084,11 +1085,22 @@ class TrainerWindow(QMainWindow):
         box_row.setContentsMargins(0, 0, 0, 0)
         box_row.setSpacing(6)
         box_row.addWidget(self.box_tab_bar, 1)
-        self.delete_box_btn = QPushButton("Delete Box")
-        self.delete_box_btn.setMaximumWidth(80)
+        self.add_subject_btn = QPushButton("+")
+        self.add_subject_btn.setMaximumWidth(30)
+        self.add_subject_btn.setToolTip("Add new subject box (draw on image)")
+        self.add_subject_btn.clicked.connect(self._start_add_subject)
+        box_row.addWidget(self.add_subject_btn)
+        self.clear_labels_btn = QPushButton("Clear")
+        self.clear_labels_btn.setMaximumWidth(50)
+        self.clear_labels_btn.setToolTip("Clear all labels from all subjects")
+        self.clear_labels_btn.clicked.connect(self._clear_all_labels)
+        box_row.addWidget(self.clear_labels_btn)
+        self.delete_box_btn = QPushButton("Delete")
+        self.delete_box_btn.setMaximumWidth(60)
+        self.delete_box_btn.setToolTip("Delete current subject")
         self.delete_box_btn.clicked.connect(self._delete_current_box)
         box_row.addWidget(self.delete_box_btn)
-        form.addRow("Box:", box_row_widget)
+        form.addRow("Subject:", box_row_widget)
         species_row_widget = QWidget()
         species_row = QHBoxLayout(species_row_widget)
         species_row.setContentsMargins(0, 0, 0, 0)
@@ -1104,8 +1116,13 @@ class TrainerWindow(QMainWindow):
         self.apply_suggest_btn.clicked.connect(self._apply_suggestion)
         self.apply_all_suggest_btn = QToolButton()
         self.apply_all_suggest_btn.setText("Apply to All")
-        self.apply_all_suggest_btn.setToolTip("Apply all pending AI suggestions to unlabeled photos")
+        self.apply_all_suggest_btn.setToolTip("Apply current species to all boxes on this photo")
         self.apply_all_suggest_btn.clicked.connect(self._apply_all_suggestions)
+        self.accept_all_btn = QToolButton()
+        self.accept_all_btn.setText("Accept All")
+        self.accept_all_btn.setToolTip("Accept AI suggestion for all boxes on this photo")
+        self.accept_all_btn.setStyleSheet("background-color: #4a4; color: white;")
+        self.accept_all_btn.clicked.connect(self._accept_all_suggestions)
         # Quick buttons reuse the same recent species buttons
         suggest_row = QVBoxLayout()
         suggest_row.setContentsMargins(0, 0, 0, 0)
@@ -1116,6 +1133,7 @@ class TrainerWindow(QMainWindow):
         top_row.addWidget(self.suggest_label)
         top_row.addWidget(self.apply_suggest_btn)
         top_row.addWidget(self.apply_all_suggest_btn)
+        top_row.addWidget(self.accept_all_btn)
         top_row.addStretch()
         suggest_row.addLayout(top_row)
         form.addRow("Species:", species_row_widget)
@@ -1165,10 +1183,10 @@ class TrainerWindow(QMainWindow):
         # Box tools (split into two rows to avoid crowding)
         box_row_top = QHBoxLayout()
         box_row_bottom = QHBoxLayout()
-        self.box_subject_btn = QPushButton("Box: Subject")
+        self.box_subject_btn = QPushButton("Draw Subject")
         self.box_subject_btn.setCheckable(True)
         self.box_subject_btn.clicked.connect(lambda: self._set_box_mode("subject"))
-        self.box_head_btn = QPushButton("Box: Deer Head")
+        self.box_head_btn = QPushButton("Draw Deer Head")
         self.box_head_btn.setCheckable(True)
         self.box_head_btn.clicked.connect(lambda: self._set_box_mode("deer_head"))
         self.box_clear_btn = QPushButton("Clear Boxes")
@@ -1576,6 +1594,8 @@ class TrainerWindow(QMainWindow):
         clear_ai_action.triggered.connect(self.clear_all_ai_data)
         ai_action = self.tools_menu.addAction("Suggest Tags (AI)...")
         ai_action.triggered.connect(self.run_ai_suggestions)
+        rerun_ai_action = self.tools_menu.addAction("Re-run AI on Current Photo")
+        rerun_ai_action.triggered.connect(self.rerun_ai_current_photo)
         self.tools_menu.addSeparator()
         sex_suggest_action = self.tools_menu.addAction("Suggest Buck/Doe (AI) on Deer Photos...")
         sex_suggest_action.triggered.connect(self.run_sex_suggestions_on_deer)
@@ -1599,6 +1619,13 @@ class TrainerWindow(QMainWindow):
 
         site_review_action = self.tools_menu.addAction("Review Site Suggestions...")
         site_review_action.triggered.connect(self.review_site_suggestions)
+
+        self.claude_review_action = self.tools_menu.addAction("Claude Review Queue...")
+        self.claude_review_action.triggered.connect(self.review_claude_queue)
+        self._update_claude_queue_menu()
+
+        # Check for special one-time queue
+        self._check_special_queue_menu()
 
         self.tools_menu.addSeparator()
         profiles_action = self.tools_menu.addAction("Buck Profiles")
@@ -2572,6 +2599,12 @@ class TrainerWindow(QMainWindow):
         self.box_head_btn.setChecked(mode == "deer_head")
         self.view.set_draw_mode(mode)
 
+    def _start_add_subject(self):
+        """Enable draw mode to add a new subject box."""
+        self._set_box_mode("subject")
+        # Show a brief status message
+        self.statusBar().showMessage("Draw a box around the subject on the image", 5000)
+
     def _clear_boxes(self):
         self.current_boxes = []
         if self.scene:
@@ -2586,6 +2619,84 @@ class TrainerWindow(QMainWindow):
         self._persist_boxes()
         if self.ai_review_mode and not self._photo_has_ai_boxes(self.current_boxes):
             self._advance_ai_review()
+
+    def _clear_all_labels(self):
+        """Clear all labels (species, sex, age, deer_id, points) from all subject boxes."""
+        if not self.current_boxes:
+            return
+
+        # Clear labels from all subject boxes
+        for box in self.current_boxes:
+            # Skip head boxes
+            if self._is_head_box(box):
+                continue
+            box["species"] = ""
+            box["sex"] = ""
+            box["deer_id"] = ""
+            box["age_class"] = ""
+            box["left_points_min"] = None
+            box["right_points_min"] = None
+            box["left_points_uncertain"] = False
+            box["right_points_uncertain"] = False
+
+        # Persist changes
+        self._persist_boxes()
+
+        # Clear the form fields
+        self.species_combo.setCurrentText("")
+        for btn in self.sex_buttons.values():
+            btn.setChecked(False)
+        self.deer_id_edit.setCurrentText("")
+        self.age_combo.setCurrentText("")
+        self.left_min.clear()
+        self.right_min.clear()
+        self.left_uncertain.setChecked(False)
+        self.right_uncertain.setChecked(False)
+        self.tags_edit.clear()  # Clear tags field
+        self.current_species_label.setText("")  # Clear species label
+
+        # Also clear photo-level data from database
+        if self.photos and self.index < len(self.photos):
+            photo = self.photos[self.index]
+            pid = photo.get("id")
+            if pid:
+                self.db.update_photo_tags(pid, [])  # Clear all tags
+                self.db.set_suggested_tag(pid, None, None)
+                # Also clear in-memory photo data
+                photo["suggested_tag"] = None
+                photo["suggested_tag_confidence"] = None
+                photo["suggested_sex"] = None
+                photo["suggested_sex_confidence"] = None
+                # Clear deer metadata
+                self.db.set_deer_metadata(
+                    pid,
+                    deer_id=None,
+                    age_class=None,
+                    left_points_min=None,
+                    right_points_min=None,
+                    left_points_uncertain=False,
+                    right_points_uncertain=False,
+                    left_ab_points_min=None,
+                    right_ab_points_min=None,
+                    left_ab_points_uncertain=False,
+                    right_ab_points_uncertain=False,
+                    abnormal_points_min=None,
+                    abnormal_points_max=None
+                )
+                # Clear additional deer entries
+                self.db.set_additional_deer(pid, [])
+
+        # Update UI
+        self._update_box_tab_bar()
+        self._draw_boxes()
+        # Update current item in photo list without rebuilding entire list
+        current_item = self.photo_list_widget.currentItem()
+        if current_item and self.photos and self.index < len(self.photos):
+            photo = self.photos[self.index]
+            # Update item text to show cleared state
+            filename = os.path.basename(photo.get("file_path", ""))
+            current_item.setText(filename)  # Just show filename, no labels
+        self.statusBar().showMessage("Cleared all labels", 3000)
 
     # --- Detection helpers ---
     def _get_megadetector(self):
@@ -2864,9 +2975,9 @@ class TrainerWindow(QMainWindow):
             box_num = tab_idx + 1
             species = box.get("species", "")
             if species:
-                tab_name = f"Box {box_num}: {species}"
+                tab_name = f"Subject {box_num}: {species}"
             else:
-                tab_name = f"Box {box_num}"
+                tab_name = f"Subject {box_num}"
             self.box_tab_bar.addTab(QWidget(), tab_name)
 
         # Select first tab and set corresponding box index
@@ -2893,9 +3004,9 @@ class TrainerWindow(QMainWindow):
         box_num = tab_idx + 1  # Tab number, not box number
         species = box.get("species", "")
         if species:
-            tab_name = f"Box {box_num}: {species}"
+            tab_name = f"Subject {box_num}: {species}"
         else:
-            tab_name = f"Box {box_num}"
+            tab_name = f"Subject {box_num}"
         self.box_tab_bar.setTabText(tab_idx, tab_name)
 
     def _get_int_field(self, field) -> int:
@@ -3025,7 +3136,7 @@ class TrainerWindow(QMainWindow):
             self.scene.addItem(item)
             self.box_items.append(item)
 
-            # Add box label text (Box 1, Box 2, etc.) with species if known
+            # Add subject label text (Subject 1, Subject 2, etc.) with species if known
             box_num = idx + 1
             species = b.get("species", "")
             # If no per-box species, check for photo-level suggestion
@@ -3035,9 +3146,9 @@ class TrainerWindow(QMainWindow):
                 if species:
                     species = f"{species}?"  # Add ? to indicate it's a suggestion
             if species:
-                label_text = f"Box {box_num}: {species}"
+                label_text = f"Subject {box_num}: {species}"
             else:
-                label_text = f"Box {box_num}"
+                label_text = f"Subject {box_num}"
 
             # Create text item ABOVE the box for visibility
             text_item = self.scene.addSimpleText(label_text)
@@ -3673,23 +3784,26 @@ class TrainerWindow(QMainWindow):
         subject_boxes = self._get_subject_boxes()
 
         if not subject_boxes:
-            QMessageBox.information(self, "Apply to All", "No boxes in this photo.")
+            QMessageBox.information(self, "Apply to All", "No subjects in this photo.")
             return
 
-        # First check if ANY box has a label
-        species = ""
-        for box in subject_boxes:
-            box_species = box.get("species", "").strip()
-            if box_species:
-                species = box_species
-                break  # Use the first labeled box
+        # Priority: current form selection > existing box label > AI suggestion
+        species = self.species_combo.currentText().strip()
+
+        if not species:
+            # Check if ANY box has a saved label
+            for box in subject_boxes:
+                box_species = box.get("species", "").strip()
+                if box_species:
+                    species = box_species
+                    break  # Use the first labeled box
 
         if not species:
             # No labels found - fall back to AI suggestion
             species = getattr(self, "current_suggested_tag", "") or ""
 
         if not species:
-            QMessageBox.information(self, "Apply to All", "No species to apply. Label a box or wait for AI suggestion.")
+            QMessageBox.information(self, "Apply to All", "No species to apply. Label a subject or wait for AI suggestion.")
             return
 
         sex = self._get_sex()
@@ -3733,8 +3847,56 @@ class TrainerWindow(QMainWindow):
         # Redraw boxes to show labels
         self._draw_boxes()
 
-        # In queue mode, advance to next photo after applying to all
+        # In queue mode, mark current as reviewed and advance to next photo
         if self.queue_mode:
+            self._mark_current_list_item_reviewed()
+            self._queue_advance()
+
+    def _accept_all_suggestions(self):
+        """Accept AI suggestion and apply to all boxes on this photo."""
+        subject_boxes = self._get_subject_boxes()
+
+        if not subject_boxes:
+            QMessageBox.information(self, "Accept All", "No subjects in this photo.")
+            return
+
+        # Get AI suggestion
+        species = getattr(self, "current_suggested_tag", "") or ""
+
+        if not species:
+            QMessageBox.information(self, "Accept All", "No AI suggestion to accept.")
+            return
+
+        # Apply AI suggestion to all subject boxes
+        for idx in self._get_subject_box_indices():
+            box = self.current_boxes[idx]
+            box["species"] = species
+
+        # Update form field to match
+        self.species_combo.setCurrentText(species)
+
+        # Persist boxes
+        self._persist_boxes()
+
+        # Save species as a tag
+        self.save_current()
+
+        # Clear the suggested_tag so photo doesn't reappear in queue
+        if self.photos and self.index < len(self.photos):
+            current_pid = self.photos[self.index].get("id")
+            if current_pid:
+                self.db.set_suggested_tag(current_pid, None, None)
+                self.queue_reviewed.add(current_pid)
+
+        # Update tab bar to show new species on all tabs
+        self._update_box_tab_bar()
+
+        # Redraw boxes to show labels
+        self._draw_boxes()
+
+        # In queue mode, mark current as reviewed and advance to next photo
+        if self.queue_mode:
+            self._mark_current_list_item_reviewed()
             self._queue_advance()
 
     def _all_boxes_labeled(self) -> bool:
@@ -5237,6 +5399,7 @@ class TrainerWindow(QMainWindow):
 
         if imported:
             self.photos = self._sorted_photos(self.db.get_all_photos())
+            self._populate_collection_filter_options()  # Refresh collection dropdown
             self._populate_photo_list()
             if self.photos:
                 self.index = 0
@@ -5410,6 +5573,7 @@ class TrainerWindow(QMainWindow):
 
         if imported:
             self.photos = self._sorted_photos(self.db.get_all_photos())
+            self._populate_collection_filter_options()  # Refresh collection dropdown
             self._populate_photo_list()
             if self.photos:
                 self.index = 0
@@ -5708,10 +5872,25 @@ class TrainerWindow(QMainWindow):
         self._cudde_dialog = QDialog(self)
         self._cudde_dialog.setWindowTitle("CuddeLink Download")
         self._cudde_dialog.setModal(True)
-        self._cudde_dialog.setMinimumWidth(300)
+        self._cudde_dialog.setMinimumWidth(350)
         layout = QVBoxLayout(self._cudde_dialog)
         self._cudde_label = QLabel("Connecting to CuddeLink...")
         layout.addWidget(self._cudde_label)
+
+        # Day progress bar (e.g., Day 3/7)
+        self._cudde_day_progress = QProgressBar()
+        self._cudde_day_progress.setFormat("Day %v of %m")
+        self._cudde_day_progress.setValue(0)
+        layout.addWidget(self._cudde_day_progress)
+
+        # Download progress bar (bytes downloaded)
+        self._cudde_download_label = QLabel("")
+        layout.addWidget(self._cudde_download_label)
+        self._cudde_download_progress = QProgressBar()
+        self._cudde_download_progress.setFormat("%p%")
+        self._cudde_download_progress.setValue(0)
+        layout.addWidget(self._cudde_download_progress)
+
         cancel_btn = QPushButton("Cancel")
         layout.addWidget(cancel_btn)
 
@@ -5728,6 +5907,7 @@ class TrainerWindow(QMainWindow):
         class DownloadWorker(QThread):
             finished = pyqtSignal(list, str)  # files, error
             status = pyqtSignal(str)  # status update
+            progress = pyqtSignal(int, int, str, str)  # current, total, stage, message
 
             def __init__(self, dest, email, password, start_date, end_date):
                 super().__init__()
@@ -5740,14 +5920,43 @@ class TrainerWindow(QMainWindow):
             def run(self):
                 try:
                     self.status.emit("Logging in...")
+
+                    def progress_callback(current, total, stage, message):
+                        self.progress.emit(current, total, stage, message)
+
                     files = download_new_photos(self.dest, user=self.email, password=self.password,
-                                                start_date=self.start_date, end_date=self.end_date)
+                                                start_date=self.start_date, end_date=self.end_date,
+                                                progress_callback=progress_callback)
                     self.finished.emit(files, "")
                 except Exception as e:
                     self.finished.emit([], str(e))
 
         def on_status(msg):
             self._cudde_label.setText(msg)
+
+        def on_progress(current, total, stage, message):
+            if stage == "login":
+                self._cudde_label.setText(message)
+                self._cudde_day_progress.setValue(0)
+                self._cudde_download_progress.setValue(0)
+            elif stage == "day":
+                self._cudde_label.setText(message)
+                self._cudde_day_progress.setMaximum(total)
+                self._cudde_day_progress.setValue(current)
+                # Reset download progress for new day
+                self._cudde_download_progress.setValue(0)
+                self._cudde_download_label.setText("")
+            elif stage == "download":
+                # Show download progress in MB
+                mb_current = current / (1024 * 1024)
+                mb_total = total / (1024 * 1024)
+                self._cudde_download_label.setText(f"Downloading: {mb_current:.1f} / {mb_total:.1f} MB")
+                self._cudde_download_progress.setMaximum(total)
+                self._cudde_download_progress.setValue(current)
+            elif stage == "done":
+                self._cudde_label.setText(message)
+                self._cudde_day_progress.setValue(self._cudde_day_progress.maximum())
+                self._cudde_download_progress.setValue(self._cudde_download_progress.maximum())
 
         def on_download_complete(files, error):
             self._cudde_dialog.close()
@@ -5796,6 +6005,7 @@ class TrainerWindow(QMainWindow):
                 # Save the end date as last download date for next time
                 settings.setValue("cuddelink_last_download", end_date)
                 self.photos = self._sorted_photos(self.db.get_all_photos())
+                self._populate_collection_filter_options()  # Refresh collection dropdown
                 self._populate_photo_list()
                 if self.photos:
                     # Find newest photo by date_taken
@@ -5811,6 +6021,7 @@ class TrainerWindow(QMainWindow):
 
         self._cudde_worker = DownloadWorker(dest, email, password, start_date, end_date)
         self._cudde_worker.status.connect(on_status)
+        self._cudde_worker.progress.connect(on_progress)
         self._cudde_worker.finished.connect(on_download_complete)
         self._cudde_worker.start()
         self._cudde_dialog.show()
@@ -6371,10 +6582,89 @@ class TrainerWindow(QMainWindow):
 
         self._update_queue_ui()
 
+    def _check_special_queue_menu(self):
+        """Check for special one-time review queue files and add menu items if they exist."""
+        import json
+
+        # Check for Turkey queue
+        turkey_file = os.path.expanduser("~/.trailcam/turkey_review_queue.json")
+        if os.path.exists(turkey_file):
+            try:
+                with open(turkey_file, 'r') as f:
+                    photo_ids = json.load(f)
+                if photo_ids:
+                    action = self.tools_menu.addAction(f"★ Review Turkey Boxes ({len(photo_ids)} photos)")
+                    action.triggered.connect(lambda: self._run_special_queue("turkey", turkey_file))
+                    self._special_queue_actions = getattr(self, '_special_queue_actions', [])
+                    self._special_queue_actions.append(action)
+            except Exception:
+                pass
+
+        # Check for Quail queue
+        quail_file = os.path.expanduser("~/.trailcam/quail_review_queue.json")
+        if os.path.exists(quail_file):
+            try:
+                with open(quail_file, 'r') as f:
+                    photo_ids = json.load(f)
+                if photo_ids:
+                    action = self.tools_menu.addAction(f"★ Review Quail Boxes ({len(photo_ids)} photos)")
+                    action.triggered.connect(lambda: self._run_special_queue("quail", quail_file))
+                    self._special_queue_actions = getattr(self, '_special_queue_actions', [])
+                    self._special_queue_actions.append(action)
+            except Exception:
+                pass
+
+    def _run_special_queue(self, queue_name: str, queue_file: str):
+        """Run a special review queue."""
+        import json
+
+        if not os.path.exists(queue_file):
+            QMessageBox.information(self, "Special Queue", "Queue file not found.")
+            return
+
+        with open(queue_file, 'r') as f:
+            photo_ids = json.load(f)
+
+        if not photo_ids:
+            QMessageBox.information(self, "Special Queue", "No photos in queue.")
+            os.remove(queue_file)
+            return
+
+        title = queue_name.title()
+
+        # Enter queue mode directly (AI detection already done)
+        self._enter_queue_mode(
+            queue_type=f"{queue_name}_boxes",
+            photo_ids=photo_ids,
+            title=f"{title} Box Review ({len(photo_ids)} photos)"
+        )
+
+        # Connect exit to cleanup
+        self._special_queue_cleanup = lambda: self._cleanup_special_queue(queue_file)
+
+    def _cleanup_special_queue(self, queue_file: str):
+        """Remove the special queue file after review is complete."""
+        try:
+            if os.path.exists(queue_file):
+                os.remove(queue_file)
+            # Remove menu items for this queue
+            if hasattr(self, '_special_queue_actions'):
+                for action in self._special_queue_actions[:]:
+                    if queue_file.split('/')[-1].replace('_review_queue.json', '') in action.text().lower():
+                        self.tools_menu.removeAction(action)
+                        self._special_queue_actions.remove(action)
+        except Exception:
+            pass
+
     def _exit_queue_mode(self):
         """Exit queue mode and return to normal view."""
         if not self.queue_mode:
             return
+
+        # Check for special queue cleanup
+        if hasattr(self, '_special_queue_cleanup') and self._special_queue_cleanup:
+            self._special_queue_cleanup()
+            self._special_queue_cleanup = None
 
         # Remember current photo to stay on it
         current_photo_id = None
@@ -6559,22 +6849,255 @@ class TrainerWindow(QMainWindow):
         QMessageBox.information(self, "Queue Complete", f"Finished reviewing {reviewed_count} photo(s).")
 
     def review_species_suggestions_integrated(self):
-        """Review species suggestions using integrated queue mode."""
+        """Enter integrated queue mode for species review."""
         pending = self._gather_pending_species_suggestions()
         if not pending:
             QMessageBox.information(self, "Species Suggestions", "No pending species suggestions to review.")
             return
 
         # Build queue data
-        photo_ids = [p["id"] for p in pending]
-        data = {p["id"]: {"species": p["species"], "conf": p["conf"]} for p in pending}
+        photo_ids = [item["id"] for item in pending]
+        queue_data = {}
+        for item in pending:
+            queue_data[item["id"]] = {
+                "species": item.get("species"),
+                "conf": item.get("conf", 0)
+            }
 
         self._enter_queue_mode(
             queue_type="species",
             photo_ids=photo_ids,
-            data=data,
+            data=queue_data,
             title=f"Species Review ({len(pending)})"
         )
+
+    def _review_species_batch_grid(self, pending):
+        """Batch grid view for species review - 16 thumbnails at a time."""
+        # Group by suggested species
+        by_species = {}
+        for item in pending:
+            sp = item.get("species", "Unknown")
+            if sp not in by_species:
+                by_species[sp] = []
+            by_species[sp].append(item)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Species Review ({len(pending)} photos)")
+        dlg.resize(1200, 850)
+        layout = QVBoxLayout(dlg)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Suggested:"))
+        species_filter = QComboBox()
+        species_filter.addItem(f"All ({len(pending)})")
+        for sp, items in sorted(by_species.items(), key=lambda x: -len(x[1])):
+            species_filter.addItem(f"{sp} ({len(items)})")
+        species_filter.setMinimumWidth(200)
+        top_row.addWidget(species_filter)
+        top_row.addStretch()
+
+        page_label = QLabel("Page 1 of 1")
+        prev_btn = QPushButton("Prev")
+        next_btn = QPushButton("Next")
+        top_row.addWidget(prev_btn)
+        top_row.addWidget(page_label)
+        top_row.addWidget(next_btn)
+
+        select_all_btn = QPushButton("Select All")
+        clear_sel_btn = QPushButton("Clear Sel")
+        top_row.addWidget(select_all_btn)
+        top_row.addWidget(clear_sel_btn)
+        layout.addLayout(top_row)
+
+        GRID_COLS, GRID_ROWS, THUMB_SIZE = 4, 4, 200
+        grid_widget = QWidget()
+        grid_layout = QGridLayout(grid_widget)
+        grid_layout.setSpacing(5)
+
+        thumb_widgets = []
+        for row in range(GRID_ROWS):
+            for col in range(GRID_COLS):
+                cell = QWidget()
+                cell_layout = QVBoxLayout(cell)
+                cell_layout.setContentsMargins(2, 2, 2, 2)
+                cell_layout.setSpacing(2)
+                thumb_label = QLabel()
+                thumb_label.setFixedSize(THUMB_SIZE, THUMB_SIZE)
+                thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                thumb_label.setStyleSheet("background-color: #333; border: 2px solid #555;")
+                info_label = QLabel()
+                info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                info_label.setStyleSheet("font-size: 10px; color: #aaa;")
+                check = QCheckBox()
+                cell_layout.addWidget(thumb_label)
+                cell_layout.addWidget(info_label)
+                cell_layout.addWidget(check, alignment=Qt.AlignmentFlag.AlignCenter)
+                grid_layout.addWidget(cell, row, col)
+                thumb_widgets.append({"label": thumb_label, "info": info_label, "check": check, "item": None})
+
+        scroll = QScrollArea()
+        scroll.setWidget(grid_widget)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+
+        tag_row = QHBoxLayout()
+        tag_row.addWidget(QLabel("Apply to selected:"))
+        accept_btn = QPushButton("Accept Suggestion")
+        accept_btn.setStyleSheet("background-color: #66aa66; font-weight: bold;")
+        tag_row.addWidget(accept_btn)
+        for species in ["Deer", "Turkey", "Raccoon", "Squirrel", "Opossum", "Empty"]:
+            btn = QPushButton(species)
+            btn.setMinimumWidth(60)
+            if species == "Deer":
+                btn.setStyleSheet("background-color: #8B4513; color: white;")
+            tag_row.addWidget(btn)
+            btn.clicked.connect(lambda checked, s=species: apply_tag(s))
+        tag_row.addStretch()
+        skip_btn = QPushButton("Skip Selected")
+        tag_row.addWidget(skip_btn)
+        single_view_btn = QPushButton("Single View")
+        single_view_btn.setStyleSheet("background-color: #555; color: white;")
+        single_view_btn.setToolTip("Switch to single photo view")
+        tag_row.addWidget(single_view_btn)
+        close_btn = QPushButton("Close")
+        tag_row.addWidget(close_btn)
+        layout.addLayout(tag_row)
+
+        switch_to_single = [False]
+
+        current_items = []
+        current_page = [0]
+        ITEMS_PER_PAGE = GRID_COLS * GRID_ROWS
+
+        def get_filtered():
+            ft = species_filter.currentText()
+            fr = ft.split(" (")[0] if " (" in ft else None
+            return pending[:] if fr == "All" else [i for i in pending if i.get("species") == fr]
+
+        def load_page():
+            nonlocal current_items
+            current_items = get_filtered()
+            tp = max(1, (len(current_items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+            current_page[0] = max(0, min(current_page[0], tp - 1))
+            page_label.setText(f"Page {current_page[0] + 1} of {tp}")
+            prev_btn.setEnabled(current_page[0] > 0)
+            next_btn.setEnabled(current_page[0] < tp - 1)
+            start = current_page[0] * ITEMS_PER_PAGE
+            page_items = current_items[start:start + ITEMS_PER_PAGE]
+            for i, tw in enumerate(thumb_widgets):
+                if i < len(page_items):
+                    item = page_items[i]
+                    tw["item"] = item
+                    tw["check"].setChecked(False)
+                    tw["check"].setVisible(True)
+                    tw["label"].setVisible(True)
+                    tw["info"].setVisible(True)
+                    tw["info"].setText(f"{item.get('species', '?')} ({int(item.get('conf', 0)*100)}%)")
+                    path = item.get("path", "")
+                    if path and os.path.exists(path):
+                        px = QPixmap(path)
+                        if not px.isNull():
+                            tw["label"].setPixmap(px.scaled(THUMB_SIZE, THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
+                        else:
+                            tw["label"].setText("Error")
+                    else:
+                        tw["label"].setText("N/A")
+                else:
+                    tw["item"] = None
+                    tw["check"].setVisible(False)
+                    tw["label"].setVisible(False)
+                    tw["info"].setVisible(False)
+                    tw["label"].clear()
+            dlg.setWindowTitle(f"Species Review ({len(current_items)} photos)")
+
+        def get_selected():
+            return [tw["item"] for tw in thumb_widgets if tw["item"] and tw["check"].isChecked()]
+
+        def apply_tag(species):
+            sel = get_selected()
+            if not sel:
+                QMessageBox.information(dlg, "No Selection", "Select photos first.")
+                return
+            boxes_labeled = 0
+            for item in sel:
+                pid = item["id"]
+                # Apply species to ALL boxes on this photo
+                boxes = self.db.get_boxes(pid)
+                for box in boxes:
+                    box_id = box.get("id")
+                    if box_id:
+                        self.db.set_box_species(box_id, species, 1.0)
+                        boxes_labeled += 1
+                # Also add tag to photo for consistency
+                self.db.add_tag(pid, species)
+                self.db.set_suggested_tag(pid, None, None)
+                if item in pending:
+                    pending.remove(item)
+            load_page()
+            if not pending:
+                QMessageBox.information(dlg, "Done", f"All reviewed! ({boxes_labeled} boxes labeled)")
+                dlg.close()
+
+        def accept_suggestions():
+            sel = get_selected()
+            if not sel:
+                QMessageBox.information(dlg, "No Selection", "Select photos first.")
+                return
+            boxes_labeled = 0
+            for item in sel:
+                pid = item["id"]
+                species = item.get("species")
+                if species:
+                    # Apply species to ALL boxes on this photo
+                    boxes = self.db.get_boxes(pid)
+                    for box in boxes:
+                        box_id = box.get("id")
+                        if box_id:
+                            self.db.set_box_species(box_id, species, 1.0)
+                            boxes_labeled += 1
+                    self.db.add_tag(pid, species)
+                self.db.set_suggested_tag(pid, None, None)
+                if item in pending:
+                    pending.remove(item)
+            load_page()
+            if not pending:
+                QMessageBox.information(dlg, "Done", f"All reviewed! ({boxes_labeled} boxes labeled)")
+                dlg.close()
+
+        def skip_selected():
+            sel = get_selected()
+            if not sel:
+                return
+            for item in sel:
+                self.db.set_suggested_tag(item["id"], None, None)
+                if item in pending:
+                    pending.remove(item)
+            load_page()
+            if not pending:
+                dlg.close()
+
+        species_filter.currentIndexChanged.connect(lambda: (current_page.__setitem__(0, 0), load_page()))
+        prev_btn.clicked.connect(lambda: (current_page.__setitem__(0, current_page[0] - 1), load_page()))
+        next_btn.clicked.connect(lambda: (current_page.__setitem__(0, current_page[0] + 1), load_page()))
+        select_all_btn.clicked.connect(lambda: [tw["check"].setChecked(True) for tw in thumb_widgets if tw["item"]])
+        clear_sel_btn.clicked.connect(lambda: [tw["check"].setChecked(False) for tw in thumb_widgets])
+        accept_btn.clicked.connect(accept_suggestions)
+        skip_btn.clicked.connect(skip_selected)
+
+        def switch_to_single_view():
+            switch_to_single[0] = True
+            dlg.accept()
+
+        single_view_btn.clicked.connect(switch_to_single_view)
+        close_btn.clicked.connect(dlg.close)
+        for tw in thumb_widgets:
+            tw["label"].mousePressEvent = lambda e, t=tw: t["check"].setChecked(not t["check"].isChecked()) if t["item"] else None
+        load_page()
+        dlg.exec()
+
+        # After dialog closes, check if we should switch to single view
+        if switch_to_single[0] and pending:
+            self._review_species_single(pending)
 
     # ====== BACKGROUND AI PROCESSING ======
 
@@ -6713,15 +7236,18 @@ class TrainerWindow(QMainWindow):
             self.queue_progress_bar.hide()
             self.queue_suggestion_label.setText("AI processing cancelled")
 
-    def review_species_suggestions(self):
+    def review_species_suggestions(self, pending=None):
         """Review and approve/reject pending species suggestions with zoomable photo preview."""
         from PyQt6.QtWidgets import QGraphicsView
 
-        # Gather pending species suggestions
-        pending = self._gather_pending_species_suggestions()
+        # Gather pending species suggestions if not passed
+        if pending is None:
+            pending = self._gather_pending_species_suggestions()
         if not pending:
             QMessageBox.information(self, "Species Suggestions", "No pending species suggestions to review.")
             return
+
+        switch_to_grid = [False]  # Flag to switch to grid view after closing
 
         # Create review dialog
         dlg = QDialog(self)
@@ -6882,6 +7408,9 @@ class TrainerWindow(QMainWindow):
         multi_checkbox.setToolTip("Check to add multiple species to the same photo")
         next_btn = QPushButton("Next (N)")
         next_btn.setToolTip("Move to next photo (use when Multi-species is checked)")
+        grid_view_btn = QPushButton("Grid View")
+        grid_view_btn.setStyleSheet("background-color: #555; color: white;")
+        grid_view_btn.setToolTip("Switch to batch grid view (16 at a time)")
         close_btn = QPushButton("Close")
         btn_row.addWidget(accept_btn)
         btn_row.addWidget(reject_btn)
@@ -6889,6 +7418,7 @@ class TrainerWindow(QMainWindow):
         btn_row.addWidget(multi_checkbox)
         btn_row.addWidget(next_btn)
         btn_row.addStretch()
+        btn_row.addWidget(grid_view_btn)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
@@ -7143,6 +7673,11 @@ class TrainerWindow(QMainWindow):
         close_btn.clicked.connect(dlg.accept)
         multi_checkbox.toggled.connect(_on_multi_toggled)
 
+        def _switch_to_grid():
+            switch_to_grid[0] = True
+            dlg.accept()
+        grid_view_btn.clicked.connect(_switch_to_grid)
+
         # Connect species quick buttons
         for sp, btn in species_buttons.items():
             btn.clicked.connect(lambda checked, s=sp: _accept_as(s))
@@ -7225,8 +7760,9 @@ class TrainerWindow(QMainWindow):
         # Use event filter for reliable gesture handling
         from PyQt6.QtCore import QObject, QEvent
         class GestureFilter(QObject):
+            GESTURE_TYPE = QEvent.Type.Gesture  # Class attribute for scope
             def eventFilter(self, obj, event):
-                if event.type() == QEvent.Type.Gesture:
+                if event.type() == self.GESTURE_TYPE:
                     pinch = event.gesture(Qt.GestureType.PinchGesture)
                     if pinch and pinch.state() == Qt.GestureState.GestureUpdated:
                         current = _get_current_scale()
@@ -7257,6 +7793,14 @@ class TrainerWindow(QMainWindow):
 
         dlg.exec()
         self._populate_photo_list()
+
+        # After dialog closes, check if we should switch to grid view
+        if switch_to_grid[0] and pending:
+            self._review_species_batch_grid(pending)
+
+    def _review_species_single(self, pending):
+        """Single-photo species review (wrapper for toggle)."""
+        self.review_species_suggestions(pending)
 
     def _gather_pending_species_suggestions(self) -> list:
         """Return list of photos with pending species suggestions."""
@@ -8309,8 +8853,9 @@ class TrainerWindow(QMainWindow):
         # Use event filter for reliable gesture handling
         from PyQt6.QtCore import QObject, QEvent
         class GestureFilter(QObject):
+            GESTURE_TYPE = QEvent.Type.Gesture  # Class attribute for scope
             def eventFilter(self, obj, event):
-                if event.type() == QEvent.Type.Gesture:
+                if event.type() == self.GESTURE_TYPE:
                     pinch = event.gesture(Qt.GestureType.PinchGesture)
                     if pinch and pinch.state() == Qt.GestureState.GestureUpdated:
                         current = _get_current_scale()
@@ -8458,6 +9003,96 @@ class TrainerWindow(QMainWindow):
             QMessageBox.information(self, "AI Boxes", f"Added {len(new_boxes)} AI box(es).")
         except Exception as exc:
             QMessageBox.warning(self, "AI Boxes", f"Detector failed: {exc}")
+
+    def rerun_ai_current_photo(self):
+        """Re-run all AI (detection + classification) on the current photo, ignoring existing labels."""
+        if not self.photos or self.index >= len(self.photos):
+            QMessageBox.information(self, "Re-run AI", "No photo selected.")
+            return
+
+        photo = self.photos[self.index]
+        pid = photo.get("id")
+        path = photo.get("file_path")
+
+        if not path or not os.path.exists(path):
+            QMessageBox.information(self, "Re-run AI", "Image file not found.")
+            return
+
+        self.statusBar().showMessage("Running AI detection and classification...")
+        QApplication.processEvents()
+
+        results = []
+
+        # Step 1: Clear existing AI boxes
+        self.current_boxes = [b for b in self.current_boxes if not str(b.get("label", "")).startswith("ai_")]
+
+        # Step 2: Run MegaDetector
+        try:
+            new_boxes = self._detect_boxes_megadetector(path, conf_thresh=0.2)
+            if new_boxes:
+                self.current_boxes.extend(new_boxes)
+                results.append(f"Detected {len(new_boxes)} subject(s)")
+            else:
+                # Only suggest Empty if there are NO boxes at all (including existing ones)
+                existing_boxes = self.db.get_boxes(pid)
+                if not existing_boxes and not self.current_boxes:
+                    results.append("No subjects detected - suggesting Empty")
+                    self.db.set_suggested_tag(pid, "Empty", 1.0)
+                    photo["suggested_tag"] = "Empty"
+                    photo["suggested_confidence"] = 1.0
+                else:
+                    results.append("No new subjects detected (existing boxes preserved)")
+        except Exception as e:
+            results.append(f"Detection failed: {e}")
+
+        # Step 3: Run species classifier on detected boxes
+        try:
+            if hasattr(self, "ai_suggester") and self.ai_suggester:
+                animal_boxes = [b for b in self.current_boxes if str(b.get("label", "")).startswith("ai_animal")]
+                if animal_boxes:
+                    # Get species suggestion for the photo
+                    import PIL.Image as PILImage
+                    img = PILImage.open(path).convert("RGB")
+                    w, h = img.size
+
+                    species_results = []
+                    for box in animal_boxes:
+                        # Crop the box region
+                        x1 = int(box["x1"] * w)
+                        y1 = int(box["y1"] * h)
+                        x2 = int(box["x2"] * w)
+                        y2 = int(box["y2"] * h)
+                        crop = img.crop((x1, y1, x2, y2))
+
+                        # Run classifier
+                        label, conf = self.ai_suggester.predict(crop)
+                        if label:
+                            species_results.append(f"{label} ({int(conf*100)}%)")
+                            box["species"] = label  # Store on box
+
+                    if species_results:
+                        results.append(f"Species: {', '.join(species_results)}")
+
+                        # Set suggested tag for the photo (use first result)
+                        first_label = animal_boxes[0].get("species", "")
+                        if first_label:
+                            self.db.set_suggested_tag(pid, first_label, conf)
+                            photo["suggested_tag"] = first_label
+                            photo["suggested_tag_confidence"] = conf
+        except Exception as e:
+            results.append(f"Classification failed: {e}")
+
+        # Step 4: Persist and update UI
+        self._persist_boxes()
+        self._draw_boxes()
+        self._update_box_tab_bar()
+        self._update_suggestion_display(photo)
+        self._populate_photo_list()
+
+        # Show results
+        result_msg = "\n".join(results) if results else "AI processing complete"
+        self.statusBar().showMessage(result_msg, 5000)
+        QMessageBox.information(self, "Re-run AI", result_msg)
 
     def run_ai_boxes_all(self):
         """Run detector across all photos in the database."""
@@ -8899,9 +9534,38 @@ class TrainerWindow(QMainWindow):
         if not btn or not btn.text():
             return
         species = btn.text()
+
+        # Update the current box's species directly
+        if hasattr(self, "current_boxes") and self.current_boxes:
+            if self.current_box_index < len(self.current_boxes):
+                self.current_boxes[self.current_box_index]["species"] = species
+                self._update_box_tab_name(self.current_box_index)
+
+        # Update the combo (without triggering _on_species_changed again)
+        self.species_combo.blockSignals(True)
         self.species_combo.setCurrentText(species)
-        # save_current() now handles multi-species mode automatically
-        self.schedule_save()
+        self.species_combo.blockSignals(False)
+
+        # Save immediately
+        self.save_current()
+
+        # In queue mode, check if all boxes labeled and advance
+        if self.queue_mode and not self._loading_photo_data:
+            # Don't auto-advance if "Multiple species" is checked
+            if hasattr(self, 'queue_multi_species') and self.queue_multi_species.isChecked():
+                return
+            # Only advance when ALL boxes are labeled
+            if self._all_boxes_labeled():
+                current_pid = None
+                if self.photos and self.index < len(self.photos):
+                    current_pid = self.photos[self.index].get("id")
+                if current_pid:
+                    if current_pid in self.queue_reviewed:
+                        return  # Already reviewed
+                    self.queue_reviewed.add(current_pid)
+                    self.db.set_suggested_tag(current_pid, None, None)
+                    self._mark_current_list_item_reviewed()
+                self._queue_advance()
 
     def _on_other_species_clicked(self):
         """Open dialog to type a custom species name."""
@@ -9548,6 +10212,196 @@ class TrainerWindow(QMainWindow):
         self._populate_site_filter_options()
         self._populate_photo_list()
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Claude Review Queue
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _update_claude_queue_menu(self):
+        """Update the Claude review queue menu item with count."""
+        if not hasattr(self, 'claude_review_action'):
+            return
+        count = self.db.get_claude_review_count()
+        if count > 0:
+            self.claude_review_action.setText(f"Claude Review Queue ({count})...")
+        else:
+            self.claude_review_action.setText("Claude Review Queue...")
+
+    def review_claude_queue(self):
+        """Review photos flagged by Claude - batch grid mode for quick tagging."""
+        queue = self.db.get_claude_review_queue()
+        if not queue:
+            QMessageBox.information(self, "Claude Review", "No photos in the Claude review queue.")
+            return
+
+        by_reason = {}
+        for item in queue:
+            reason = item.get("reason", "Unknown")
+            if reason not in by_reason:
+                by_reason[reason] = []
+            by_reason[reason].append(item)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Claude Review Queue ({len(queue)} photos)")
+        dlg.resize(1200, 850)
+        layout = QVBoxLayout(dlg)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Reason:"))
+        reason_filter = QComboBox()
+        reason_filter.addItem(f"All ({len(queue)})")
+        for reason, items in sorted(by_reason.items()):
+            reason_filter.addItem(f"{reason} ({len(items)})")
+        reason_filter.setMinimumWidth(250)
+        top_row.addWidget(reason_filter)
+        top_row.addStretch()
+
+        page_label = QLabel("Page 1 of 1")
+        prev_btn = QPushButton("Prev")
+        next_btn = QPushButton("Next")
+        top_row.addWidget(prev_btn)
+        top_row.addWidget(page_label)
+        top_row.addWidget(next_btn)
+
+        select_all_btn = QPushButton("Select All")
+        clear_sel_btn = QPushButton("Clear Sel")
+        top_row.addWidget(select_all_btn)
+        top_row.addWidget(clear_sel_btn)
+        layout.addLayout(top_row)
+
+        GRID_COLS, GRID_ROWS, THUMB_SIZE = 4, 4, 200
+        grid_widget = QWidget()
+        grid_layout = QGridLayout(grid_widget)
+        grid_layout.setSpacing(5)
+
+        thumb_widgets = []
+        for row in range(GRID_ROWS):
+            for col in range(GRID_COLS):
+                cell = QWidget()
+                cell_layout = QVBoxLayout(cell)
+                cell_layout.setContentsMargins(2, 2, 2, 2)
+                cell_layout.setSpacing(2)
+                thumb_label = QLabel()
+                thumb_label.setFixedSize(THUMB_SIZE, THUMB_SIZE)
+                thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                thumb_label.setStyleSheet("background-color: #333; border: 2px solid #555;")
+                check = QCheckBox()
+                cell_layout.addWidget(thumb_label)
+                cell_layout.addWidget(check, alignment=Qt.AlignmentFlag.AlignCenter)
+                grid_layout.addWidget(cell, row, col)
+                thumb_widgets.append({"label": thumb_label, "check": check, "item": None})
+
+        scroll = QScrollArea()
+        scroll.setWidget(grid_widget)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+
+        tag_row = QHBoxLayout()
+        tag_row.addWidget(QLabel("Apply to selected:"))
+        for species in ["Deer", "Turkey", "Raccoon", "Squirrel", "Opossum", "Rabbit", "Empty"]:
+            btn = QPushButton(species)
+            btn.setMinimumWidth(70)
+            if species == "Empty":
+                btn.setStyleSheet("background-color: #888;")
+            elif species == "Deer":
+                btn.setStyleSheet("background-color: #8B4513; color: white;")
+            tag_row.addWidget(btn)
+            btn.clicked.connect(lambda checked, s=species: apply_tag(s))
+        tag_row.addStretch()
+        mark_reviewed_btn = QPushButton("Mark Reviewed")
+        mark_reviewed_btn.setStyleSheet("background-color: #66aa66;")
+        tag_row.addWidget(mark_reviewed_btn)
+        close_btn = QPushButton("Close")
+        tag_row.addWidget(close_btn)
+        layout.addLayout(tag_row)
+
+        current_items = []
+        current_page = [0]
+        ITEMS_PER_PAGE = GRID_COLS * GRID_ROWS
+
+        def get_filtered():
+            ft = reason_filter.currentText()
+            fr = ft.split(" (")[0] if " (" in ft else None
+            return queue[:] if fr == "All" else [i for i in queue if i.get("reason") == fr]
+
+        def load_page():
+            nonlocal current_items
+            current_items = get_filtered()
+            tp = max(1, (len(current_items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+            current_page[0] = max(0, min(current_page[0], tp - 1))
+            page_label.setText(f"Page {current_page[0] + 1} of {tp}")
+            prev_btn.setEnabled(current_page[0] > 0)
+            next_btn.setEnabled(current_page[0] < tp - 1)
+            start = current_page[0] * ITEMS_PER_PAGE
+            page_items = current_items[start:start + ITEMS_PER_PAGE]
+            for i, tw in enumerate(thumb_widgets):
+                if i < len(page_items):
+                    item = page_items[i]
+                    tw["item"] = item
+                    tw["check"].setChecked(False)
+                    tw["check"].setVisible(True)
+                    tw["label"].setVisible(True)
+                    path = item.get("file_path", "")
+                    if path and os.path.exists(path):
+                        px = QPixmap(path)
+                        if not px.isNull():
+                            tw["label"].setPixmap(px.scaled(THUMB_SIZE, THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
+                        else:
+                            tw["label"].setText("Error")
+                    else:
+                        tw["label"].setText("N/A")
+                else:
+                    tw["item"] = None
+                    tw["check"].setVisible(False)
+                    tw["label"].setVisible(False)
+                    tw["label"].clear()
+            dlg.setWindowTitle(f"Claude Review Queue ({len(current_items)} photos)")
+
+        def get_selected():
+            return [tw["item"] for tw in thumb_widgets if tw["item"] and tw["check"].isChecked()]
+
+        def apply_tag(species):
+            sel = get_selected()
+            if not sel:
+                QMessageBox.information(dlg, "No Selection", "Select photos first.")
+                return
+            for item in sel:
+                pid = item["photo_id"]
+                self.db.add_tag(pid, species)
+                self.db.set_suggested_tag(pid, None, None)
+                self.db.mark_claude_reviewed(pid)
+                if item in queue:
+                    queue.remove(item)
+            self._update_claude_queue_menu()
+            load_page()
+            if not queue:
+                QMessageBox.information(dlg, "Done", "All reviewed!")
+                dlg.close()
+
+        def mark_sel_reviewed():
+            sel = get_selected()
+            if not sel:
+                return
+            for item in sel:
+                self.db.mark_claude_reviewed(item["photo_id"])
+                if item in queue:
+                    queue.remove(item)
+            self._update_claude_queue_menu()
+            load_page()
+            if not queue:
+                dlg.close()
+
+        reason_filter.currentIndexChanged.connect(lambda: (current_page.__setitem__(0, 0), load_page()))
+        prev_btn.clicked.connect(lambda: (current_page.__setitem__(0, current_page[0] - 1), load_page()))
+        next_btn.clicked.connect(lambda: (current_page.__setitem__(0, current_page[0] + 1), load_page()))
+        select_all_btn.clicked.connect(lambda: [tw["check"].setChecked(True) for tw in thumb_widgets if tw["item"]])
+        clear_sel_btn.clicked.connect(lambda: [tw["check"].setChecked(False) for tw in thumb_widgets])
+        mark_reviewed_btn.clicked.connect(mark_sel_reviewed)
+        close_btn.clicked.connect(dlg.close)
+        for tw in thumb_widgets:
+            tw["label"].mousePressEvent = lambda e, t=tw: t["check"].setChecked(not t["check"].isChecked()) if t["item"] else None
+        load_page()
+        dlg.exec()
+
     def open_buck_profiles_list(self):
         """List all buck profiles and open one."""
         ids = sorted({d for d in self._all_deer_ids() if d})
@@ -10041,8 +10895,9 @@ class TrainerWindow(QMainWindow):
 
             progress.close()
 
-            # Refresh photo list
+            # Refresh photo list and collection dropdown
             self.photos = self._sorted_photos(self.db.get_all_photos())
+            self._populate_collection_filter_options()  # Refresh collection dropdown
             self._populate_photo_list()
             if self.photos:
                 self.index = 0

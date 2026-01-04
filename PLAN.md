@@ -13,11 +13,11 @@
 - [X] Total photos now: Brooke Farm (3,866), Hunting Club (1,405), Tightwad House (1,167)
 
 **Discovered Issues:**
-- [ ] Collection filter dropdown doesn't refresh after import - requires app restart to see new collections
+- [X] Collection filter dropdown doesn't refresh after import - requires app restart to see new collections (FIXED Jan 3, 2026)
 - [ ] App has single-instance protection - cannot open two windows simultaneously
 
 **TODO (Future):**
-- [ ] Auto-refresh collection dropdown after photo import completes
+- [X] Auto-refresh collection dropdown after photo import completes (FIXED Jan 3, 2026)
 - [ ] Consider allowing multiple app instances (or add option to disable single-instance check)
 
 ---

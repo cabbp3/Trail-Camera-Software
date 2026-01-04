@@ -211,6 +211,21 @@ class TrailCamDatabase:
             )
         """)
 
+        # Claude review queue - photos flagged by Claude for manual review
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS claude_review_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                photo_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TEXT,
+                FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_claude_review_photo ON claude_review_queue(photo_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_claude_review_pending ON claude_review_queue(reviewed_at)")
+
         self.conn.commit()
         self._ensure_photo_columns()
         self._ensure_deer_columns()
@@ -1880,36 +1895,48 @@ class TrailCamDatabase:
         batch_upsert("buck_profile_seasons", seasons_data, "deer_id,season_year")
         counts["buck_profile_seasons"] = len(seasons_data)
 
-        # Push annotation_boxes - clear and re-insert
+        # Push annotation_boxes - but ONLY if we have a substantial local database
+        # This prevents accidentally wiping cloud boxes when pushing from an empty/new computer
         print("Syncing annotation boxes...")
-        cursor.execute("""
-            SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
-            FROM annotation_boxes b
-            JOIN photos p ON b.photo_id = p.id
-        """)
-        boxes_data = []
-        for row in cursor.fetchall():
-            d = dict(row)
-            photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
-            boxes_data.append({
-                "photo_key": photo_key,
-                "file_hash": d.get("file_hash"),
-                "label": d.get("label"),
-                "x1": d.get("x1"),
-                "y1": d.get("y1"),
-                "x2": d.get("x2"),
-                "y2": d.get("y2"),
-                "confidence": d.get("confidence"),
-                "updated_at": now
-            })
-        # For boxes, we delete all and re-insert since there's no unique constraint
-        if boxes_data:
-            supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
-            for i in range(0, len(boxes_data), BATCH_SIZE):
-                batch = boxes_data[i:i + BATCH_SIZE]
-                if batch:
-                    supabase_client.table("annotation_boxes").insert(batch).execute()
-        counts["annotation_boxes"] = len(boxes_data)
+        cursor.execute("SELECT COUNT(*) FROM annotation_boxes")
+        local_box_count = cursor.fetchone()[0]
+
+        # Safety check: don't delete cloud boxes if local has very few
+        # (protects against pushing from empty/new database)
+        if local_box_count < 100:
+            print(f"  Skipping box sync - only {local_box_count} local boxes (need 100+ to sync)")
+            print("  This protects cloud data from being overwritten by an empty database.")
+            print("  Run 'Pull from Cloud' first if this is a new computer.")
+            counts["annotation_boxes"] = 0
+        else:
+            cursor.execute("""
+                SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
+                FROM annotation_boxes b
+                JOIN photos p ON b.photo_id = p.id
+            """)
+            boxes_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
+                boxes_data.append({
+                    "photo_key": photo_key,
+                    "file_hash": d.get("file_hash"),
+                    "label": d.get("label"),
+                    "x1": d.get("x1"),
+                    "y1": d.get("y1"),
+                    "x2": d.get("x2"),
+                    "y2": d.get("y2"),
+                    "confidence": d.get("confidence"),
+                    "updated_at": now
+                })
+            # Delete and re-insert (safe now because we verified we have data)
+            if boxes_data:
+                supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
+                for i in range(0, len(boxes_data), BATCH_SIZE):
+                    batch = boxes_data[i:i + BATCH_SIZE]
+                    if batch:
+                        supabase_client.table("annotation_boxes").insert(batch).execute()
+            counts["annotation_boxes"] = len(boxes_data)
 
         print("Sync complete!")
         return counts
@@ -2023,6 +2050,71 @@ class TrailCamDatabase:
 
         self.conn.commit()
         return counts
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Claude Review Queue Methods
+    # ─────────────────────────────────────────────────────────────────────
+
+    def add_to_claude_review(self, photo_id: int, reason: str, priority: int = 0):
+        """Add a photo to the Claude review queue."""
+        cursor = self.conn.cursor()
+        # Check if already in queue
+        cursor.execute("SELECT id FROM claude_review_queue WHERE photo_id = ? AND reviewed_at IS NULL", (photo_id,))
+        if cursor.fetchone():
+            return  # Already in queue
+        cursor.execute(
+            "INSERT INTO claude_review_queue (photo_id, reason, priority) VALUES (?, ?, ?)",
+            (photo_id, reason, priority)
+        )
+        self.conn.commit()
+
+    def add_many_to_claude_review(self, photo_ids: List[int], reason: str, priority: int = 0):
+        """Add multiple photos to the Claude review queue."""
+        cursor = self.conn.cursor()
+        for photo_id in photo_ids:
+            cursor.execute("SELECT id FROM claude_review_queue WHERE photo_id = ? AND reviewed_at IS NULL", (photo_id,))
+            if not cursor.fetchone():
+                cursor.execute(
+                    "INSERT INTO claude_review_queue (photo_id, reason, priority) VALUES (?, ?, ?)",
+                    (photo_id, reason, priority)
+                )
+        self.conn.commit()
+
+    def get_claude_review_queue(self, limit: int = None) -> List[Dict]:
+        """Get pending photos in the Claude review queue."""
+        cursor = self.conn.cursor()
+        query = """
+            SELECT q.id, q.photo_id, q.reason, q.priority, q.added_at, p.file_path
+            FROM claude_review_queue q
+            JOIN photos p ON q.photo_id = p.id
+            WHERE q.reviewed_at IS NULL
+            ORDER BY q.priority DESC, q.added_at ASC
+        """
+        if limit:
+            query += f" LIMIT {limit}"
+        cursor.execute(query)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_claude_review_count(self) -> int:
+        """Get count of pending items in Claude review queue."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM claude_review_queue WHERE reviewed_at IS NULL")
+        return cursor.fetchone()[0]
+
+    def mark_claude_reviewed(self, photo_id: int):
+        """Mark a photo as reviewed in the Claude queue."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE claude_review_queue SET reviewed_at = CURRENT_TIMESTAMP WHERE photo_id = ? AND reviewed_at IS NULL",
+            (photo_id,)
+        )
+        self.conn.commit()
+
+    def clear_claude_review_queue(self):
+        """Clear all pending items from the Claude review queue."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM claude_review_queue WHERE reviewed_at IS NULL")
+        self.conn.commit()
 
     def close(self):
         """Close database connection."""

@@ -27,11 +27,12 @@ def run_megadetector_on_unboxed():
     # Connect to database
     db = TrailCamDatabase()
 
-    # Get photos without boxes
+    # Get photos without boxes, excluding Empty-tagged photos
     cursor = db.conn.cursor()
     cursor.execute("""
         SELECT id, file_path FROM photos
         WHERE id NOT IN (SELECT DISTINCT photo_id FROM annotation_boxes)
+          AND id NOT IN (SELECT photo_id FROM tags WHERE tag_name = 'Empty')
     """)
     photos = cursor.fetchall()
 
