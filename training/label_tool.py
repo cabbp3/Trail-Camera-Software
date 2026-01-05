@@ -233,6 +233,8 @@ from ai_suggester import CombinedSuggester
 from duplicate_dialog import DuplicateDialog, HashCalculationThread
 from image_processor import import_photo, create_thumbnail
 from cuddelink_downloader import download_new_photos, check_server_status
+from head_annotation_window import HeadAnnotationWindow
+from head_model_viewer import HeadModelViewer
 
 # Ensure Qt finds the platform plugin (Cocoa on macOS, qwindows on Windows) and image plugins
 def _ensure_qt_plugin_paths():
@@ -1629,6 +1631,15 @@ class TrainerWindow(QMainWindow):
 
         # Check for special one-time queue
         self._check_special_queue_menu()
+
+        # === ANNOTATION TOOLS ===
+        self.tools_menu.addSeparator()
+        annotation_label = self.tools_menu.addAction("── Annotation Tools ──")
+        annotation_label.setEnabled(False)
+        head_annotation_action = self.tools_menu.addAction("Annotate Deer Head Direction...")
+        head_annotation_action.triggered.connect(self.open_head_annotation_window)
+        head_model_action = self.tools_menu.addAction("View Head Model Predictions...")
+        head_model_action.triggered.connect(self.open_head_model_viewer)
 
         self.tools_menu.addSeparator()
         profiles_action = self.tools_menu.addAction("Buck Profiles")
@@ -6033,8 +6044,14 @@ class TrainerWindow(QMainWindow):
                 return
 
             if error:
-                if "credentials" in error.lower() or "login" in error.lower() or "invalid" in error.lower():
-                    QMessageBox.warning(self, "CuddeLink", f"Login failed. Please check your credentials in\nFile → Setup CuddeLink Credentials.\n\nError: {error}")
+                if "credentials" in error.lower() or "login" in error.lower() or "invalid" in error.lower() or "password" in error.lower():
+                    reply = QMessageBox.question(
+                        self, "CuddeLink Login Failed",
+                        f"Login failed: {error}\n\nWould you like to update your credentials?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.setup_cuddelink_credentials()
                 else:
                     QMessageBox.warning(self, "CuddeLink", f"Download failed: {error}")
                 return
@@ -10469,6 +10486,16 @@ class TrainerWindow(QMainWindow):
             tw["label"].mousePressEvent = lambda e, t=tw: t["check"].setChecked(not t["check"].isChecked()) if t["item"] else None
         load_page()
         dlg.exec()
+
+    def open_head_annotation_window(self):
+        """Open the head direction annotation window."""
+        window = HeadAnnotationWindow(self.db, self)
+        window.exec()
+
+    def open_head_model_viewer(self):
+        """Open the head model predictions viewer."""
+        viewer = HeadModelViewer(self)
+        viewer.exec()
 
     def open_buck_profiles_list(self):
         """List all buck profiles and open one."""

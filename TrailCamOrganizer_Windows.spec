@@ -27,6 +27,9 @@ datas = [
     ('image_processor.py', '.'),
     ('duplicate_dialog.py', '.'),
     ('site_clustering.py', '.'),
+    ('organizer_ui.py', '.'),
+    ('updater.py', '.'),
+    ('version.py', '.'),
 ]
 datas += pyqt6_datas
 
@@ -61,6 +64,9 @@ hiddenimports = [
     'cuddelink_downloader',
     'image_processor',
     'duplicate_dialog',
+    'organizer_ui',
+    'updater',
+    'version',
 ]
 hiddenimports += pyqt6_hiddenimports
 hiddenimports += collect_submodules('PIL')

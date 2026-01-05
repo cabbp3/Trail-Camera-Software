@@ -1,47 +1,69 @@
 name: Build Windows Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
-
-permissions:
-  contents: write
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.3)'
+        required: true
+        default: 'v1.0.3'
 
 jobs:
   build-windows:
     runs-on: windows-latest
+
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
       with:
-        lfs: true  # Download Git LFS files
-    - uses: actions/setup-python@v5
+        lfs: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
+
     - name: Build executable
-      run: pyinstaller TrailCamOrganizer_Windows.spec --clean
-    - name: Generate manifest for delta updates
-      run: python build_manifest.py dist/TrailCamOrganizer dist/TrailCamOrganizer/manifest.json
-    - name: Create zip
-      run: Compress-Archive -Path dist\TrailCamOrganizer\* -DestinationPath TrailCamOrganizer-Windows.zip
-    - name: Copy manifest for separate upload
-      run: Copy-Item dist\TrailCamOrganizer\manifest.json manifest-windows.json
-    - uses: actions/upload-artifact@v4
+      run: |
+        pyinstaller TrailCamOrganizer_Windows.spec --clean
+
+    - name: Create ZIP archive
+      run: |
+        Compress-Archive -Path dist/TrailCamOrganizer -DestinationPath TrailCamOrganizer-Windows.zip
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
         name: TrailCamOrganizer-Windows
         path: TrailCamOrganizer-Windows.zip
-    - name: Upload to Release
-      if: startsWith(github.ref, 'refs/tags/')
+
+    - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
-        files: |
-          TrailCamOrganizer-Windows.zip
-          manifest-windows.json
+        tag_name: ${{ github.event.inputs.version }}
+        name: Trail Camera Organizer ${{ github.event.inputs.version }}
+        files: TrailCamOrganizer-Windows.zip
+        draft: false
+        prerelease: false
+        body: |
+          ## Trail Camera Organizer
+
+          ### Installation (Windows)
+          1. Download TrailCamOrganizer-Windows.zip
+          2. Extract to a folder
+          3. Run TrailCamOrganizer.exe
+
+          ### What is New
+          - Improved photo viewer with zoom/pan support
+          - Toggle buttons for Buck/Doe selection
+          - Quick buck ID buttons
+          - Subject box tabs for multi-animal photos
+          - Fixed CuddeLink credential change issue
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

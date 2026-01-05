@@ -21,6 +21,7 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 #### v4.0 (January 1, 2026)
 - **Training data**: 4,100 samples (3,485 train + 615 val) with bounding boxes, crops extracted on-the-fly
 - **Classes**: 10 species - Bobcat, Coyote, Deer, Fox, House Cat, Opossum, Rabbit, Raccoon, Squirrel, Turkey
+- **Per-species counts** (not recorded - see v5.0+ for per-species tracking)
 - **Architecture**: ResNet18 pretrained, fine-tuned, 50 epochs
 - **Accuracy**: 97.2% overall (Deer 99%, Turkey 97%, Squirrel 96%, Raccoon 90%, Opossum 91%, Rabbit 92%, Coyote 56%)
 - **Changes from v3.0**:
@@ -28,6 +29,7 @@ This file tracks the version history of AI models used in the Trail Camera Softw
   - Species model should now NEVER suggest "Person" - if it does, it's converted to "Unknown"
   - This fixes the issue where subjects were incorrectly classified as "Person" by the species model
 - **Notes**: Backed up v3.0 as species.onnx.backup_v3. Person/Vehicle now handled by MegaDetector auto-classification.
+- **Known issue**: No overlap filtering - overlapping boxes may have caused pseudo-replication (fixed in v5.0+)
 
 #### v3.0 (December 28, 2024)
 - **Training data**: 3,155 samples (2,682 train + 473 val) with bounding boxes, crops extracted on-the-fly
@@ -85,13 +87,18 @@ When training a new model:
 1. Train the model using the appropriate script in `training/`
 2. Export to ONNX and copy to `models/`
 3. Update `models/version.txt` with new version number
-4. Add a new version entry to this file with:
+4. Copy per-species counts from `training/outputs/species_crops_summary.txt`
+5. Add a new version entry to this file with:
    - Version number
    - Date
-   - Training data summary
+   - Training data summary with **per-species counts**
    - Any architecture changes
-   - Performance notes
+   - Performance notes (overall and per-class accuracy)
    - Known issues or improvements
+
+### Training Protocol Notes
+
+**Overlap filtering (added Jan 4, 2026):** Training script now filters boxes with >50% IoU overlap to reduce pseudo-replication. When multiple boxes on the same photo significantly overlap, only the largest box is kept for training. This prevents the same animal from being counted multiple times.
 
 ## Rejection Data
 

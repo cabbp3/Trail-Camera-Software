@@ -362,7 +362,18 @@ class TrailCamDatabase:
         cols = {row[1] for row in cursor.fetchall()}
         if "confidence" not in cols:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN confidence REAL")
-            self.conn.commit()
+        # Head direction line columns (for deer pose annotation)
+        if "head_x1" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_x1 REAL")
+        if "head_y1" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_y1 REAL")
+        if "head_x2" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_x2 REAL")
+        if "head_y2" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_y2 REAL")
+        if "head_notes" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_notes TEXT")
+        self.conn.commit()
 
     @staticmethod
     def compute_season_year(date_str: Optional[str]) -> Optional[int]:
@@ -1134,7 +1145,11 @@ class TrailCamDatabase:
 
     def get_boxes(self, photo_id: int) -> List[Dict[str, float]]:
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
+        cursor.execute("""
+            SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf,
+                   head_x1, head_y1, head_x2, head_y2, head_notes
+            FROM annotation_boxes WHERE photo_id = ?
+        """, (photo_id,))
         out = []
         for row in cursor.fetchall():
             box = {"id": row[0], "label": row[1], "x1": row[2], "y1": row[3], "x2": row[4], "y2": row[5]}
@@ -1144,6 +1159,14 @@ class TrailCamDatabase:
                 box["species"] = row[7]
             if row[8] is not None:
                 box["species_conf"] = row[8]
+            # Head direction line
+            if row[9] is not None and row[10] is not None:
+                box["head_x1"] = row[9]
+                box["head_y1"] = row[10]
+                box["head_x2"] = row[11]
+                box["head_y2"] = row[12]
+            if row[13]:
+                box["head_notes"] = row[13]
             out.append(box)
         return out
 
@@ -1155,6 +1178,59 @@ class TrailCamDatabase:
             (species, confidence, box_id)
         )
         self.conn.commit()
+
+    def set_box_head_line(self, box_id: int, x1: float, y1: float, x2: float, y2: float, notes: str = None):
+        """Set head direction line for a specific box.
+
+        Args:
+            box_id: The annotation box ID
+            x1, y1: Top of skull position (relative 0-1)
+            x2, y2: Nose tip position (relative 0-1)
+            notes: Optional notes about this annotation
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE annotation_boxes SET head_x1 = ?, head_y1 = ?, head_x2 = ?, head_y2 = ?, head_notes = ? WHERE id = ?",
+            (x1, y1, x2, y2, notes, box_id)
+        )
+        self.conn.commit()
+
+    def clear_box_head_line(self, box_id: int):
+        """Clear head direction line for a specific box."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE annotation_boxes SET head_x1 = NULL, head_y1 = NULL, head_x2 = NULL, head_y2 = NULL, head_notes = NULL WHERE id = ?",
+            (box_id,)
+        )
+        self.conn.commit()
+
+    def get_deer_boxes_for_head_annotation(self) -> List[Dict]:
+        """Get all deer boxes that need head direction annotation.
+
+        Returns boxes where species is 'Deer' and head line is not set.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT ab.id, ab.photo_id, p.file_path, ab.x1, ab.y1, ab.x2, ab.y2,
+                   ab.head_x1, ab.head_y1, ab.head_x2, ab.head_y2, ab.head_notes
+            FROM annotation_boxes ab
+            JOIN photos p ON ab.photo_id = p.id
+            JOIN tags t ON p.id = t.photo_id
+            WHERE t.tag_name = 'Deer'
+              AND ab.label IN ('subject', 'ai_animal')
+            ORDER BY p.date_taken DESC
+        """)
+        out = []
+        for row in cursor.fetchall():
+            out.append({
+                "box_id": row[0],
+                "photo_id": row[1],
+                "file_path": row[2],
+                "x1": row[3], "y1": row[4], "x2": row[5], "y2": row[6],
+                "head_x1": row[7], "head_y1": row[8], "head_x2": row[9], "head_y2": row[10],
+                "head_notes": row[11]
+            })
+        return out
 
     def has_detection_boxes(self, photo_id: int) -> bool:
         """Check if photo has any detection boxes (AI or human-labeled)."""

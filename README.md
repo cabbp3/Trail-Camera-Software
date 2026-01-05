@@ -1,6 +1,15 @@
-# Trail Camera Photo Organizer
+# Trail Camera Software
 
-A cross-platform Python desktop application for organizing trail camera photos, with a focus on deer tracking and identification.
+Two cross-platform Python desktop applications for organizing trail camera photos, with a focus on deer tracking and identification.
+
+## Two Apps
+
+| App | Command | Purpose |
+|-----|---------|---------|
+| **Organizer** | `python main.py` | Simplified photo browser for end users |
+| **Trainer** | `python trainer_main.py` | Advanced labeling tool for AI training (internal) |
+
+Both apps share the same database and AI models.
 
 ## Features
 

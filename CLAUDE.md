@@ -49,22 +49,43 @@ When making architecture decisions, keep these principles in mind:
 
 ## Project Overview
 
-Trail Camera Photo Organizer - A PyQt6 desktop application for organizing trail camera photos with AI-assisted wildlife labeling, deer tracking, and custom model training.
+Trail Camera Software - **Two separate PyQt6 desktop applications** for organizing trail camera photos:
+
+| App | Entry Point | Purpose | Target User |
+|-----|-------------|---------|-------------|
+| **Organizer** | `main.py` → `organizer_ui.py` | Simplified photo browser, filtering, basic tagging | End users / Product |
+| **Trainer** | `trainer_main.py` → `training/label_tool.py` | Advanced labeling, bounding boxes, AI training | Developer / Internal |
+
+Both apps share the same database, AI models, and supporting modules.
 
 ## Commands
 
-### Run the Application (macOS)
+### Run the Organizer (Product App - macOS)
 ```bash
 cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0"
 source .venv/bin/activate
 python main.py
 ```
 
-### Run the Application (Windows)
+### Run the Trainer (Development App - macOS)
+```bash
+cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0"
+source .venv/bin/activate
+python trainer_main.py
+```
+
+### Run the Organizer (Windows)
 ```cmd
 cd C:\Users\mbroo\OneDrive\Desktop\Trail Camera Software V 1.0
 venv\Scripts\activate
 python main.py
+```
+
+### Run the Trainer (Windows)
+```cmd
+cd C:\Users\mbroo\OneDrive\Desktop\Trail Camera Software V 1.0
+venv\Scripts\activate
+python trainer_main.py
 ```
 
 **Windows Status (Dec 25, 2024):**
@@ -134,11 +155,25 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ## Architecture
 
-### Entry Point
-- `main.py` → Launches `TrainerWindow` from `training/label_tool.py` (the primary UI)
+### Two Apps - Entry Points
+- `main.py` → `organizer_ui.py` - **Organizer** (product app for end users)
+- `trainer_main.py` → `training/label_tool.py` - **Trainer** (development app for labeling/training)
 
-### Core Modules
-- **training/label_tool.py** (11,000+ lines) - Primary UI for photo labeling with species/deer ID/antler tagging
+### Organizer App (organizer_ui.py - ~56KB)
+- Simplified photo browser with dark theme
+- Filter/sort by species, date, collection, camera
+- Accept AI suggestions, basic tagging
+- CuddeLink download integration
+- Designed for non-technical users
+
+### Trainer App (training/label_tool.py - 11,000+ lines)
+- Advanced labeling with bounding box annotation
+- Per-box tabbed interface for multiple detections
+- AI model training pipelines
+- Review queues for AI suggestions
+- Designed for developer/data labeling
+
+### Shared Modules
 - **database.py** - SQLite operations with WAL mode; schema includes `photos`, `tags`, `deer_metadata`, `deer_additional`, `camera_info`, `annotation_history` tables
 - **preview_window.py** - Full-size image viewer with zoom/pan and annotation UI
 
@@ -181,7 +216,7 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ---
 
-## Current State (Jan 3, 2026)
+## Current State (Jan 5, 2026)
 
 **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
 
@@ -219,12 +254,64 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 **Known Issues:**
 - `training/label_tool.py` is 11,000+ lines (could be split, but risky)
 - MegaDetector struggles with small birds (quail: only 22% detection rate)
+- `openpyxl` in requirements.txt is unused (Excel features removed, now using Supabase)
 
 **Supabase:** Working via REST API (`supabase_rest.py`). Run `supabase_setup.sql` once to create tables.
 
 ---
 
-## Recent Session (Jan 3, 2026)
+## Bedtime/Away Projects
+
+When the user is looking for something to run overnight or while away:
+
+1. **Augmentation Experiment** (~7-10 hours)
+   ```bash
+   python training/train_augmentation_experiment.py
+   ```
+   Tests 7 augmentation configs × 3 replicates = 21 training runs.
+   See PLAN.md "Augmentation Experiment" section for details.
+
+2. **Download LILA data for rare species** (future)
+   - NACTI, Caltech Camera Traps for Coyote, Fox, Bobcat, Otter
+   - CDLA-Permissive license allows commercial use
+
+---
+
+## Recent Session (Jan 5, 2026)
+
+### Two-App Architecture & CuddeLink Fix
+
+**App Split Documented:**
+- Project now has two separate apps: **Organizer** (product) and **Trainer** (development)
+- Updated CLAUDE.md architecture section to reflect this
+- Organizer: `main.py` → `organizer_ui.py` (56KB, simplified UI for end users)
+- Trainer: `trainer_main.py` → `training/label_tool.py` (11K+ lines, advanced labeling)
+
+**CuddeLink Credential Fix:**
+- Fixed bug where wrong password couldn't be changed after initial login attempt
+- Both apps now detect credential errors and offer to update credentials
+- Checks for "credentials", "password", "invalid", "login" in error messages
+- Files modified: `organizer_ui.py`, `training/label_tool.py`
+
+---
+
+## Session 18 (Jan 4, 2026)
+
+### PLAN.md Verification & Cleanup
+
+Verified status of all pending items in PLAN.md:
+- **Excel export/import** - DONE (removed from UI, replaced by Supabase)
+- **AI background processing** - DONE (AIWorker QThread working)
+- **Person/Vehicle in species model** - DONE (MegaDetector handles these)
+- **Export detection crops** - Not needed (boxes sync via Supabase)
+- **Single-instance protection** - No mutex code found; may be SQLite lock, needs testing
+- **windows_fix.py** - Confirmed in tools/ folder
+
+Updated PLAN.md to mark completed items and clarify remaining work.
+
+---
+
+## Session 17 (Jan 3, 2026)
 
 ### Cleanup & Performance Improvements
 

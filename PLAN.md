@@ -1,6 +1,29 @@
 # Trail Camera Software - Project Plan
 
-**Last Updated:** January 1, 2026 (Session 16)
+**Last Updated:** January 5, 2026 (Session 19)
+
+---
+
+## Two-App Architecture
+
+The project now has **two separate applications**:
+
+| App | Entry Point | Purpose |
+|-----|-------------|---------|
+| **Organizer** | `python main.py` | Product app - simplified photo browser for end users |
+| **Trainer** | `python trainer_main.py` | Internal app - advanced labeling, bounding boxes, AI training |
+
+Both share the same database (`~/.trailcam/trailcam.db`), AI models, and supporting modules.
+
+---
+
+## Session 19 Progress (Jan 5, 2026)
+
+**Focus:** Documentation update, CuddeLink credential fix
+
+**Completed:**
+- [X] Documented two-app architecture in CLAUDE.md, PLAN.md, README.md
+- [X] Fixed CuddeLink credential change bug - both apps now offer to update credentials on auth failure
 
 ---
 
@@ -14,11 +37,11 @@
 
 **Discovered Issues:**
 - [X] Collection filter dropdown doesn't refresh after import - requires app restart to see new collections (FIXED Jan 3, 2026)
-- [ ] App has single-instance protection - cannot open two windows simultaneously
+- [?] App may have single-instance limitation - needs testing (no mutex code found; may be SQLite lock)
 
 **TODO (Future):**
 - [X] Auto-refresh collection dropdown after photo import completes (FIXED Jan 3, 2026)
-- [ ] Consider allowing multiple app instances (or add option to disable single-instance check)
+- [ ] Test if multiple app instances can run simultaneously
 
 ---
 
@@ -111,8 +134,8 @@
 
 **Still TODO:**
 - [X] ~~On Windows: Run `python windows_fix.py` to sync labels~~ - Not needed, hash sync built into app
-- [ ] Fix AI suggestions not running in background (still blocking UI)
-- [ ] Remove Person and Vehicle from species model (auto-classified by MegaDetector now)
+- [X] Fix AI suggestions not running in background - DONE (AIWorker QThread implemented Dec 24, 2024)
+- [X] Remove Person and Vehicle from species model - DONE (MegaDetector auto-classifies these before species classifier runs)
 
 **Needs Testing (Dec 28 fixes):**
 - [ ] Multi-species labeling - click second species, verify both are saved
@@ -149,7 +172,7 @@
 **Still TODO (resume here):**
 - [X] Run `supabase_add_file_hash.sql` in Supabase dashboard to add file_hash columns (Dec 27, 2024)
 - [X] Push from Mac to Supabase (will include file hashes) (Dec 27, 2024)
-- [ ] On Windows: Run `python windows_fix.py` to calculate hashes and pull labels
+- [X] On Windows: Hash sync built into app - use File → Pull from Cloud
 
 **Supabase SQL to run:**
 ```sql
@@ -251,10 +274,46 @@ This software is intended to become a **marketable product** for hunters and wil
 
 ## Pending Tasks
 
-- [ ] Complete Windows standalone build
+- [X] Complete Windows standalone build - DONE (v1.0.0 on GitHub)
 - [ ] Batch editing by date range (for camera moves)
 - [ ] Queue mode performance optimization
 - [ ] Deer head detection training (need more head boxes)
+- [ ] 216 photos at WB 27 need date correction (see Timestamp Corrections section)
+- [ ] Remove unused `openpyxl` from requirements.txt
+
+---
+
+## Augmentation Experiment (Run When Away)
+
+**Goal:** Systematically evaluate which image augmentations improve model accuracy, using multiple replicates for statistical confidence.
+
+**Baseline:** v5.0 model (95% test accuracy, current augmentations: flip, rotation, color jitter)
+
+**Augmentations to test:**
+| ID | Augmentation | Description |
+|----|--------------|-------------|
+| A0 | Baseline | Current augmentations only |
+| A1 | +Grayscale | 30% of samples converted to grayscale (simulates IR) |
+| A2 | +Noise | Gaussian noise (simulates low-light grain) |
+| A3 | +Brightness | Stronger brightness extremes (flash/dark) |
+| A4 | +Blur | Random Gaussian blur (motion blur) |
+| A5 | +Erasing | Random erasing/cutout (obstructions) |
+| A6 | +All | All augmentations combined |
+
+**Experimental design:**
+- 3 replicates per augmentation (different random seeds: 42, 123, 456)
+- Same stratified train/val/test split across all runs
+- Record: test accuracy (overall), per-class accuracy, training time
+- Total runs: 7 augmentations × 3 replicates = 21 training runs
+
+**Run command:** `python training/train_augmentation_experiment.py`
+
+**Expected runtime:** ~7-10 hours (21 runs × 20 min each)
+
+**Analysis:**
+- Compare mean ± std test accuracy across replicates
+- Identify augmentations that significantly improve rare species (Coyote, Fox, Bobcat)
+- Check for augmentations that hurt performance (remove those)
 
 ---
 
@@ -332,31 +391,26 @@ Key capabilities needed:
 - [ ] Automated antler detection and counting
 - [ ] Antler measurement from photos
 
-### 1.5 Multi-Computer / Team Workflow (NEW)
+### 1.5 Multi-Computer / Team Workflow
 
 **Goal:** Allow multiple people to download photos on different computers and share labels without needing to sync databases or install software updates.
 
-**How it works:**
+**How it works (via Supabase cloud sync):**
 1. Each person downloads photos to their own computer
 2. One "master" computer runs the full app and does all the labeling
-3. Export labels to Excel file (keyed by photo filename + fixed metadata)
-4. Share the Excel file with other computers
-5. Other computers import the Excel to link labels to their local photos
-
-**Key matching fields:**
-- Photo filename (after rename: `YYYY-MM-DD_HH-MM-SS_CameraModel.jpg`)
-- Original EXIF date/time (backup if filename differs)
-- Camera model from EXIF
-- File size or partial hash (optional verification)
+3. Master computer pushes labels to Supabase (File → Push to Cloud)
+4. Other computers pull labels from Supabase (File → Pull from Cloud)
+5. Photos matched by MD5 hash (works even if filenames differ between computers)
 
 **Tasks:**
-- [X] **Export Labels to Excel** - Export all tags, deer IDs, species, buck/doe to .xlsx
-- [X] **Import Labels from Excel** - Match by filename, apply labels to local photos
+- [X] **Supabase cloud sync** - Push/pull labels via REST API
+- [X] **Hash-based matching** - MD5 hash ensures same photos match across computers
 - [X] **Simple Mode** - Toggle in Settings menu hides AI features for simpler labeling
+- ~~Excel export/import~~ - Replaced by Supabase sync
 - [ ] **Conflict handling** - What if same photo has different labels? (newest wins, or flag for review)
 - [ ] **Relink photos tool** - If photos moved, match by filename pattern and relink paths
 
-**Use case:** Hunting club where 3-4 people check different cameras, one person labels on the main computer, others get updated Excel to see what deer were spotted.
+**Use case:** Hunting club where 3-4 people check different cameras, one person labels on the main computer, others sync via Supabase to see what deer were spotted.
 
 ---
 
@@ -412,7 +466,7 @@ Key capabilities needed:
 - [X] Modify species suggester to classify subject crops - DONE
 - [X] Modify buck/doe suggester to use head crops - DONE (when deer_head boxes exist)
 - [X] UI to view/edit detection boxes - DONE
-- [ ] Export detection crops for training
+- ~~Export detection crops for training~~ - Not needed (boxes sync via Supabase, training scripts in training/ folder)
 
 **Why this matters:**
 - Head crops for buck/doe = antlers visible = much better accuracy
@@ -427,16 +481,9 @@ Key capabilities needed:
 1. ~~**Save detection boxes to database**~~ - DONE (2,010 boxes stored for 1,611 photos)
 2. ~~**Head-crop buck/doe classifier**~~ - DONE (code uses deer_head boxes when available, only 63 exist - need more head box training data)
 3. Continue labeling to improve model accuracy
-4. **Set up GitHub repository** - Version control for the app
-    - Create GitHub account (if needed)
-    - Initialize git repo in project folder
-    - Create .gitignore for venv, __pycache__, .db files, etc.
-    - Push to GitHub for backup and version history
-    - Enables rolling back changes if something breaks
-5. **Remove Excel export/import features** - Using Supabase now
-    - Remove "Export Labels to Excel" menu item
-    - Remove "Import Labels from Excel" menu item
-    - Remove related code and openpyxl dependency
+4. ~~**Set up GitHub repository**~~ - DONE (https://github.com/cabbp3/Trail-Camera-Software)
+5. ~~**Remove Excel export/import features**~~ - DONE (menu items removed, using Supabase now)
+    - Note: `openpyxl` still in requirements.txt but unused - can be removed
 
 ### Medium Priority
 4. **Portable View/Label Mode** - Lightweight version for other computers
@@ -458,10 +505,9 @@ Key capabilities needed:
     - Skip labeled photos entirely (don't include in loop)
     - Makes progress bar more accurate and processing faster
     - Show per-species counts in progress bar (e.g., "Deer: 45 | Turkey: 12 | Buck: 30 | Doe: 15")
-14. **[X] Background AI processing** - Run AI suggestions without blocking the UI
-    - IMPLEMENTED Dec 24, 2024 - `AIWorker` QThread class in label_tool.py
-    - Menu: Tools → Suggest Tags (AI) — Background + Live Queue
-    - Photos appear in queue as they're processed
+14. ~~**Background AI processing**~~ - DONE (Dec 24, 2024)
+    - `AIWorker` QThread class in label_tool.py
+    - Menu: Tools → Suggest Tags (AI)
     - Progress bar shows AI processing status
 15. **Integrated queue mode performance** - Queue mode runs slow, needs optimization
     - Current implementation re-filters and rebuilds photo list on each change
