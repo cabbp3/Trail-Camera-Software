@@ -32,7 +32,6 @@ datas = [
     ('version.py', '.'),
     ('r2_storage.py', '.'),
     ('user_config.py', '.'),
-    ('cloud_config.json', '.'),
 ]
 datas += pyqt6_datas
 
