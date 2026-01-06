@@ -30,6 +30,9 @@ datas = [
     ('organizer_ui.py', '.'),
     ('updater.py', '.'),
     ('version.py', '.'),
+    ('r2_storage.py', '.'),
+    ('user_config.py', '.'),
+    ('cloud_config.json', '.'),
 ]
 datas += pyqt6_datas
 
@@ -67,10 +70,16 @@ hiddenimports = [
     'organizer_ui',
     'updater',
     'version',
+    'r2_storage',
+    'user_config',
+    'boto3',
+    'botocore',
 ]
 hiddenimports += pyqt6_hiddenimports
 hiddenimports += collect_submodules('PIL')
 hiddenimports += collect_submodules('onnxruntime')
+hiddenimports += collect_submodules('boto3')
+hiddenimports += collect_submodules('botocore')
 
 a = Analysis(
     ['main.py'],

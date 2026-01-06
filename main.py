@@ -1,11 +1,17 @@
+#!/usr/bin/env python3
 """
 Trail Cam Organizer - Main Entry Point
 
-This launches the Organizer (product app) by default.
-For the Trainer (development app), run trainer_main.py instead.
+Launches the full-featured Trail Cam app.
 """
+
 import sys
-from organizer_ui import main
+import os
+
+# Ensure we can find our modules
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from training.label_tool import main
 
 if __name__ == "__main__":
     main()

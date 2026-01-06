@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from version import __version__
 import updater
+import user_config
 
 logger = logging.getLogger(__name__)
 
@@ -231,10 +232,9 @@ class DraggableBoxItem(QGraphicsRectItem):
 from compare_window import CompareWindow
 from ai_suggester import CombinedSuggester
 from duplicate_dialog import DuplicateDialog, HashCalculationThread
+from stamp_reader import StampReader
 from image_processor import import_photo, create_thumbnail
 from cuddelink_downloader import download_new_photos, check_server_status
-from head_annotation_window import HeadAnnotationWindow
-from head_model_viewer import HeadModelViewer
 
 # Ensure Qt finds the platform plugin (Cocoa on macOS, qwindows on Windows) and image plugins
 def _ensure_qt_plugin_paths():
@@ -871,7 +871,6 @@ class TrainerWindow(QMainWindow):
         self.queue_data = {}  # Extra data per photo (e.g., suggested species, confidence)
         self.queue_reviewed = set()  # Photo IDs that have been reviewed
         self.queue_pre_filter_index = 0  # Remember position before entering queue
-        self.simple_mode = False  # Simple mode hides advanced AI features
 
         # Background AI processing
         self.ai_worker = None  # AIWorker instance when running
@@ -1208,9 +1207,6 @@ class TrainerWindow(QMainWindow):
         self.box_reject_ai_btn = QToolButton()
         self.box_reject_ai_btn.setText("Reject AI")
         self.box_reject_ai_btn.clicked.connect(self._clear_ai_boxes)
-        self.box_review_ai_btn = QToolButton()
-        self.box_review_ai_btn.setText("Review AI Queue")
-        self.box_review_ai_btn.clicked.connect(self.start_ai_review)
         self.box_edit_btn = QPushButton("Edit Boxes...")
         self.box_edit_btn.clicked.connect(self.edit_boxes)
         self.box_clear_all_ai_btn = QPushButton("Clear ALL AI")
@@ -1232,7 +1228,6 @@ class TrainerWindow(QMainWindow):
         box_row_bottom.addWidget(self.box_accept_ai_btn)
         box_row_bottom.addWidget(self.box_reject_ai_btn)
         box_row_bottom.addWidget(self.box_accept_all_ai_btn)
-        box_row_bottom.addWidget(self.box_review_ai_btn)
         box_row_bottom.addWidget(self.box_clear_btn)
         box_row_bottom.addWidget(self.box_clear_ai_btn)
         box_row_bottom.addWidget(self.box_clear_all_ai_btn)
@@ -1306,6 +1301,10 @@ class TrainerWindow(QMainWindow):
         self.multi_select_toggle.setCheckable(True)
         self.multi_select_toggle.setChecked(False)
         self.multi_select_toggle.toggled.connect(self._toggle_multi_select)
+        # Select All button
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.setToolTip("Select all photos in current filter")
+        self.select_all_btn.clicked.connect(self._select_all_photos)
         # Archive/Unarchive buttons
         self.archive_btn = QPushButton("Archive")
         self.archive_btn.setToolTip("Archive selected photo(s) - hides from default view")
@@ -1323,6 +1322,7 @@ class TrainerWindow(QMainWindow):
         nav = QHBoxLayout()
         nav.addWidget(self.compare_btn)
         nav.addWidget(self.multi_select_toggle)
+        nav.addWidget(self.select_all_btn)
         nav.addWidget(self.archive_btn)
         nav.addWidget(self.unarchive_btn)
         nav.addStretch()
@@ -1610,24 +1610,14 @@ class TrainerWindow(QMainWindow):
         review_label = self.tools_menu.addAction("── Review Queues ──")
         review_label.setEnabled(False)
 
-        box_review_action = self.tools_menu.addAction("Review AI Boxes (Subject/Head)...")
-        box_review_action.triggered.connect(self.start_ai_review)
-
         species_review_action = self.tools_menu.addAction("Review Species Suggestions...")
         species_review_action.triggered.connect(self.review_species_suggestions_integrated)
-
-        unlabeled_boxes_action = self.tools_menu.addAction("Label Photos with Boxes (No Suggestion)...")
-        unlabeled_boxes_action.triggered.connect(self.review_unlabeled_with_boxes)
 
         sex_review_action = self.tools_menu.addAction("Review Buck/Doe Suggestions...")
         sex_review_action.triggered.connect(self.review_sex_suggestions)
 
         site_review_action = self.tools_menu.addAction("Review Site Suggestions...")
         site_review_action.triggered.connect(self.review_site_suggestions)
-
-        self.claude_review_action = self.tools_menu.addAction("Claude Review Queue...")
-        self.claude_review_action.triggered.connect(self.review_claude_queue)
-        self._update_claude_queue_menu()
 
         # Check for special one-time queue
         self._check_special_queue_menu()
@@ -1636,10 +1626,8 @@ class TrainerWindow(QMainWindow):
         self.tools_menu.addSeparator()
         annotation_label = self.tools_menu.addAction("── Annotation Tools ──")
         annotation_label.setEnabled(False)
-        head_annotation_action = self.tools_menu.addAction("Annotate Deer Head Direction...")
-        head_annotation_action.triggered.connect(self.open_head_annotation_window)
-        head_model_action = self.tools_menu.addAction("View Head Model Predictions...")
-        head_model_action.triggered.connect(self.open_head_model_viewer)
+        stamp_reader_action = self.tools_menu.addAction("Stamp Reader...")
+        stamp_reader_action.triggered.connect(self.open_stamp_reader)
 
         self.tools_menu.addSeparator()
         profiles_action = self.tools_menu.addAction("Buck Profiles")
@@ -1657,20 +1645,28 @@ class TrainerWindow(QMainWindow):
         # Store AI-related actions for simple mode hiding
         self.advanced_menu_actions = [
             clear_ai_action, ai_action, sex_suggest_action,
-            review_label, box_review_action, species_review_action,
+            review_label, species_review_action,
             sex_review_action, site_review_action, profiles_action,
             site_label, auto_site_action, manage_sites_action
         ]
 
+        # === CLOUD SYNC ===
+        self.tools_menu.addSeparator()
+        cloud_label = self.tools_menu.addAction("── Cloud Sync ──")
+        cloud_label.setEnabled(False)
+        cloud_status_action = self.tools_menu.addAction("Cloud Status...")
+        cloud_status_action.triggered.connect(self.show_cloud_status)
+        upload_thumbs_action = self.tools_menu.addAction("Upload Thumbnails to Cloud...")
+        upload_thumbs_action.triggered.connect(lambda: self.upload_to_cloud(thumbnails_only=True))
+        upload_all_action = self.tools_menu.addAction("Upload All Photos to Cloud...")
+        upload_all_action.triggered.connect(lambda: self.upload_to_cloud(thumbnails_only=False))
+        change_username_action = self.tools_menu.addAction("Change Username...")
+        change_username_action.triggered.connect(self.change_username)
+        admin_panel_action = self.tools_menu.addAction("Admin: View All Users...")
+        admin_panel_action.triggered.connect(self.show_cloud_admin)
+
         menubar.addMenu(self.tools_menu)
         settings_menu = QMenu("Settings", self)
-        # Simple/Advanced mode toggle
-        self.simple_mode = False
-        self.simple_mode_action = settings_menu.addAction("Simple Mode")
-        self.simple_mode_action.setCheckable(True)
-        self.simple_mode_action.setChecked(False)
-        self.simple_mode_action.toggled.connect(self._toggle_simple_mode)
-        settings_menu.addSeparator()
         self.enhance_toggle_action = settings_menu.addAction("Auto Enhance All")
         self.enhance_toggle_action.setCheckable(True)
         self.enhance_toggle_action.setChecked(True)
@@ -1733,6 +1729,53 @@ class TrainerWindow(QMainWindow):
         # Load saved settings (window state, simple mode)
         self._load_settings()
 
+        # Check cloud storage on startup (delayed so UI loads first)
+        QTimer.singleShot(2000, self._check_cloud_storage_warning)
+
+    def _check_cloud_storage_warning(self):
+        """Check cloud storage and warn if over 8GB (admin only)."""
+        try:
+            # Only warn admins
+            config = user_config.get_config()
+            if not config.get('is_admin', False):
+                return
+
+            from r2_storage import R2Storage
+            storage = R2Storage()
+            if not storage.is_configured():
+                return
+
+            stats = storage.get_bucket_stats()
+            if 'error' in stats:
+                return
+
+            total_mb = stats.get('total_size_mb', 0)
+            total_gb = total_mb / 1024
+
+            # Limits
+            WARNING_GB = 8
+            LIMIT_GB = 20
+
+            if total_gb >= LIMIT_GB:
+                QMessageBox.critical(
+                    self,
+                    "Cloud Storage LIMIT REACHED",
+                    f"Cloud storage is at {total_gb:.1f} GB!\n\n"
+                    f"LIMIT: {LIMIT_GB} GB\n\n"
+                    "You need to delete files or upgrade storage."
+                )
+            elif total_gb >= WARNING_GB:
+                QMessageBox.warning(
+                    self,
+                    "Cloud Storage Warning",
+                    f"Cloud storage is at {total_gb:.1f} GB.\n\n"
+                    f"Warning threshold: {WARNING_GB} GB\n"
+                    f"Limit: {LIMIT_GB} GB\n\n"
+                    "Consider managing storage soon."
+                )
+        except Exception as e:
+            logger.debug(f"Cloud storage check failed: {e}")
+
     def _load_settings(self):
         """Load saved window settings."""
         settings = QSettings("TrailCam", "Trainer")
@@ -1746,17 +1789,11 @@ class TrainerWindow(QMainWindow):
         if settings.value("maximized", False, type=bool):
             self.showMaximized()
 
-        # Restore simple mode
-        simple_mode = settings.value("simple_mode", False, type=bool)
-        if simple_mode:
-            self.simple_mode_action.setChecked(True)
-
     def _save_settings(self):
         """Save window settings."""
         settings = QSettings("TrailCam", "Trainer")
         settings.setValue("geometry", self.saveGeometry())
         settings.setValue("maximized", self.isMaximized())
-        settings.setValue("simple_mode", self.simple_mode)
 
     def showEvent(self, event):
         """Handle window show - prompt for cloud sync and CuddeLink on first show."""
@@ -3765,6 +3802,18 @@ class TrainerWindow(QMainWindow):
                         self.photo_list_widget.setCurrentItem(item)
                         break
 
+    def _select_all_photos(self):
+        """Select all photos in the current filtered list."""
+        # Enable multi-select mode if not already
+        if not self.multi_select_toggle.isChecked():
+            self.multi_select_toggle.setChecked(True)
+
+        # Select all items in the list
+        self.photo_list_widget.selectAll()
+
+        count = len(self.photo_list_widget.selectedItems())
+        self.statusBar().showMessage(f"Selected {count} photos", 3000)
+
     def _toggle_additional_buck(self, enabled: bool):
         """Show/hide the second-buck fields."""
         self.add_buck_container.setVisible(enabled)
@@ -3779,54 +3828,6 @@ class TrainerWindow(QMainWindow):
             self.add_right_min.clear()
             self.add_left_uncertain.setChecked(False)
             self.add_right_uncertain.setChecked(False)
-
-    def _toggle_simple_mode(self, enabled: bool):
-        """Toggle between Simple Mode and Advanced Mode.
-
-        Simple Mode hides AI/training features but keeps core labeling tools:
-        - KEEPS: thumbnails, filters, species, buck/doe, deer ID, location,
-                 key characteristics, quick buck buttons, additional bucks
-        - HIDES: AI suggestions, box annotation, antler point counting,
-                 training tools, bulk operations, raw tags
-        """
-        self.simple_mode = enabled
-        show_advanced = not enabled
-
-        # Update window title
-        mode_str = " (Simple Mode)" if enabled else ""
-        self.setWindowTitle(f"TrailCam Trainer{mode_str}")
-
-        # --- Elements HIDDEN in Simple Mode ---
-
-        # Box annotation tools (AI feature)
-        self.box_container_top.setVisible(show_advanced)
-        self.box_container_bottom.setVisible(show_advanced)
-        self.box_tab_bar.setVisible(show_advanced)
-
-        # AI suggestion rows
-        self.suggest_row_widget.setVisible(show_advanced)
-        self.sex_suggest_label.setVisible(show_advanced)
-        self.apply_sex_suggest_btn.setVisible(show_advanced)
-
-        # Antler point counting (complex)
-        self.antler_toggle.setVisible(show_advanced)
-        if enabled:
-            self.antler_container.setVisible(False)
-
-        # Raw tags field (technical)
-        self.tags_edit.setVisible(show_advanced)
-
-        # Bulk operations (merge, bulk assign)
-        self.bulk_container.setVisible(show_advanced)
-
-        # Removed: Training/AI navigation buttons (now in menus/dropdowns)
-
-        # AI suggestion filter in left panel
-        self.suggest_filter_combo.setVisible(show_advanced)
-
-        # AI/training menu items
-        for action in self.advanced_menu_actions:
-            action.setVisible(show_advanced)
 
     def _update_suggestion_display(self, photo: dict):
         """Show AI suggestion with confidence, require explicit apply."""
@@ -4485,15 +4486,6 @@ class TrainerWindow(QMainWindow):
                 # Show only archived photos
                 result = [(idx, p) for idx, p in result if p.get("archived")]
             # "all" shows everything, no filter needed
-
-        # In Simple Mode, hide "Empty" photos (treat like archived)
-        if self.simple_mode:
-            filtered = []
-            for idx, p in result:
-                tags = set(self.db.get_tags(p["id"]))
-                if "Empty" not in tags:
-                    filtered.append((idx, p))
-            result = filtered
 
         # Apply species filter
         if hasattr(self, "species_filter_combo"):
@@ -6252,10 +6244,24 @@ class TrainerWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # Create progress dialog
+        progress = QProgressDialog("Preparing to push...", None, 0, 7, self)
+        progress.setWindowTitle("Push to Cloud")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        progress.raise_()
+        QApplication.processEvents()
+
+        def update_progress(step, total, message):
+            progress.setValue(step)
+            progress.setLabelText(message)
+            QApplication.processEvents()
+
         try:
-            counts = self.db.push_to_supabase(client)
-            QApplication.restoreOverrideCursor()
+            counts = self.db.push_to_supabase(client, progress_callback=update_progress)
+            progress.close()
             summary = (
                 f"Pushed to cloud:\n\n"
                 f"• Photos: {counts['photos']}\n"
@@ -6268,7 +6274,7 @@ class TrainerWindow(QMainWindow):
             )
             QMessageBox.information(self, "Push Complete", summary)
         except Exception as e:
-            QApplication.restoreOverrideCursor()
+            progress.close()
             QMessageBox.warning(self, "Push Failed", f"Error pushing to cloud:\n{str(e)}")
 
     def pull_from_cloud(self):
@@ -6288,10 +6294,24 @@ class TrainerWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # Create progress dialog
+        progress = QProgressDialog("Preparing to pull...", None, 0, 7, self)
+        progress.setWindowTitle("Pull from Cloud")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        progress.raise_()
+        QApplication.processEvents()
+
+        def update_progress(step, total, message):
+            progress.setValue(step)
+            progress.setLabelText(message)
+            QApplication.processEvents()
+
         try:
-            counts = self.db.pull_from_supabase(client)
-            QApplication.restoreOverrideCursor()
+            counts = self.db.pull_from_supabase(client, progress_callback=update_progress)
+            progress.close()
             summary = (
                 f"Pulled from cloud:\n\n"
                 f"• Photos updated: {counts['photos']}\n"
@@ -6308,7 +6328,7 @@ class TrainerWindow(QMainWindow):
             if self.photos:
                 self.load_photo()
         except Exception as e:
-            QApplication.restoreOverrideCursor()
+            progress.close()
             QMessageBox.warning(self, "Pull Failed", f"Error pulling from cloud:\n{str(e)}")
 
     def remove_duplicates(self):
@@ -10487,15 +10507,10 @@ class TrainerWindow(QMainWindow):
         load_page()
         dlg.exec()
 
-    def open_head_annotation_window(self):
-        """Open the head direction annotation window."""
-        window = HeadAnnotationWindow(self.db, self)
-        window.exec()
-
-    def open_head_model_viewer(self):
-        """Open the head model predictions viewer."""
-        viewer = HeadModelViewer(self)
-        viewer.exec()
+    def open_stamp_reader(self):
+        """Open the stamp reader for pattern-based OCR."""
+        reader = StampReader(self.db, self)
+        reader.exec()
 
     def open_buck_profiles_list(self):
         """List all buck profiles and open one."""
@@ -11161,6 +11176,335 @@ class TrainerWindow(QMainWindow):
                 f"Failed to download/install update:\n{str(e)}"
             )
 
+    # === CLOUD SYNC METHODS ===
+
+    def show_cloud_status(self):
+        """Show cloud storage status dialog."""
+        try:
+            from r2_storage import R2Storage
+
+            storage = R2Storage()
+            username = user_config.get_username() or "not set"
+
+            if not storage.is_configured():
+                QMessageBox.information(
+                    self,
+                    "Cloud Status",
+                    "Cloud storage (Cloudflare R2) is not configured.\n\n"
+                    "See PLAN.md for setup instructions."
+                )
+                return
+
+            stats = storage.get_bucket_stats()
+
+            if "error" in stats:
+                QMessageBox.warning(
+                    self,
+                    "Cloud Status",
+                    f"Error connecting to cloud:\n{stats['error']}"
+                )
+                return
+
+            # Count user's files
+            user_photos = storage.list_photos(username, "photos/")
+            user_thumbs = storage.list_photos(username, "thumbnails/")
+
+            status_text = f"""
+<h3>Cloud Storage Status</h3>
+<p><b>Username:</b> {username}</p>
+<p><b>Bucket:</b> trailcam-photos</p>
+<hr>
+<p><b>Total in bucket:</b></p>
+<ul>
+<li>Objects: {stats.get('object_count', 0)}</li>
+<li>Size: {stats.get('total_size_mb', 0):.1f} MB</li>
+</ul>
+<p><b>Your uploads:</b></p>
+<ul>
+<li>Photos: {len(user_photos)}</li>
+<li>Thumbnails: {len(user_thumbs)}</li>
+</ul>
+<hr>
+<p><b>Free tier:</b> 10 GB storage, unlimited downloads</p>
+"""
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Cloud Status")
+            msg.setTextFormat(Qt.TextFormat.RichText)
+            msg.setText(status_text)
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.exec()
+
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "Cloud Status",
+                "Cloud storage module not found.\n"
+                "Make sure r2_storage.py exists and boto3 is installed."
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Cloud Status", f"Error: {str(e)}")
+
+    def upload_to_cloud(self, thumbnails_only: bool = True):
+        """Upload photos to cloud storage."""
+        try:
+            from r2_storage import R2Storage
+
+            storage = R2Storage()
+            if not storage.is_configured():
+                QMessageBox.warning(
+                    self,
+                    "Cloud Upload",
+                    "Cloud storage is not configured.\n"
+                    "See PLAN.md for setup instructions."
+                )
+                return
+
+            username = user_config.get_username()
+            if not username:
+                QMessageBox.warning(
+                    self,
+                    "Cloud Upload",
+                    "Username not set. Please set your username first."
+                )
+                return
+
+            # Get photos
+            photos = self.db.get_photos(archived=False)
+            if not photos:
+                QMessageBox.information(self, "Cloud Upload", "No photos to upload.")
+                return
+
+            # Confirm
+            mode = "thumbnails only" if thumbnails_only else "full photos + thumbnails"
+            reply = QMessageBox.question(
+                self,
+                "Cloud Upload",
+                f"Upload {len(photos)} photos ({mode}) as '{username}'?\n\n"
+                "This may take a while on slow connections.\n"
+                "You can cancel by closing the progress dialog.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            # Progress dialog
+            from PyQt6.QtWidgets import QProgressDialog
+            progress = QProgressDialog(
+                "Uploading to cloud...", "Cancel", 0, len(photos), self
+            )
+            progress.setWindowTitle("Cloud Upload")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.show()
+
+            thumb_dir = Path.home() / "TrailCamLibrary" / ".thumbnails"
+            uploaded = 0
+            skipped = 0
+            errors = 0
+
+            for i, photo in enumerate(photos):
+                if progress.wasCanceled():
+                    break
+
+                photo_id = str(photo['id'])
+                progress.setValue(i)
+                progress.setLabelText(f"Uploading {i+1}/{len(photos)}...")
+                QApplication.processEvents()
+
+                # Upload thumbnail
+                thumb_path = thumb_dir / f"{photo_id}.jpg"
+                if thumb_path.exists():
+                    r2_key = f"users/{username}/thumbnails/{photo_id}_thumb.jpg"
+                    if not storage.check_exists(r2_key):
+                        if storage.upload_thumbnail(thumb_path, username, photo_id):
+                            uploaded += 1
+                        else:
+                            errors += 1
+                    else:
+                        skipped += 1
+
+                # Upload full photo if requested
+                if not thumbnails_only:
+                    photo_path = Path(photo['file_path'])
+                    if photo_path.exists():
+                        r2_key = f"users/{username}/photos/{photo_id}.jpg"
+                        if not storage.check_exists(r2_key):
+                            if storage.upload_photo(photo_path, username, photo_id):
+                                uploaded += 1
+                            else:
+                                errors += 1
+                        else:
+                            skipped += 1
+
+            progress.close()
+
+            QMessageBox.information(
+                self,
+                "Cloud Upload Complete",
+                f"Upload finished!\n\n"
+                f"Uploaded: {uploaded}\n"
+                f"Skipped (already exists): {skipped}\n"
+                f"Errors: {errors}"
+            )
+
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "Cloud Upload",
+                "Cloud storage module not found.\n"
+                "Make sure r2_storage.py exists and boto3 is installed."
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Cloud Upload", f"Error: {str(e)}")
+
+    def change_username(self):
+        """Change the username."""
+        current = user_config.get_username() or ""
+        new_username, ok = QInputDialog.getText(
+            self,
+            "Change Username",
+            "Enter new username:",
+            QLineEdit.EchoMode.Normal,
+            current
+        )
+        if ok and new_username and len(new_username.strip()) >= 2:
+            user_config.set_username(new_username.strip())
+            QMessageBox.information(
+                self,
+                "Username Changed",
+                f"Username changed to: {new_username.strip()}\n\n"
+                "Note: Photos already uploaded will remain under the old username."
+            )
+
+    def show_cloud_admin(self):
+        """Show admin panel with all users and their storage."""
+        try:
+            from r2_storage import R2Storage
+
+            storage = R2Storage()
+            if not storage.is_configured():
+                QMessageBox.warning(
+                    self,
+                    "Cloud Admin",
+                    "Cloud storage is not configured.\n"
+                    "See PLAN.md for setup instructions."
+                )
+                return
+
+            # Show loading message
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+
+            # Get all objects
+            objects = []
+            try:
+                paginator = storage.client.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=storage.bucket_name):
+                    for obj in page.get('Contents', []):
+                        objects.append(obj)
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.warning(self, "Cloud Admin", f"Error: {str(e)}")
+                return
+
+            QApplication.restoreOverrideCursor()
+
+            # Analyze by user
+            users = {}
+            total_size = 0
+
+            for obj in objects:
+                key = obj['Key']
+                size = obj['Size']
+                total_size += size
+
+                parts = key.split('/')
+                if len(parts) >= 2 and parts[0] == 'users':
+                    username = parts[1]
+                    if username not in users:
+                        users[username] = {'photos': 0, 'thumbnails': 0, 'size': 0}
+                    users[username]['size'] += size
+                    if '/photos/' in key:
+                        users[username]['photos'] += 1
+                    elif '/thumbnails/' in key:
+                        users[username]['thumbnails'] += 1
+
+            # Format size helper
+            def fmt_size(b):
+                for unit in ['B', 'KB', 'MB', 'GB']:
+                    if b < 1024:
+                        return f"{b:.1f} {unit}"
+                    b /= 1024
+                return f"{b:.1f} TB"
+
+            # Build HTML table
+            if not users:
+                user_rows = "<tr><td colspan='4' style='text-align:center; color:#888;'>No users yet</td></tr>"
+            else:
+                user_rows = ""
+                for username in sorted(users.keys()):
+                    data = users[username]
+                    user_rows += f"""
+                    <tr>
+                        <td style='padding:8px;'><b>{username}</b></td>
+                        <td style='padding:8px; text-align:right;'>{data['photos']}</td>
+                        <td style='padding:8px; text-align:right;'>{data['thumbnails']}</td>
+                        <td style='padding:8px; text-align:right;'>{fmt_size(data['size'])}</td>
+                    </tr>
+                    """
+
+            free_remaining = 10 * 1024 * 1024 * 1024 - total_size  # 10GB free tier
+
+            admin_html = f"""
+            <h2>Cloud Admin Panel</h2>
+            <hr>
+            <h3>Storage Summary</h3>
+            <p><b>Total objects:</b> {len(objects)}</p>
+            <p><b>Total size:</b> {fmt_size(total_size)}</p>
+            <p><b>Free tier remaining:</b> {fmt_size(free_remaining)}</p>
+            <hr>
+            <h3>Users ({len(users)})</h3>
+            <table border='0' cellspacing='0' style='width:100%;'>
+                <tr style='background:#333;'>
+                    <th style='padding:8px; text-align:left;'>Username</th>
+                    <th style='padding:8px; text-align:right;'>Photos</th>
+                    <th style='padding:8px; text-align:right;'>Thumbnails</th>
+                    <th style='padding:8px; text-align:right;'>Size</th>
+                </tr>
+                {user_rows}
+            </table>
+            <hr>
+            <p style='color:#888; font-size:0.9em;'>Free tier: 10 GB storage, unlimited downloads</p>
+            """
+
+            # Show in dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Cloud Admin")
+            dialog.setMinimumSize(500, 400)
+
+            layout = QVBoxLayout(dialog)
+
+            from PyQt6.QtWidgets import QTextBrowser
+            browser = QTextBrowser()
+            browser.setHtml(admin_html)
+            browser.setOpenExternalLinks(True)
+            layout.addWidget(browser)
+
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            layout.addWidget(close_btn)
+
+            dialog.exec()
+
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "Cloud Admin",
+                "Cloud storage module not found.\n"
+                "Make sure r2_storage.py exists and boto3 is installed."
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Cloud Admin", f"Error: {str(e)}")
+
     def _show_about(self):
         """Show about dialog."""
         about_text = f"""
@@ -11185,6 +11529,33 @@ class TrainerWindow(QMainWindow):
         msg.exec()
 
 
+def _add_user_to_registry(username: str):
+    """Add a new user to the user registry if not already present."""
+    import json
+    registry_path = Path.home() / '.trailcam' / 'user_registry.json'
+
+    try:
+        if registry_path.exists():
+            with open(registry_path) as f:
+                registry = json.load(f)
+        else:
+            registry = {'users': []}
+
+        # Check if user already exists
+        existing = [u for u in registry['users'] if u.get('username') == username]
+        if not existing:
+            registry['users'].append({
+                'username': username,
+                'is_admin': False,
+                'status': 'active'
+            })
+            with open(registry_path, 'w') as f:
+                json.dump(registry, f, indent=2)
+            logger.info(f"Added new user to registry: {username}")
+    except Exception as e:
+        logger.warning(f"Failed to update user registry: {e}")
+
+
 def main():
     app = QApplication(sys.argv)
     # Look for icon in standard locations
@@ -11199,7 +11570,30 @@ def main():
             app.setWindowIcon(QIcon(str(icon_path)))
             break
     app.setStyleSheet(APP_STYLE)
+
+    # Check for username on first launch
+    username = user_config.get_username()
+    if not username:
+        username, ok = QInputDialog.getText(
+            None,
+            "Welcome to Trail Camera Software",
+            "Please enter your name.\n"
+            "This identifies your photos when syncing to the cloud.",
+            QLineEdit.EchoMode.Normal,
+            ""
+        )
+        if ok and username and len(username.strip()) >= 2:
+            username = username.strip()
+            user_config.set_username(username)
+            _add_user_to_registry(username)
+        else:
+            # User cancelled or invalid - use default
+            user_config.set_username("user")
+            username = "user"
+
     win = TrainerWindow()
+    # Show username in window title
+    win.setWindowTitle(f"TrailCam - {username}")
     win.resize(1280, 720)
     win.show()
     sys.exit(app.exec())

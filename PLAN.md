@@ -280,6 +280,8 @@ This software is intended to become a **marketable product** for hunters and wil
 - [ ] Deer head detection training (need more head boxes)
 - [ ] 216 photos at WB 27 need date correction (see Timestamp Corrections section)
 - [ ] Remove unused `openpyxl` from requirements.txt
+- [ ] Stamp Reader training - example-based learning where user labels parts of a stamp and system learns the pattern per camera type
+- [ ] Video support - import, organize, and tag video clips from trail cameras (MP4, AVI)
 
 ---
 
@@ -592,6 +594,176 @@ Key capabilities needed:
 - [ ] Build buck profile pages
 - [ ] Deploy to hosting (Vercel, Netlify, etc.)
 
+### Cloudflare R2 Setup (Next Step)
+
+**Why R2:** Zero egress fees = photos can be viewed unlimited times without bandwidth costs. Critical for a photo-heavy app at scale.
+
+**Pricing Reminder:**
+- Storage: $0.015/GB/month (first 10GB free)
+- Downloads: FREE (this is the big win)
+- Uploads: $4.50/million operations (negligible)
+
+#### Step 1: Create Cloudflare Account - DONE
+
+#### Step 2: Create R2 Bucket - DONE
+- Bucket name: `trailcam-photos`
+- Endpoint: `https://856273fcd044ac1fac11116e7d92ba0f.r2.cloudflarestorage.com`
+
+#### Step 3: Create API Token - DONE
+- Object Read & Write permissions
+- TTL: Forever
+
+#### Step 4: Store Credentials - DONE
+
+Config file at `~/.trailcam/r2_config.json`:
+```json
+{
+  "endpoint_url": "https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com",
+  "access_key_id": "YOUR_ACCESS_KEY",
+  "secret_access_key": "YOUR_SECRET_KEY",
+  "bucket_name": "trailcam-photos"
+}
+```
+
+#### Step 5: Integration Code
+
+- [X] `r2_storage.py` - Upload/download photos to R2 (DONE Jan 6, 2026)
+- [ ] Thumbnail generation and upload to R2
+- [ ] Sync mechanism in desktop app (upload photos on import)
+- [X] URL signing for secure photo access (DONE - `get_signed_url()` method)
+
+#### Storage Structure
+```
+trailcam-photos/
+├── users/
+│   └── {username}/
+│       ├── photos/
+│       │   └── {photo_id}.jpg (full resolution)
+│       └── thumbnails/
+│           └── {photo_id}_thumb.jpg (small preview)
+```
+
+### User System (Phased Approach)
+
+**Phase 1: Simple Usernames (Current)**
+- User enters a username on first launch (stored locally in `~/.trailcam/user_config.json`)
+- No password, no authentication
+- All users with R2 credentials can see all photos
+- Good for: Family, trusted hunting club members
+
+**Phase 2: Basic Privacy (Future)**
+- Users can mark photos as "private" vs "shared"
+- Private photos only visible to uploader
+- Still no real authentication - honor system
+
+**Phase 3: Real Authentication - Free Accounts (Next Major Step)**
+- Supabase Auth for proper login (email/password)
+- User accounts stored in database
+- API server as gatekeeper (users never get R2 credentials directly)
+- Signed URLs for photo access (time-limited, per-user)
+- Invite-only clubs/groups
+- Permission controls (view only, can label, admin)
+- Usage tracking (photo count, storage used per user)
+- **No payments yet** - everyone gets full access for free
+
+Architecture:
+```
+App  →  API Server (Supabase Edge Functions)  →  R2
+              ↓
+        - Validates user session
+        - Checks permissions
+        - Generates signed URLs
+        - Tracks usage
+```
+
+Tasks for Phase 3:
+- [ ] Set up Supabase Auth (email/password login)
+- [ ] Create users table with usage tracking
+- [ ] Create API endpoint: request upload URL
+- [ ] Create API endpoint: request photo URL
+- [ ] Create API endpoint: get user stats
+- [ ] Update app to use API instead of direct R2 access
+- [ ] Remove bundled R2 credentials from public builds
+
+**Phase 4: Paid Subscriptions (Future)**
+- Stripe integration for payments
+- Plan tiers (Free, Basic, Pro)
+- Quota enforcement (photo limits, storage limits)
+- Billing dashboard
+- Usage alerts ("You're at 80% of your storage")
+
+Example tiers:
+| Plan | Price | Photos | Storage |
+|------|-------|--------|---------|
+| Free | $0 | 100 | 500 MB |
+| Basic | $5/mo | 2,000 | 5 GB |
+| Pro | $15/mo | Unlimited | 50 GB |
+| Club | $30/mo | Unlimited | 200 GB + 5 users |
+
+**Admin Features (All Phases)**
+- [ ] Admin dashboard to view all users
+- [ ] See which users are in which groups
+- [ ] Move users between groups
+- [ ] Users can belong to multiple groups
+- [ ] Group-level permissions (who can view, who can label)
+- [ ] Usage stats per user (photos uploaded, storage used)
+
+**Data Model for Groups:**
+```
+users table:
+  - id
+  - username
+  - email (optional, for Phase 3)
+  - created_at
+  - is_admin
+
+groups table:
+  - id
+  - name (e.g., "Brooke Farm", "Hunting Club")
+  - created_by
+  - created_at
+
+user_groups table (many-to-many):
+  - user_id
+  - group_id
+  - role (viewer, labeler, admin)
+  - joined_at
+```
+
+**Current Plan:** Implement Phase 1 now. Simple username prompt, photos organized by username in R2.
+
+---
+
+### Weather & Location Features (Future)
+
+**Purpose:** Add environmental context to photos for better hunting insights.
+
+**Location Data:**
+- [ ] Store GPS coordinates per camera/location
+- [ ] Map view showing camera locations
+- [ ] Distance/direction from stand sites
+- [ ] Auto-assign location to photos based on camera ID or folder
+
+**Weather Integration:**
+- [ ] Fetch historical weather for photo timestamp + location
+- [ ] Store: temperature, wind speed/direction, barometric pressure, moon phase, precipitation
+- [ ] Weather overlay on photo viewer
+- [ ] Filter photos by weather conditions
+- [ ] Correlate deer activity with weather patterns (analytics)
+
+**Data Sources (to research):**
+- Open-Meteo API (free, historical data)
+- Weather.gov API (free, US only)
+- Visual Crossing (paid, comprehensive historical)
+- Moon phase calculation (can be done locally)
+
+**Implementation Notes:**
+- Weather data could be fetched in batch for date ranges
+- Store in new `weather_data` table linked by date/location
+- Camera locations stored in `camera_info` table (already exists)
+
+---
+
 ### Shared Backend Strategy
 
 All platforms should sync through **Supabase**:
@@ -634,3 +806,34 @@ sqlite3 ~/.trailcam/trailcam.db "SELECT COUNT(*) FROM photos WHERE suggested_sex
 # All tag distribution
 sqlite3 ~/.trailcam/trailcam.db "SELECT tag_name, COUNT(*) FROM tags GROUP BY tag_name ORDER BY COUNT(*) DESC;"
 ```
+
+---
+
+## 5. FUTURE AI/ML IDEAS
+
+### Camera Location Re-ID via Visual Anchor Points
+
+**Concept:** Use visual features in photo backgrounds (trees, terrain, structures) to automatically identify which camera location a photo came from, even without EXIF data or folder structure.
+
+**How it could work:**
+1. Extract visual features from background regions (excluding detected animals)
+2. Build a feature embedding for each known camera location from labeled photos
+3. For new photos, compare background features to known location embeddings
+4. Suggest most likely camera location based on visual similarity
+
+**Potential approaches:**
+- **Triplet loss / contrastive learning** - Train to make same-location photos embed close together
+- **Image retrieval** - Find most similar labeled photos and use their location
+- **Scene recognition backbone** - Use places365 or similar pretrained model for scene features
+
+**Benefits:**
+- Works even when cameras are moved (learns the scene, not camera metadata)
+- Could detect when a camera has been moved to a new location
+- Helps organize photos from cameras without reliable EXIF/naming
+
+**Challenges:**
+- Seasonal changes (leaves, snow) may confuse matching
+- Night photos vs day photos look very different
+- Need sufficient labeled examples per location
+
+**Status:** Long-term idea - revisit after head keypoint model is mature

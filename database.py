@@ -237,6 +237,7 @@ class TrailCamDatabase:
         self._ensure_photo_columns()
         self._ensure_deer_columns()
         self._ensure_box_columns()
+        self._ensure_sync_tracking()
 
     def _ensure_photo_columns(self):
         """Ensure newer photo columns exist for backward compatibility."""
@@ -263,6 +264,7 @@ class TrailCamDatabase:
         add_column("collection", "collection TEXT", "")  # Photo collection grouping
         add_column("file_hash", "file_hash TEXT", None)  # MD5 hash for cross-computer sync
         add_column("archived", "archived INTEGER DEFAULT 0", 0)  # Hide from default view
+        add_column("owner", "owner TEXT", "")  # Photo owner for cloud sync
         # Custom species list table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS custom_species (
@@ -373,6 +375,86 @@ class TrailCamDatabase:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_y2 REAL")
         if "head_notes" not in cols:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_notes TEXT")
+        self.conn.commit()
+
+    def _ensure_sync_tracking(self):
+        """Add updated_at columns and sync_state table for smart sync."""
+        cursor = self.conn.cursor()
+
+        # Add updated_at to tables that need sync tracking
+        sync_tables = ['photos', 'tags', 'deer_metadata', 'deer_additional',
+                       'buck_profiles', 'buck_profile_seasons', 'annotation_boxes']
+
+        for table in sync_tables:
+            cursor.execute(f"PRAGMA table_info({table})")
+            cols = {row[1] for row in cursor.fetchall()}
+            if "updated_at" not in cols:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN updated_at TEXT")
+                # Set existing records to now so they sync on first push
+                cursor.execute(f"UPDATE {table} SET updated_at = datetime('now') WHERE updated_at IS NULL")
+
+        # Create sync_state table to track last sync time
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sync_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_push_at TEXT,
+                last_pull_at TEXT
+            )
+        """)
+
+        # Initialize sync_state if empty
+        cursor.execute("INSERT OR IGNORE INTO sync_state (id) VALUES (1)")
+
+        # Create indexes for updated_at columns
+        for table in sync_tables:
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_updated_at ON {table}(updated_at)")
+
+        # Create triggers to auto-update updated_at on INSERT and UPDATE
+        for table in sync_tables:
+            # Trigger for INSERT
+            cursor.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS {table}_insert_updated_at
+                AFTER INSERT ON {table}
+                FOR EACH ROW
+                WHEN NEW.updated_at IS NULL
+                BEGIN
+                    UPDATE {table} SET updated_at = datetime('now') WHERE rowid = NEW.rowid;
+                END
+            """)
+            # Trigger for UPDATE
+            cursor.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS {table}_update_updated_at
+                AFTER UPDATE ON {table}
+                FOR EACH ROW
+                WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+                BEGIN
+                    UPDATE {table} SET updated_at = datetime('now') WHERE rowid = NEW.rowid;
+                END
+            """)
+
+        self.conn.commit()
+
+    def get_last_sync_time(self, sync_type='push') -> Optional[str]:
+        """Get the last sync timestamp."""
+        cursor = self.conn.cursor()
+        col = 'last_push_at' if sync_type == 'push' else 'last_pull_at'
+        cursor.execute(f"SELECT {col} FROM sync_state WHERE id = 1")
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def set_last_sync_time(self, sync_type='push', timestamp=None):
+        """Set the last sync timestamp."""
+        if timestamp is None:
+            timestamp = datetime.utcnow().isoformat()
+        cursor = self.conn.cursor()
+        col = 'last_push_at' if sync_type == 'push' else 'last_pull_at'
+        cursor.execute(f"UPDATE sync_state SET {col} = ? WHERE id = 1", (timestamp,))
+        self.conn.commit()
+
+    def mark_record_updated(self, table: str, record_id: int):
+        """Mark a record as updated for sync tracking."""
+        cursor = self.conn.cursor()
+        cursor.execute(f"UPDATE {table} SET updated_at = datetime('now') WHERE id = ?", (record_id,))
         self.conn.commit()
 
     @staticmethod
@@ -1802,10 +1884,27 @@ class TrailCamDatabase:
 
         return None
 
-    def push_to_supabase(self, supabase_client) -> Dict[str, int]:
-        """Push all local data to Supabase using batch operations. Returns counts of items pushed."""
+    def push_to_supabase(self, supabase_client, progress_callback=None, force_full=False) -> Dict[str, int]:
+        """Push changed local data to Supabase using batch operations. Returns counts of items pushed.
+
+        Args:
+            supabase_client: Supabase client instance
+            progress_callback: Optional callable(step, total, message) for progress updates
+            force_full: If True, push all data regardless of last sync time
+        """
+        def report(step, msg):
+            if progress_callback:
+                progress_callback(step, 7, msg)
+            print(msg)
+
         # Ensure all required columns exist before syncing (handles old databases)
         self._ensure_deer_columns()
+        self._ensure_sync_tracking()
+
+        # Get last sync time for incremental push
+        last_sync = None if force_full else self.get_last_sync_time('push')
+        sync_mode = "full" if last_sync is None else "incremental"
+        report(0, f"Starting {sync_mode} sync...")
 
         # Calculate file hashes for photos that don't have one (for cross-computer matching)
         hash_stats = self.get_hash_stats()
@@ -1821,6 +1920,13 @@ class TrailCamDatabase:
         now = datetime.utcnow().isoformat()
         BATCH_SIZE = 500  # Supabase handles batches well
 
+        # Build WHERE clause for incremental sync
+        def since_clause(table_alias=""):
+            if last_sync is None:
+                return ""
+            prefix = f"{table_alias}." if table_alias else ""
+            return f" AND {prefix}updated_at > '{last_sync}'"
+
         def batch_upsert(table_name, data_list, on_conflict):
             """Upsert data in batches."""
             for i in range(0, len(data_list), BATCH_SIZE):
@@ -1829,8 +1935,9 @@ class TrailCamDatabase:
                     supabase_client.table(table_name).upsert(batch, on_conflict=on_conflict).execute()
 
         # Push photos_sync (photo identifiers and basic metadata)
-        print("Syncing photos...")
-        cursor.execute("SELECT * FROM photos")
+        report(1, "Syncing photos...")
+        query = "SELECT * FROM photos WHERE 1=1" + since_clause()
+        cursor.execute(query)
         photos_data = []
         for row in cursor.fetchall():
             photo = dict(row)
@@ -1851,11 +1958,12 @@ class TrailCamDatabase:
         counts["photos"] = len(photos_data)
 
         # Push tags
-        print("Syncing tags...")
-        cursor.execute("""
-            SELECT t.tag_name, p.original_name, p.date_taken, p.camera_model, p.file_hash
+        report(2, "Syncing tags...")
+        cursor.execute(f"""
+            SELECT t.tag_name, t.updated_at, p.original_name, p.date_taken, p.camera_model, p.file_hash
             FROM tags t
             JOIN photos p ON t.photo_id = p.id
+            WHERE 1=1 {since_clause('t')}
         """)
         tags_data = []
         for row in cursor.fetchall():
@@ -1870,11 +1978,12 @@ class TrailCamDatabase:
         counts["tags"] = len(tags_data)
 
         # Push deer_metadata
-        print("Syncing deer metadata...")
-        cursor.execute("""
+        report(3, "Syncing deer metadata...")
+        cursor.execute(f"""
             SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
             FROM deer_metadata d
             JOIN photos p ON d.photo_id = p.id
+            WHERE 1=1 {since_clause('d')}
         """)
         deer_meta_data = []
         for row in cursor.fetchall():
@@ -1905,11 +2014,12 @@ class TrailCamDatabase:
         counts["deer_metadata"] = len(deer_meta_data)
 
         # Push deer_additional
-        print("Syncing additional deer...")
-        cursor.execute("""
+        report(4, "Syncing additional deer...")
+        cursor.execute(f"""
             SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
             FROM deer_additional d
             JOIN photos p ON d.photo_id = p.id
+            WHERE 1=1 {since_clause('d')}
         """)
         deer_add_data = []
         for row in cursor.fetchall():
@@ -1940,8 +2050,8 @@ class TrailCamDatabase:
         counts["deer_additional"] = len(deer_add_data)
 
         # Push buck_profiles
-        print("Syncing buck profiles...")
-        cursor.execute("SELECT * FROM buck_profiles")
+        report(5, "Syncing buck profiles...")
+        cursor.execute(f"SELECT * FROM buck_profiles WHERE 1=1 {since_clause()}")
         profiles_data = []
         for row in cursor.fetchall():
             d = dict(row)
@@ -1955,8 +2065,8 @@ class TrailCamDatabase:
         counts["buck_profiles"] = len(profiles_data)
 
         # Push buck_profile_seasons
-        print("Syncing buck profile seasons...")
-        cursor.execute("SELECT * FROM buck_profile_seasons")
+        report(6, "Syncing buck profile seasons...")
+        cursor.execute(f"SELECT * FROM buck_profile_seasons WHERE 1=1 {since_clause()}")
         seasons_data = []
         for row in cursor.fetchall():
             d = dict(row)
@@ -1982,7 +2092,7 @@ class TrailCamDatabase:
 
         # Push annotation_boxes - but ONLY if we have a substantial local database
         # This prevents accidentally wiping cloud boxes when pushing from an empty/new computer
-        print("Syncing annotation boxes...")
+        report(7, "Syncing annotation boxes...")
         cursor.execute("SELECT COUNT(*) FROM annotation_boxes")
         local_box_count = cursor.fetchone()[0]
 
@@ -1994,10 +2104,11 @@ class TrailCamDatabase:
             print("  Run 'Pull from Cloud' first if this is a new computer.")
             counts["annotation_boxes"] = 0
         else:
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
                 FROM annotation_boxes b
                 JOIN photos p ON b.photo_id = p.id
+                WHERE 1=1 {since_clause('b')}
             """)
             boxes_data = []
             for row in cursor.fetchall():
@@ -2014,20 +2125,39 @@ class TrailCamDatabase:
                     "confidence": d.get("confidence"),
                     "updated_at": now
                 })
-            # Delete and re-insert (safe now because we verified we have data)
+            # For incremental sync, use upsert instead of delete+insert
             if boxes_data:
-                supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
-                for i in range(0, len(boxes_data), BATCH_SIZE):
-                    batch = boxes_data[i:i + BATCH_SIZE]
-                    if batch:
-                        supabase_client.table("annotation_boxes").insert(batch).execute()
+                if last_sync is None:
+                    # Full sync: delete all and re-insert
+                    supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
+                    for i in range(0, len(boxes_data), BATCH_SIZE):
+                        batch = boxes_data[i:i + BATCH_SIZE]
+                        if batch:
+                            supabase_client.table("annotation_boxes").insert(batch).execute()
+                else:
+                    # Incremental sync: upsert changed boxes
+                    batch_upsert("annotation_boxes", boxes_data, "photo_key,label,x1,y1")
             counts["annotation_boxes"] = len(boxes_data)
 
-        print("Sync complete!")
+        report(7, "Sync complete!")
+
+        # Update last sync time after successful push
+        self.set_last_sync_time('push', now)
+
         return counts
 
-    def pull_from_supabase(self, supabase_client) -> Dict[str, int]:
-        """Pull data from Supabase and update local database. Returns counts."""
+    def pull_from_supabase(self, supabase_client, progress_callback=None) -> Dict[str, int]:
+        """Pull data from Supabase and update local database. Returns counts.
+
+        Args:
+            supabase_client: Supabase client instance
+            progress_callback: Optional callable(step, total, message) for progress updates
+        """
+        def report(step, msg):
+            if progress_callback:
+                progress_callback(step, 7, msg)
+            print(msg)
+
         # Ensure all required columns exist before syncing (handles old databases)
         self._ensure_deer_columns()
 
@@ -2037,6 +2167,7 @@ class TrailCamDatabase:
         cursor = self.conn.cursor()
 
         # Pull photos_sync - update local photo metadata (fetch_all to bypass 1000 row limit)
+        report(1, "Pulling photos...")
         result = supabase_client.table("photos_sync").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
@@ -2051,6 +2182,7 @@ class TrailCamDatabase:
                 counts["photos"] += 1
 
         # Pull tags (fetch_all to bypass 1000 row limit)
+        report(2, "Pulling tags...")
         result = supabase_client.table("tags").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
@@ -2061,6 +2193,7 @@ class TrailCamDatabase:
                 counts["tags"] += 1
 
         # Pull deer_metadata (fetch_all to bypass 1000 row limit)
+        report(3, "Pulling deer metadata...")
         result = supabase_client.table("deer_metadata").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
@@ -2083,6 +2216,7 @@ class TrailCamDatabase:
                 counts["deer_metadata"] += 1
 
         # Pull deer_additional (fetch_all to bypass 1000 row limit)
+        report(4, "Pulling additional deer...")
         result = supabase_client.table("deer_additional").select("*").execute(fetch_all=True)
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
@@ -2105,6 +2239,7 @@ class TrailCamDatabase:
                 counts["deer_additional"] += 1
 
         # Pull buck_profiles (fetch_all to bypass 1000 row limit)
+        report(5, "Pulling buck profiles...")
         result = supabase_client.table("buck_profiles").select("*").execute(fetch_all=True)
         for row in result.data:
             if row.get("deer_id"):
@@ -2115,6 +2250,7 @@ class TrailCamDatabase:
                 counts["buck_profiles"] += 1
 
         # Pull buck_profile_seasons (fetch_all to bypass 1000 row limit)
+        report(6, "Pulling buck profile seasons...")
         result = supabase_client.table("buck_profile_seasons").select("*").execute(fetch_all=True)
         for row in result.data:
             if row.get("deer_id") and row.get("season_year"):
@@ -2133,6 +2269,7 @@ class TrailCamDatabase:
                       row.get("abnormal_points_min"), row.get("abnormal_points_max")))
                 counts["buck_profile_seasons"] += 1
 
+        report(7, "Sync complete!")
         self.conn.commit()
         return counts
 

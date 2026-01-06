@@ -59,3 +59,6 @@ outputs/
 
 # Archived/deprecated code
 archive/
+
+# Cloud credentials (never commit)
+cloud_config.json

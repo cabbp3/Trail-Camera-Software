@@ -1726,54 +1726,41 @@ class OrganizerWindow(QMainWindow):
             # Get library path for download destination
             dest = image_processor.get_library_path()
 
-            # Download photos
-            result = download_new_photos(
-                email=email,
+            # Download photos - returns List[Path]
+            files = download_new_photos(
+                destination=dest,
+                user=email,
                 password=password,
-                dest_dir=str(dest),
                 start_date=start,
                 end_date=end
             )
 
-            if result.get('error'):
-                error = result['error']
-                # Check if it's a credential error
-                if "credentials" in error.lower() or "password" in error.lower() or "invalid" in error.lower() or "login" in error.lower():
-                    reply = QMessageBox.question(
-                        self, "CuddeLink Login Failed",
-                        f"Login failed: {error}\n\nWould you like to update your credentials?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
-                        self._setup_cuddelink()
-                else:
-                    QMessageBox.warning(self, "CuddeLink", f"Download failed: {error}")
-                self.status_label.setText("CuddeLink download failed")
+            if not files:
+                QMessageBox.information(self, "CuddeLink", "No new photos found to download.")
+                self.status_label.setText("CuddeLink: No new photos")
                 return
 
-            downloaded = result.get('downloaded', 0)
-            skipped = result.get('skipped', 0)
+            # Import downloaded photos to database
+            imported = 0
+            skipped = 0
+            for f in files:
+                try:
+                    # Check if already in database
+                    if self.db.get_photo_by_path(str(f)):
+                        skipped += 1
+                        continue
+                    if self.db.photo_exists_by_original_name(f.name):
+                        skipped += 1
+                        continue
+                    date_taken, camera_model = image_processor.extract_exif_data(str(f))
+                    self.db.add_photo(str(f), f.name, date_taken or "", camera_model or "")
+                    imported += 1
+                except Exception as e:
+                    logger.error(f"Import error: {e}")
 
-            if downloaded == 0 and skipped == 0:
-                QMessageBox.information(self, "CuddeLink", "No new photos found to download.")
-            else:
-                # Import downloaded photos to database
-                new_files = result.get('files', [])
-                imported = 0
-                for f in new_files:
-                    try:
-                        if self.db.get_photo_by_path(f):
-                            continue
-                        date_taken, camera_model = image_processor.extract_exif_data(f)
-                        self.db.add_photo(f, Path(f).name, date_taken or "", camera_model or "")
-                        imported += 1
-                    except Exception as e:
-                        logger.error(f"Import error: {e}")
-
-                msg = f"Downloaded: {downloaded} photos\nSkipped (already have): {skipped}\nImported to library: {imported}"
-                QMessageBox.information(self, "CuddeLink", msg)
-                self._load_photos()
-
+            msg = f"Downloaded: {len(files)} photos\nImported to library: {imported}\nSkipped (already have): {skipped}"
+            QMessageBox.information(self, "CuddeLink", msg)
+            self._load_photos()
             self.status_label.setText("CuddeLink download complete")
 
         except Exception as e:

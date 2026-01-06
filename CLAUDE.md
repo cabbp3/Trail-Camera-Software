@@ -15,6 +15,55 @@ Keep solutions simple and focused. Prioritize working software over perfect arch
 
 ---
 
+## Session Startup: Check Cloud Storage Usage
+
+**Run this at the start of each session** to monitor free tier usage:
+
+```bash
+cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0" && source .venv/bin/activate && python3 -c "
+print('=== STORAGE USAGE CHECK ===')
+
+# Cloudflare R2
+try:
+    from r2_storage import R2Storage
+    r2 = R2Storage()
+    if r2.is_configured():
+        stats = r2.get_bucket_stats()
+        used = stats.get('total_size_mb', 0)
+        print(f'Cloudflare R2: {used:.1f} MB / 10,000 MB free')
+        if used > 8000:
+            print('  ⚠️  WARNING: Approaching R2 free tier limit!')
+    else:
+        print('Cloudflare R2: Not configured')
+except: print('Cloudflare R2: Check failed')
+
+# Supabase
+try:
+    from supabase_rest import SupabaseREST
+    sb = SupabaseREST()
+    if sb.is_configured():
+        print('Supabase: Configured (check dashboard for exact usage)')
+        print('  Free tier: 500 MB database, 1 GB storage, 2 GB bandwidth')
+    else:
+        print('Supabase: Not configured')
+except: print('Supabase: Not configured')
+
+# Local storage
+import subprocess
+result = subprocess.run(['du', '-sh', '/Users/brookebratcher/TrailCamLibrary'], capture_output=True, text=True)
+if result.returncode == 0:
+    print(f'Local photos: {result.stdout.split()[0]}')
+"
+```
+
+**Free Tier Limits:**
+| Service | Free Tier | Warning Threshold |
+|---------|-----------|-------------------|
+| Cloudflare R2 | 10 GB storage, unlimited downloads | 8 GB |
+| Supabase | 500 MB db, 1 GB storage, 2 GB bandwidth/month | Check dashboard |
+
+---
+
 ## Product Vision
 
 This software is intended to eventually become a **marketable product** for hunters and wildlife enthusiasts who manage trail cameras. Keep this in mind when making design decisions:
@@ -49,50 +98,37 @@ When making architecture decisions, keep these principles in mind:
 
 ## Project Overview
 
-Trail Camera Software - **Two separate PyQt6 desktop applications** for organizing trail camera photos:
+Trail Camera Software - **PyQt6 desktop application** for organizing trail camera photos:
 
-| App | Entry Point | Purpose | Target User |
-|-----|-------------|---------|-------------|
-| **Organizer** | `main.py` → `organizer_ui.py` | Simplified photo browser, filtering, basic tagging | End users / Product |
-| **Trainer** | `trainer_main.py` → `training/label_tool.py` | Advanced labeling, bounding boxes, AI training | Developer / Internal |
+| Entry Point | Code | Purpose |
+|-------------|------|---------|
+| `main.py` | `training/label_tool.py` | Full-featured app (unified) |
+| `trainer_main.py` | `training/label_tool.py` | Same as above (legacy entry point) |
 
-Both apps share the same database, AI models, and supporting modules.
+**Note:** The apps were unified on Jan 5, 2026. Both entry points now run the same full-featured code. The old simplified `organizer_ui.py` is deprecated.
 
 ## Commands
 
-### Run the Organizer (Product App - macOS)
+### Run the App (macOS)
 ```bash
 cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0"
 source .venv/bin/activate
 python main.py
 ```
 
-### Run the Trainer (Development App - macOS)
-```bash
-cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0"
-source .venv/bin/activate
-python trainer_main.py
-```
-
-### Run the Organizer (Windows)
+### Run the App (Windows)
 ```cmd
 cd C:\Users\mbroo\OneDrive\Desktop\Trail Camera Software V 1.0
 venv\Scripts\activate
 python main.py
 ```
 
-### Run the Trainer (Windows)
-```cmd
-cd C:\Users\mbroo\OneDrive\Desktop\Trail Camera Software V 1.0
-venv\Scripts\activate
-python trainer_main.py
-```
-
-**Windows Status (Dec 25, 2024):**
+**Windows Status (Jan 2026):**
+- **GitHub Actions builds** - Automated via `.github/workflows/build-windows.yml`
+- **Latest release**: v1.0.3 at https://github.com/cabbp3/Trail-Camera-Software/releases
 - App runs and all core features work
-- Supabase cloud sync FIXED - replaced supabase package with REST API (supabase_rest.py)
-- No C++ Build Tools needed anymore
-- **IMPORTANT:** Use Python 3.11 (not 3.14) - newer versions lack package support
+- Supabase cloud sync works via REST API (supabase_rest.py)
+- **IMPORTANT:** Use Python 3.11 (not 3.14) for local builds
 - McAfee/antivirus may block the .exe - add to exclusions or restore from quarantine
 
 ### Install Dependencies
@@ -234,6 +270,7 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 **Key Features Working:**
 - Windows & macOS standalone builds (PyInstaller)
 - Supabase cloud sync (REST API, no C++ deps)
+- **Cloudflare R2 photo storage** (Tools → Cloud Sync menu)
 - CuddeLink photo downloads with retry logic
 - Integrated queue mode for reviewing AI suggestions
 - Background AI processing with live updates
@@ -277,21 +314,82 @@ When the user is looking for something to run overnight or while away:
 
 ---
 
-## Recent Session (Jan 5, 2026)
+## Recent Session (Jan 5-6, 2026)
 
-### Two-App Architecture & CuddeLink Fix
+### Unified App Architecture
 
-**App Split Documented:**
-- Project now has two separate apps: **Organizer** (product) and **Trainer** (development)
-- Updated CLAUDE.md architecture section to reflect this
-- Organizer: `main.py` → `organizer_ui.py` (56KB, simplified UI for end users)
-- Trainer: `trainer_main.py` → `training/label_tool.py` (11K+ lines, advanced labeling)
+**Merged Organizer into Trainer:**
+- `main.py` now launches the full Trainer app (same as `trainer_main.py`)
+- Both entry points run `training/label_tool.py`
+- Old simplified `organizer_ui.py` is deprecated (kept for reference)
+- Removed Simple Mode from Trainer - now one full-featured app
 
 **CuddeLink Credential Fix:**
-- Fixed bug where wrong password couldn't be changed after initial login attempt
-- Both apps now detect credential errors and offer to update credentials
-- Checks for "credentials", "password", "invalid", "login" in error messages
-- Files modified: `organizer_ui.py`, `training/label_tool.py`
+- Fixed parameter names: `user=` not `email=`, `destination=` not `dest_dir=`
+- Fixed return type handling (expects `List[Path]` not dict)
+
+### Head Annotation Improvements
+
+- **Tighter zoom**: Reduced padding from 50% to 15% when loading each subject box
+- **Restored "Low Quality" quick note**: Added back to `head_annotation_window.py`
+
+### Head Keypoint Model v1
+
+Trained first version of head direction prediction model:
+- **Training data**: 186 clean annotations (with head lines, no notes)
+- **Results**: ~14% skull error, ~16% nose error (on 200px crop = ~28-33px)
+- **Model saved**: `outputs/head_keypoints_v1/best_model.pt`
+- **Visualizations**: `outputs/head_keypoints_v1/visualizations/`
+
+**Annotation Progress:**
+- Total deer boxes: 5,759
+- Annotated: 429 (7.4%)
+- Remaining: 5,330
+
+### Windows Release v1.0.3
+
+**GitHub Actions Workflow:**
+- `.github/workflows/build-windows.yml` - Automated Windows builds
+- Release v1.0.3: https://github.com/cabbp3/Trail-Camera-Software/releases/tag/v1.0.3
+- Windows ZIP upload pending (network issues)
+
+### Cloudflare R2 Cloud Storage (Jan 6, 2026)
+
+**R2 Setup Complete:**
+- Bucket: `trailcam-photos`
+- Credentials stored in `~/.trailcam/r2_config.json`
+- Free tier: 10GB storage, unlimited downloads
+
+**New Files Created:**
+- `r2_storage.py` - R2 upload/download/signed URL module
+- `user_config.py` - Simple username management
+- `tools/batch_upload_r2.py` - Batch upload script for overnight runs
+- `tools/r2_admin.py` - Admin CLI to view all users/files
+
+**Desktop App Cloud Features** (Tools → Cloud Sync):
+- Cloud Status - Shows bucket usage and your uploads
+- Upload Thumbnails to Cloud (~90MB)
+- Upload All Photos to Cloud (~5GB)
+- Change Username
+
+**Web Server Cloud Endpoints** (`web/server.py`):
+- `/api/cloud/stats` - Bucket statistics
+- `/api/cloud/photos` - List photos with signed URLs
+- `/api/cloud/photos?user=X` - Filter by user
+
+**User System (Phase 1):**
+- Username prompt on first launch
+- No authentication yet - for trusted users (family, hunting club)
+- See PLAN.md for Phase 2/3 roadmap (privacy, real auth)
+
+**Batch Upload for Tonight:**
+```bash
+cd "/Users/brookebratcher/Desktop/Trail Camera Software V 1.0"
+source .venv/bin/activate
+python tools/batch_upload_r2.py --username brooke --thumbnails-only
+# Or for full photos:
+python tools/batch_upload_r2.py --username brooke --both --resume
+```
 
 ---
 

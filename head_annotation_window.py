@@ -164,11 +164,11 @@ class HeadAnnotationView(QGraphicsView):
         x2 = box["x2"] * self.img_width
         y2 = box["y2"] * self.img_height
 
-        # Add padding around the box (50% on each side)
+        # Add small padding around the box (15% on each side) for tight zoom
         width = x2 - x1
         height = y2 - y1
-        padding_x = width * 0.5
-        padding_y = height * 0.5
+        padding_x = width * 0.15
+        padding_y = height * 0.15
 
         rect = QRectF(
             x1 - padding_x,
@@ -322,6 +322,7 @@ class HeadAnnotationWindow(QDialog):
         ("Obstructed: object", "Head obstructed by object"),
         ("Obstructed: body", "Head obstructed by body (walking away)"),
         ("Facing away", "Facing away - line estimated"),
+        ("Low Quality", "Low quality photo - cannot annotate"),
         ("NOT A DEER", "Species error - not a deer"),
     ]
 

@@ -234,6 +234,101 @@ def refresh_photos_json():
         json.dump(photos, f)
 
 
+def get_r2_storage():
+    """Get R2 storage instance if configured."""
+    try:
+        from r2_storage import R2Storage
+        storage = R2Storage()
+        if storage.is_configured():
+            return storage
+    except ImportError:
+        pass
+    return None
+
+
+def get_cloud_stats():
+    """Get cloud storage statistics."""
+    storage = get_r2_storage()
+    if not storage:
+        return {"error": "R2 not configured"}
+
+    try:
+        # List all objects
+        objects = []
+        paginator = storage.client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=storage.bucket_name):
+            for obj in page.get('Contents', []):
+                objects.append(obj)
+
+        # Analyze by user
+        users = {}
+        total_size = 0
+
+        for obj in objects:
+            key = obj['Key']
+            size = obj['Size']
+            total_size += size
+
+            parts = key.split('/')
+            if len(parts) >= 2 and parts[0] == 'users':
+                username = parts[1]
+                if username not in users:
+                    users[username] = {'photos': 0, 'thumbnails': 0, 'size': 0}
+                users[username]['size'] += size
+                if '/photos/' in key:
+                    users[username]['photos'] += 1
+                elif '/thumbnails/' in key:
+                    users[username]['thumbnails'] += 1
+
+        return {
+            "total_objects": len(objects),
+            "total_size": total_size,
+            "total_photos": sum(u['photos'] for u in users.values()),
+            "users": list(users.keys()),
+            "user_stats": users
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_cloud_photos(username=None):
+    """Get list of photos from cloud storage."""
+    storage = get_r2_storage()
+    if not storage:
+        return []
+
+    try:
+        photos = []
+        prefix = f"users/{username}/thumbnails/" if username else "users/"
+
+        paginator = storage.client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=storage.bucket_name, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if '/thumbnails/' in key and key.endswith('.jpg'):
+                    # Extract photo ID from thumbnail key
+                    parts = key.split('/')
+                    photo_id = parts[-1].replace('_thumb.jpg', '')
+                    user = parts[1] if len(parts) > 1 else 'unknown'
+
+                    # Generate signed URLs
+                    thumb_url = storage.get_signed_url(key, expires_in=3600)
+                    photo_key = key.replace('/thumbnails/', '/photos/').replace('_thumb.jpg', '.jpg')
+                    photo_url = storage.get_signed_url(photo_key, expires_in=3600)
+
+                    photos.append({
+                        'id': photo_id,
+                        'user': user,
+                        'thumbnail_url': thumb_url,
+                        'photo_url': photo_url
+                    })
+
+        return photos
+    except Exception as e:
+        print(f"Error getting cloud photos: {e}")
+        return []
+
+
 class TrailCamHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEB_DIR, **kwargs)
@@ -241,6 +336,19 @@ class TrailCamHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
+        query = urllib.parse.parse_qs(parsed.query)
+
+        # API: Cloud stats
+        if path == '/api/cloud/stats':
+            self.send_json_response(get_cloud_stats())
+            return
+
+        # API: Cloud photos
+        if path == '/api/cloud/photos':
+            username = query.get('user', [None])[0]
+            photos = get_cloud_photos(username)
+            self.send_json_response(photos)
+            return
 
         # API: Download status
         if path == '/api/cuddelink/status':
