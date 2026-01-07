@@ -125,7 +125,7 @@ python main.py
 
 **Windows Status (Jan 2026):**
 - **GitHub Actions builds** - Automated via `.github/workflows/build-windows.yml`
-- **Latest release**: v1.0.3 at https://github.com/cabbp3/Trail-Camera-Software/releases
+- **Latest release**: v1.0.5 at https://github.com/cabbp3/Trail-Camera-Software/releases
 - App runs and all core features work
 - Supabase cloud sync works via REST API (supabase_rest.py)
 - **IMPORTANT:** Use Python 3.11 (not 3.14) for local builds
@@ -191,23 +191,20 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ## Architecture
 
-### Two Apps - Entry Points
-- `main.py` → `organizer_ui.py` - **Organizer** (product app for end users)
-- `trainer_main.py` → `training/label_tool.py` - **Trainer** (development app for labeling/training)
+### Unified App
+- `main.py` → `training/label_tool.py` - Full-featured app (11,000+ lines)
+- `trainer_main.py` → Same code (legacy entry point)
+- `organizer_ui.py` - Deprecated (kept for reference)
 
-### Organizer App (organizer_ui.py - ~56KB)
-- Simplified photo browser with dark theme
+### Main App Features (training/label_tool.py)
+- Photo browser with dark theme
 - Filter/sort by species, date, collection, camera
-- Accept AI suggestions, basic tagging
-- CuddeLink download integration
-- Designed for non-technical users
-
-### Trainer App (training/label_tool.py - 11,000+ lines)
-- Advanced labeling with bounding box annotation
 - Per-box tabbed interface for multiple detections
-- AI model training pipelines
-- Review queues for AI suggestions
-- Designed for developer/data labeling
+- AI suggestions and review queues
+- Bounding box annotation
+- CuddeLink download integration
+- Supabase cloud sync
+- Cloudflare R2 photo storage
 
 ### Shared Modules
 - **database.py** - SQLite operations with WAL mode; schema includes `photos`, `tags`, `deer_metadata`, `deer_additional`, `camera_info`, `annotation_history` tables
@@ -252,7 +249,7 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ---
 
-## Current State (Jan 5, 2026)
+## Current State (Jan 7, 2026)
 
 **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
 
@@ -314,7 +311,30 @@ When the user is looking for something to run overnight or while away:
 
 ---
 
-## Recent Session (Jan 5-6, 2026)
+## Recent Session (Jan 6-7, 2026)
+
+### v1.0.5 Release
+
+**Smart Sync Implementation:**
+- Added `updated_at` column to all sync tables
+- Created `sync_state` table for tracking last push/pull timestamps
+- SQLite triggers auto-update `updated_at` on INSERT/UPDATE
+- First sync is full, subsequent syncs only push changed records
+- Fixed database migration order (archived index after column exists)
+
+**UI Cleanup:**
+- Removed box-related review queue items
+- Removed Claude review queue menu item
+- Fixed progress bar visibility when pushing to Supabase
+
+**Windows Release v1.0.5:**
+- Fixed startup crash on Windows with existing databases
+- GitHub Actions automated build working
+- Release: https://github.com/cabbp3/Trail-Camera-Software/releases/tag/v1.0.5
+
+---
+
+## Session 19 (Jan 5-6, 2026)
 
 ### Unified App Architecture
 

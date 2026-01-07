@@ -1,19 +1,59 @@
 # Trail Camera Software - Project Plan
 
-**Last Updated:** January 5, 2026 (Session 19)
+**Last Updated:** January 7, 2026 (Session 20)
 
 ---
 
-## Two-App Architecture
+## Unified App Architecture
 
-The project now has **two separate applications**:
+The apps have been merged into a **single full-featured application**:
 
-| App | Entry Point | Purpose |
-|-----|-------------|---------|
-| **Organizer** | `python main.py` | Product app - simplified photo browser for end users |
-| **Trainer** | `python trainer_main.py` | Internal app - advanced labeling, bounding boxes, AI training |
+| Entry Point | Code | Purpose |
+|-------------|------|---------|
+| `main.py` | `training/label_tool.py` | Full-featured app |
+| `trainer_main.py` | `training/label_tool.py` | Same (legacy entry) |
 
-Both share the same database (`~/.trailcam/trailcam.db`), AI models, and supporting modules.
+Database: `~/.trailcam/trailcam.db`
+
+---
+
+## NEXT BIG STEP: Android App
+
+**Priority:** Build Android app for viewing photos and labels from anywhere.
+
+**Approach:** Flutter (cross-platform, one codebase for Android + iOS)
+
+**Scope (simpler than desktop):**
+- View photos synced from Supabase/R2
+- Browse/filter by location, species, deer ID
+- View buck profiles and sightings
+- Add tags and notes
+- Does NOT need: photo import, AI inference, training tools
+
+**Tasks:**
+- [ ] Set up Flutter project
+- [ ] Design mobile-friendly UI
+- [ ] Connect to Supabase for metadata
+- [ ] Connect to R2 for photo URLs (via signed URLs)
+- [ ] Build photo viewer with filters
+- [ ] Build buck profile browser
+- [ ] Test on Android device
+- [ ] Google Play Store submission
+
+---
+
+## Session 20 Progress (Jan 6-7, 2026)
+
+**Focus:** Smart sync, Windows v1.0.5 release
+
+**Completed:**
+- [X] Implemented incremental sync (only push changed records to Supabase)
+- [X] Added `updated_at` columns and SQLite triggers for sync tracking
+- [X] Fixed progress bar visibility when pushing to Supabase
+- [X] Removed box-related and Claude queue items from review menus
+- [X] Added camera location re-ID idea to future plans
+- [X] Fixed Windows startup crash (database migration order)
+- [X] Released v1.0.5 for Windows
 
 ---
 
@@ -22,8 +62,8 @@ Both share the same database (`~/.trailcam/trailcam.db`), AI models, and support
 **Focus:** Documentation update, CuddeLink credential fix
 
 **Completed:**
-- [X] Documented two-app architecture in CLAUDE.md, PLAN.md, README.md
-- [X] Fixed CuddeLink credential change bug - both apps now offer to update credentials on auth failure
+- [X] Documented unified app architecture
+- [X] Fixed CuddeLink credential change bug
 
 ---
 
@@ -526,11 +566,11 @@ Key capabilities needed:
 
 | Platform | App Type | Status | Priority |
 |----------|----------|--------|----------|
-| macOS | Standalone .app | Done | High |
-| Windows | Standalone .exe | Done | High |
-| Android | Native/Flutter app | Not started | Medium |
-| iPhone | Native/Flutter app | Not started | Medium |
-| Web | Browser app | Not started | Medium |
+| macOS | Standalone .app | Done | - |
+| Windows | Standalone .exe | Done (v1.0.5) | - |
+| Android | Flutter app | **Next** | **High** |
+| iPhone | Flutter app | After Android | Medium |
+| Web | Browser app | Future | Low |
 
 ### Desktop Standalone Apps (No Python/C++ Required)
 
