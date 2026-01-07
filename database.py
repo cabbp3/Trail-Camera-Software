@@ -175,8 +175,7 @@ class TrailCamDatabase:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_deer_id ON deer_metadata(deer_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_deer_additional_photo ON deer_additional(photo_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_deer_additional_id ON deer_additional(deer_id)")
-        # Additional indexes for common query patterns
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_archived ON photos(archived)")
+        # Additional indexes for common query patterns (columns that exist in CREATE TABLE)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_suggested_tag ON photos(suggested_tag)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_season ON photos(season_year)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_composite ON tags(photo_id, tag_name)")
@@ -265,6 +264,8 @@ class TrailCamDatabase:
         add_column("file_hash", "file_hash TEXT", None)  # MD5 hash for cross-computer sync
         add_column("archived", "archived INTEGER DEFAULT 0", 0)  # Hide from default view
         add_column("owner", "owner TEXT", "")  # Photo owner for cloud sync
+        # Create index on archived column (must be after column exists)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_archived ON photos(archived)")
         # Custom species list table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS custom_species (
