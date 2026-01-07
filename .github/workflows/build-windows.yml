@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v1.0.3)'
+        description: 'Version tag (e.g., v1.0.4)'
         required: true
-        default: 'v1.0.3'
+        default: 'v1.0.4'
 
 permissions:
   contents: write
@@ -62,11 +62,11 @@ jobs:
           2. Extract to a folder
           3. Run TrailCamOrganizer.exe
 
-          ### What is New
-          - Improved photo viewer with zoom/pan support
-          - Toggle buttons for Buck/Doe selection
-          - Quick buck ID buttons
-          - Subject box tabs for multi-animal photos
-          - Fixed CuddeLink credential change issue
+          ### What is New in v1.0.4
+          - Smart sync: Only push changed records to Supabase (much faster)
+          - Cloudflare R2 cloud photo storage support
+          - Removed box-related and Claude queue items from review menus
+          - Fixed progress bar visibility when pushing labels
+          - Tighter zoom on deer head annotations (15% padding)
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
