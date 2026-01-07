@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v1.0.4)'
+        description: 'Version tag (e.g., v1.0.5)'
         required: true
-        default: 'v1.0.4'
+        default: 'v1.0.5'
 
 permissions:
   contents: write
@@ -62,7 +62,8 @@ jobs:
           2. Extract to a folder
           3. Run TrailCamOrganizer.exe
 
-          ### What is New in v1.0.4
+          ### What is New in v1.0.5
+          - Fixed startup crash on Windows with existing databases
           - Smart sync: Only push changed records to Supabase (much faster)
           - Cloudflare R2 cloud photo storage support
           - Removed box-related and Claude queue items from review menus
