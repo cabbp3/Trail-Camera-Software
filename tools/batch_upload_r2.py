@@ -58,6 +58,7 @@ def main():
     parser.add_argument('--both', action='store_true', help='Upload both thumbnails and full photos')
     parser.add_argument('--limit', type=int, help='Limit number of photos to upload')
     parser.add_argument('--resume', action='store_true', help='Skip already uploaded photos')
+    parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompt')
 
     args = parser.parse_args()
 
@@ -85,29 +86,32 @@ def main():
 
     db = TrailCamDatabase()
 
-    # Get all photos
-    photos = db.get_photos(archived=False)
+    # Get all photos (filter out archived)
+    all_photos = db.get_all_photos()
+    photos = [p for p in all_photos if not p.get('archived', 0)]
     if args.limit:
         photos = photos[:args.limit]
 
     print(f"Found {len(photos)} photos to process")
 
     # Calculate estimated size
-    thumb_dir = Path.home() / "TrailCamLibrary" / ".thumbnails"
-
     total_thumb_size = 0
     total_photo_size = 0
 
     for photo in photos:
         if upload_thumbs:
-            thumb_path = thumb_dir / f"{photo['id']}.jpg"
-            if thumb_path.exists():
-                total_thumb_size += thumb_path.stat().st_size
+            thumb_path_str = photo.get('thumbnail_path')
+            if thumb_path_str:
+                thumb_path = Path(thumb_path_str)
+                if thumb_path.exists():
+                    total_thumb_size += thumb_path.stat().st_size
 
         if upload_full:
-            photo_path = Path(photo['file_path'])
-            if photo_path.exists():
-                total_photo_size += photo_path.stat().st_size
+            file_path_str = photo.get('file_path')
+            if file_path_str:
+                photo_path = Path(file_path_str)
+                if photo_path.exists():
+                    total_photo_size += photo_path.stat().st_size
 
     print(f"Estimated upload size:")
     if upload_thumbs:
@@ -118,10 +122,11 @@ def main():
     print()
 
     # Confirm
-    response = input("Continue? (y/n): ")
-    if response.lower() != 'y':
-        print("Cancelled")
-        sys.exit(0)
+    if not args.yes:
+        response = input("Continue? (y/n): ")
+        if response.lower() != 'y':
+            print("Cancelled")
+            sys.exit(0)
 
     print()
 
@@ -139,35 +144,39 @@ def main():
 
         # Upload thumbnail
         if upload_thumbs:
-            thumb_path = thumb_dir / f"{photo_id}.jpg"
-            if thumb_path.exists():
-                r2_key = f"users/{args.username}/thumbnails/{photo_id}_thumb.jpg"
+            thumb_path_str = photo.get('thumbnail_path')
+            if thumb_path_str:
+                thumb_path = Path(thumb_path_str)
+                if thumb_path.exists():
+                    r2_key = f"users/{args.username}/thumbnails/{photo_id}_thumb.jpg"
 
-                if args.resume and storage.check_exists(r2_key):
-                    skipped += 1
-                else:
-                    result = storage.upload_thumbnail(thumb_path, args.username, photo_id)
-                    if result:
-                        uploaded_thumbs += 1
-                        bytes_uploaded += thumb_path.stat().st_size
+                    if args.resume and storage.check_exists(r2_key):
+                        skipped += 1
                     else:
-                        errors += 1
+                        result = storage.upload_thumbnail(thumb_path, args.username, photo_id)
+                        if result:
+                            uploaded_thumbs += 1
+                            bytes_uploaded += thumb_path.stat().st_size
+                        else:
+                            errors += 1
 
         # Upload full photo
         if upload_full:
-            photo_path = Path(photo['file_path'])
-            if photo_path.exists():
-                r2_key = f"users/{args.username}/photos/{photo_id}.jpg"
+            file_path_str = photo.get('file_path')
+            if file_path_str:
+                photo_path = Path(file_path_str)
+                if photo_path.exists():
+                    r2_key = f"users/{args.username}/photos/{photo_id}.jpg"
 
-                if args.resume and storage.check_exists(r2_key):
-                    skipped += 1
-                else:
-                    result = storage.upload_photo(photo_path, args.username, photo_id)
-                    if result:
-                        uploaded_photos += 1
-                        bytes_uploaded += photo_path.stat().st_size
+                    if args.resume and storage.check_exists(r2_key):
+                        skipped += 1
                     else:
-                        errors += 1
+                        result = storage.upload_photo(photo_path, args.username, photo_id)
+                        if result:
+                            uploaded_photos += 1
+                            bytes_uploaded += photo_path.stat().st_size
+                        else:
+                            errors += 1
 
         # Progress update every 10 photos
         if (i + 1) % 10 == 0:
