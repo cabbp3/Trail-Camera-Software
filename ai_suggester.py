@@ -32,11 +32,12 @@ except ImportError:
     Image = None
 
 # Master list of valid species labels - predictions outside this set are rejected
+# Must match SPECIES_OPTIONS in training/label_tool.py (alphabetized, admin-only changes)
 VALID_SPECIES = {
-    "Deer", "Empty", "Other", "Other_Mammal", "Other Mammal", "Turkey", "Unknown",
-    "Bobcat", "Coyote", "Fox", "House Cat", "Opossum", "Other Bird", "Person",
-    "Quail", "Rabbit", "Raccoon", "Squirrel", "Vehicle", "Skunk",
-    "Armadillo", "Chipmunk", "Dog", "Ground Hog", "Flicker", "Turkey Buzzard"
+    "Armadillo", "Bobcat", "Chipmunk", "Coyote", "Deer", "Dog", "Empty",
+    "Flicker", "Fox", "Ground Hog", "House Cat", "Opossum", "Other",
+    "Other Bird", "Otter", "Person", "Quail", "Rabbit", "Raccoon",
+    "Skunk", "Squirrel", "Turkey", "Turkey Buzzard", "Unknown", "Vehicle"
 }
 
 

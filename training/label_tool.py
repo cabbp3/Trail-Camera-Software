@@ -312,16 +312,40 @@ def _ensure_qt_plugin_paths():
 _ensure_qt_plugin_paths()
 
 
-SPECIES_OPTIONS = ["", "Coyote", "Deer", "Empty", "Person", "Raccoon", "Turkey", "Unknown", "Vehicle"]
+# Fixed species list - alphabetized, admin-only changes
+# This is the complete list of valid species for the application
+SPECIES_OPTIONS = [
+    "",  # Empty option first
+    "Armadillo",
+    "Bobcat",
+    "Chipmunk",
+    "Coyote",
+    "Deer",
+    "Dog",
+    "Empty",
+    "Flicker",
+    "Fox",
+    "Ground Hog",
+    "House Cat",
+    "Opossum",
+    "Other",
+    "Other Bird",
+    "Otter",
+    "Person",
+    "Quail",
+    "Rabbit",
+    "Raccoon",
+    "Skunk",
+    "Squirrel",
+    "Turkey",
+    "Turkey Buzzard",
+    "Unknown",
+    "Vehicle",
+]
 SEX_TAGS = {"buck", "doe"}
 
-# Master list of valid species labels - ONLY these can be written to labels.txt
-# Includes both simplified model categories AND detailed species for manual tagging
-VALID_SPECIES = {
-    "Bobcat", "Coyote", "Deer", "Empty", "Opossum", "Other", "Other Bird",
-    "Other Mammal", "Person", "Quail", "Rabbit", "Raccoon", "Squirrel",
-    "Turkey", "Unknown", "Vehicle"
-}
+# Master list of valid species labels - matches SPECIES_OPTIONS (excluding empty string)
+VALID_SPECIES = set(s for s in SPECIES_OPTIONS if s)
 SEX_OPTIONS = ["", "Buck", "Doe", "Unknown"]
 AGE_OPTIONS = ["", "1.5", "2.5", "3.5", "4.5", "5.5+", "Fawn", "Mature", "Unknown"]
 
@@ -2497,11 +2521,7 @@ class TrainerWindow(QMainWindow):
                 self._session_recent_species.remove(species)
             self._session_recent_species.insert(0, species)
             self._session_recent_species = self._session_recent_species[:20]  # Keep max 20
-            # persist custom species (only if length >= 3 to avoid partial typing)
-            if species not in SPECIES_OPTIONS and len(species) >= 3:
-                self.db.add_custom_species(species)
-                # refresh dropdown with saved customs
-                self._populate_species_dropdown()
+            # Note: Custom species addition disabled - using fixed species list
             # Update original species so subsequent saves don't re-trigger
             self._original_saved_species.add(species)
         # Refresh camera location dropdown if new location was added
@@ -4354,7 +4374,7 @@ class TrainerWindow(QMainWindow):
         self.suggest_filter_combo.blockSignals(False)
 
     def _populate_species_filter_options(self):
-        """Fill the species filter combo with counts."""
+        """Fill the species filter combo with counts (contextual to other filters)."""
         if not hasattr(self, "species_filter_combo"):
             return
         current = self.species_filter_combo.currentData()
@@ -4362,18 +4382,20 @@ class TrainerWindow(QMainWindow):
         self.species_filter_combo.clear()
         self.species_filter_combo.addItem("All Species", "")
         try:
-            # Count photos by species
+            # Count photos by species within current filter context
+            context_photos = self._get_context_filtered_photos(exclude_filter='species')
             species_counts = {}
             unlabeled_count = 0
-            for photo in self._get_all_photos_cached():
+            for photo in context_photos:
                 tags = set(self.db.get_tags(photo["id"]))
                 species_tags = tags & VALID_SPECIES
                 if not species_tags:
                     unlabeled_count += 1
                 for sp in species_tags:
                     species_counts[sp] = species_counts.get(sp, 0) + 1
-            self.species_filter_combo.addItem(f"Unlabeled ({unlabeled_count})", "__unlabeled__")
-            # Add all species alphabetically
+            if unlabeled_count > 0:
+                self.species_filter_combo.addItem(f"Unlabeled ({unlabeled_count})", "__unlabeled__")
+            # Add only species with photos in current context
             for sp in sorted(species_counts.keys()):
                 self.species_filter_combo.addItem(f"{sp} ({species_counts[sp]})", sp)
         except Exception:
@@ -4384,7 +4406,7 @@ class TrainerWindow(QMainWindow):
         self.species_filter_combo.blockSignals(False)
 
     def _populate_sex_filter_options(self):
-        """Fill the sex filter combo with counts."""
+        """Fill the sex filter combo with counts (contextual to other filters)."""
         if not hasattr(self, "sex_filter_combo"):
             return
         current = self.sex_filter_combo.currentData()
@@ -4392,10 +4414,11 @@ class TrainerWindow(QMainWindow):
         self.sex_filter_combo.clear()
         self.sex_filter_combo.addItem("All", "")
         try:
+            context_photos = self._get_context_filtered_photos(exclude_filter='sex')
             buck_count = 0
             doe_count = 0
             unknown_count = 0
-            for photo in self._get_all_photos_cached():
+            for photo in context_photos:
                 tags = set(self.db.get_tags(photo["id"]))
                 if "Buck" in tags:
                     buck_count += 1
@@ -4403,9 +4426,13 @@ class TrainerWindow(QMainWindow):
                     doe_count += 1
                 elif "Unknown" in tags:
                     unknown_count += 1
-            self.sex_filter_combo.addItem(f"Buck ({buck_count})", "Buck")
-            self.sex_filter_combo.addItem(f"Doe ({doe_count})", "Doe")
-            self.sex_filter_combo.addItem(f"Unknown ({unknown_count})", "Unknown")
+            # Only add options with photos in current context
+            if buck_count > 0:
+                self.sex_filter_combo.addItem(f"Buck ({buck_count})", "Buck")
+            if doe_count > 0:
+                self.sex_filter_combo.addItem(f"Doe ({doe_count})", "Doe")
+            if unknown_count > 0:
+                self.sex_filter_combo.addItem(f"Unknown ({unknown_count})", "Unknown")
         except Exception:
             self.sex_filter_combo.addItem("Buck", "Buck")
             self.sex_filter_combo.addItem("Doe", "Doe")
@@ -4415,7 +4442,7 @@ class TrainerWindow(QMainWindow):
         self.sex_filter_combo.blockSignals(False)
 
     def _populate_deer_id_filter_options(self):
-        """Fill the deer ID filter combo with existing deer IDs and counts."""
+        """Fill the deer ID filter combo with deer IDs (contextual to other filters)."""
         if not hasattr(self, "deer_id_filter_combo"):
             return
         current = self.deer_id_filter_combo.currentData()
@@ -4423,10 +4450,11 @@ class TrainerWindow(QMainWindow):
         self.deer_id_filter_combo.clear()
         self.deer_id_filter_combo.addItem("All Deer IDs", "")
         try:
+            context_photos = self._get_context_filtered_photos(exclude_filter='deer_id')
             id_counts = {}
             has_id_count = 0
             no_id_count = 0
-            for photo in self._get_all_photos_cached():
+            for photo in context_photos:
                 meta = self.db.get_deer_metadata(photo["id"])
                 deer_id = meta.get("deer_id")
                 if deer_id:
@@ -4434,8 +4462,11 @@ class TrainerWindow(QMainWindow):
                     id_counts[deer_id] = id_counts.get(deer_id, 0) + 1
                 else:
                     no_id_count += 1
-            self.deer_id_filter_combo.addItem(f"Has ID ({has_id_count})", "__has_id__")
-            self.deer_id_filter_combo.addItem(f"No ID ({no_id_count})", "__no_id__")
+            # Only add options with photos in current context
+            if has_id_count > 0:
+                self.deer_id_filter_combo.addItem(f"Has ID ({has_id_count})", "__has_id__")
+            if no_id_count > 0:
+                self.deer_id_filter_combo.addItem(f"No ID ({no_id_count})", "__no_id__")
             for did in sorted(id_counts.keys()):
                 self.deer_id_filter_combo.addItem(f"{did} ({id_counts[did]})", did)
         except Exception:
@@ -4688,6 +4719,144 @@ class TrainerWindow(QMainWindow):
                     meta = self.db.get_deer_metadata(p["id"])
                     return meta.get("deer_id") or "zzz"
                 result.sort(key=lambda x: (get_deer_id(x[1]), x[1].get("date_taken") or ""))
+
+        return result
+
+    def _get_context_filtered_photos(self, exclude_filter: str = None) -> list:
+        """Get photos filtered by all active filters EXCEPT the specified one.
+
+        This enables contextual filter dropdowns - showing only options that
+        exist in the current filter context (e.g., only species found in the
+        selected collection).
+
+        Args:
+            exclude_filter: One of 'species', 'sex', 'deer_id', 'site', 'year',
+                          'collection', 'archive', 'suggest'. That filter is skipped.
+
+        Returns:
+            List of photo dicts matching all other active filters.
+        """
+        result = list(self.photos)
+
+        # Skip if in queue mode - queue overrides all filters
+        if self.queue_mode and self.queue_photo_ids:
+            queue_set = set(self.queue_photo_ids)
+            return [p for p in result if p.get("id") in queue_set]
+
+        # Apply archive filter
+        if exclude_filter != 'archive' and hasattr(self, "archive_filter_combo"):
+            archive_flt = self.archive_filter_combo.currentData()
+            if archive_flt == "active":
+                result = [p for p in result if not p.get("archived")]
+            elif archive_flt == "archived":
+                result = [p for p in result if p.get("archived")]
+
+        # Apply species filter
+        if exclude_filter != 'species' and hasattr(self, "species_filter_combo"):
+            species_flt = self.species_filter_combo.currentData()
+            if species_flt:
+                filtered = []
+                for p in result:
+                    tags = set(self.db.get_tags(p["id"]))
+                    species_tags = tags & VALID_SPECIES
+                    if species_flt == "__unlabeled__":
+                        if not species_tags:
+                            filtered.append(p)
+                    elif species_flt in species_tags:
+                        filtered.append(p)
+                result = filtered
+
+        # Apply sex filter
+        if exclude_filter != 'sex' and hasattr(self, "sex_filter_combo"):
+            sex_flt = self.sex_filter_combo.currentData()
+            if sex_flt:
+                filtered = []
+                for p in result:
+                    tags = set(self.db.get_tags(p["id"]))
+                    photo_sex = ""
+                    if "Buck" in tags:
+                        photo_sex = "Buck"
+                    elif "Doe" in tags:
+                        photo_sex = "Doe"
+                    elif "Unknown" in tags:
+                        photo_sex = "Unknown"
+                    if photo_sex == sex_flt:
+                        filtered.append(p)
+                result = filtered
+
+        # Apply deer ID filter
+        if exclude_filter != 'deer_id' and hasattr(self, "deer_id_filter_combo"):
+            deer_flt = self.deer_id_filter_combo.currentData()
+            if deer_flt:
+                filtered = []
+                for p in result:
+                    meta = self.db.get_deer_metadata(p["id"])
+                    deer_id = meta.get("deer_id") or ""
+                    if deer_flt == "__has_id__":
+                        if deer_id:
+                            filtered.append(p)
+                    elif deer_flt == "__no_id__":
+                        if not deer_id:
+                            filtered.append(p)
+                    elif deer_id == deer_flt:
+                        filtered.append(p)
+                result = filtered
+
+        # Apply suggestion filter
+        if exclude_filter != 'suggest' and hasattr(self, "suggest_filter_combo"):
+            flt = self.suggest_filter_combo.currentData()
+            if flt:
+                filtered = []
+                for p in result:
+                    tag = p.get("suggested_tag")
+                    if flt == "__has__":
+                        if tag:
+                            filtered.append(p)
+                    elif tag == flt:
+                        filtered.append(p)
+                result = filtered
+
+        # Apply site filter
+        if exclude_filter != 'site' and hasattr(self, "site_filter_combo"):
+            site_flt = self.site_filter_combo.currentData()
+            if site_flt is not None:
+                filtered = []
+                for p in result:
+                    camera_loc = p.get("camera_location")
+                    camera_loc = camera_loc.strip() if camera_loc else None
+                    if site_flt == "__unassigned__":
+                        if not camera_loc:
+                            filtered.append(p)
+                    elif camera_loc == site_flt:
+                        filtered.append(p)
+                result = filtered
+
+        # Apply year filter
+        if exclude_filter != 'year' and hasattr(self, "year_filter_combo"):
+            year_flt = self.year_filter_combo.currentData()
+            if year_flt is not None:
+                filtered = []
+                for p in result:
+                    date_taken = p.get("date_taken")
+                    if date_taken:
+                        season_year = TrailCamDatabase.compute_season_year(date_taken)
+                        if season_year == year_flt:
+                            filtered.append(p)
+                result = filtered
+
+        # Apply collection filter
+        if exclude_filter != 'collection' and hasattr(self, "collection_filter_combo"):
+            coll_flt = self.collection_filter_combo.currentData()
+            if coll_flt is not None:
+                filtered = []
+                for p in result:
+                    photo_coll = p.get("collection") or ""
+                    if coll_flt == "__unassigned__":
+                        if not photo_coll:
+                            filtered.append(p)
+                    elif photo_coll == coll_flt:
+                        filtered.append(p)
+                result = filtered
 
         return result
 
@@ -8135,17 +8304,10 @@ class TrainerWindow(QMainWindow):
         for sp, btn in species_buttons.items():
             btn.clicked.connect(lambda checked, s=sp: _accept_as(s))
 
-        # "Other (+)" handler to add new species
-        def _add_custom_species():
-            from PyQt6.QtWidgets import QInputDialog
-            name, ok = QInputDialog.getText(dlg, "Add New Species", "Enter species name:")
-            if ok and name.strip():
-                species_name = name.strip()
-                # Save custom species to database
-                if species_name not in SPECIES_OPTIONS and species_name not in VALID_SPECIES:
-                    self.db.add_custom_species(species_name)
-                _accept_as(species_name)
-        other_btn.clicked.connect(_add_custom_species)
+        # "Other" button - just applies "Other" tag (custom species disabled)
+        def _apply_other():
+            _accept_as("Other")
+        other_btn.clicked.connect(_apply_other)
 
         # Keyboard shortcuts
         from PyQt6.QtGui import QShortcut, QKeySequence
@@ -8783,30 +8945,14 @@ class TrainerWindow(QMainWindow):
                 _update_preview()
             _advance()
 
-        def _add_custom_species():
-            """Prompt for new species name, label photo, and add quick button."""
-            from PyQt6.QtWidgets import QInputDialog
-            name, ok = QInputDialog.getText(dlg, "Add New Species", "Enter species name:")
-            if ok and name.strip():
-                species_name = name.strip()
-                # Save custom species to database so it's recognized by filters
-                if species_name not in SPECIES_OPTIONS and species_name not in VALID_SPECIES:
-                    self.db.add_custom_species(species_name)
-                # Label the current photo
-                _label_species(species_name)
-                # Add button if not already added
-                if species_name not in custom_species and species_name not in species_buttons:
-                    custom_species.append(species_name)
-                    new_btn = QPushButton(species_name)
-                    new_btn.setStyleSheet("padding: 6px 12px; background: #363;")
-                    new_btn.clicked.connect(lambda checked, s=species_name: _label_species(s))
-                    # Insert before the stretch
-                    species_btn_row3.insertWidget(species_btn_row3.count() - 1, new_btn)
+        def _apply_other():
+            """Apply 'Other' species tag (custom species disabled)."""
+            _label_species("Other")
 
         for sp, btn in species_buttons.items():
             btn.clicked.connect(lambda checked, s=sp: _label_species(s))
 
-        other_btn.clicked.connect(_add_custom_species)
+        other_btn.clicked.connect(_apply_other)
         draw_box_btn.clicked.connect(_toggle_draw_mode)
         delete_selected_btn.clicked.connect(_delete_selected)
         accept_boxes_btn.clicked.connect(_accept_boxes)
@@ -9857,33 +10003,13 @@ class TrainerWindow(QMainWindow):
             self.schedule_save()
 
     def _populate_species_dropdown(self):
-        """Fill species dropdown with defaults + actually used custom species (from applied tags only)."""
+        """Fill species dropdown with fixed alphabetized species list."""
         self.species_combo.blockSignals(True)
         current = self.species_combo.currentText()
         self.species_combo.clear()
-        # defaults always available (skip single-letter names)
+        # Use fixed species list only (already alphabetized in SPECIES_OPTIONS)
         for s in SPECIES_OPTIONS:
-            if len(s) >= 2:  # Skip single-letter species
-                self.species_combo.addItem(s)
-        # gather used species from applied tags AND custom_species table
-        used = set()
-        try:
-            # Include all custom species
-            for s in self.db.list_custom_species():
-                if s and len(s) >= 2 and s.lower() not in SEX_TAGS:
-                    used.add(s)
-            # Also scan tags for any species-like tags not in custom_species
-            # (catches species that were saved but not registered)
-            all_tags = self.db.get_all_distinct_tags()
-            skip_tags = SEX_TAGS | {"buck", "doe", "favorite"}
-            for t in all_tags:
-                if t and len(t) >= 2 and t.lower() not in skip_tags and t not in SPECIES_OPTIONS:
-                    used.add(t)
-        except Exception:
-            pass
-        for s in sorted(used):
-            if s not in SPECIES_OPTIONS and len(s) >= 2:
-                self.species_combo.addItem(s)
+            self.species_combo.addItem(s)
         if current:
             self.species_combo.setCurrentText(current)
         self.species_combo.blockSignals(False)
@@ -10021,21 +10147,9 @@ class TrainerWindow(QMainWindow):
                 self._queue_advance()
 
     def _on_other_species_clicked(self):
-        """Open dialog to type a custom species name."""
-        from PyQt6.QtWidgets import QInputDialog
-        species, ok = QInputDialog.getText(
-            self, "Custom Species", "Enter species name:",
-            text=""
-        )
-        if ok and species and len(species.strip()) >= 3:
-            species = species.strip()
-            self.species_combo.setCurrentText(species)
-            # Add to custom species if not already known
-            if species not in SPECIES_OPTIONS:
-                self.db.add_custom_species(species)
-                self._populate_species_dropdown()
-            # save_current() now handles multi-species mode automatically
-            self.save_current()
+        """Apply 'Other' species tag (custom species addition disabled)."""
+        self.species_combo.setCurrentText("Other")
+        self.save_current()
 
     def _update_current_species_label(self, species_list: List[str]):
         """Update the label showing all current species tags."""
@@ -10068,10 +10182,7 @@ class TrainerWindow(QMainWindow):
             self.db.add_tag(pid, species)
             current_species.append(species)
             self._update_current_species_label(current_species)
-            # Persist custom species if needed (only if length >= 3)
-            if species not in SPECIES_OPTIONS and len(species) >= 3:
-                self.db.add_custom_species(species)
-                self._populate_species_dropdown()
+            # Note: Custom species addition disabled - using fixed species list
             self._update_recent_species_buttons()
             # Refresh photo data
             self.photos[self.index].update(self.db.get_photo_by_id(pid) or {})
