@@ -21,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from version import __version__
 import updater
 import user_config
+from sync_manager import SyncManager
+from r2_upload_queue import R2UploadManager
 
 logger = logging.getLogger(__name__)
 
@@ -876,6 +878,17 @@ class TrainerWindow(QMainWindow):
         self.ai_worker = None  # AIWorker instance when running
         self.ai_processing = False  # True while AI is running in background
 
+        # Automatic cloud sync
+        self.sync_manager = SyncManager(self.db, self._get_supabase_client_silent)
+        self.sync_manager.status_changed.connect(self._on_sync_status_changed)
+        self.sync_manager.sync_completed.connect(self._on_sync_completed)
+        self.sync_manager.sync_failed.connect(self._on_sync_failed)
+
+        # Automatic R2 photo upload
+        self.r2_manager = R2UploadManager(self._get_r2_storage)
+        self.r2_manager.status_changed.connect(self._on_r2_status_changed)
+        self.r2_manager.upload_completed.connect(self._on_r2_upload_completed)
+
         # Session-based recently applied species (for quick buttons)
         self._session_recent_species = []  # Species applied this session, most recent first
 
@@ -1667,6 +1680,12 @@ class TrainerWindow(QMainWindow):
 
         menubar.addMenu(self.tools_menu)
         settings_menu = QMenu("Settings", self)
+
+        # User settings (name & hunting club)
+        user_settings_action = settings_menu.addAction("User Settings...")
+        user_settings_action.triggered.connect(self.show_user_settings)
+        settings_menu.addSeparator()
+
         self.enhance_toggle_action = settings_menu.addAction("Auto Enhance All")
         self.enhance_toggle_action.setCheckable(True)
         self.enhance_toggle_action.setChecked(True)
@@ -1695,6 +1714,16 @@ class TrainerWindow(QMainWindow):
         layout.addWidget(split)
         layout.addLayout(nav)
         self.setCentralWidget(container)
+
+        # Add sync status indicator to status bar
+        self.sync_status_label = QLabel("Cloud: Synced")
+        self.sync_status_label.setStyleSheet("color: green; padding: 0 10px;")
+        self.statusBar().addPermanentWidget(self.sync_status_label)
+
+        # Add R2 upload status indicator
+        self.r2_status_label = QLabel("R2: Synced")
+        self.r2_status_label.setStyleSheet("color: green; padding: 0 10px;")
+        self.statusBar().addPermanentWidget(self.r2_status_label)
 
         if not self.photos:
             QMessageBox.information(self, "Trainer", "No photos found in the database.")
@@ -1806,18 +1835,55 @@ class TrainerWindow(QMainWindow):
 
     def _run_startup_prompts(self):
         """Run all startup prompts in sequence."""
-        self._check_cloud_pull_on_startup()
+        # First check if user needs to set up username/hunting club
+        self._check_user_setup_on_startup()
+        # Then check cloud sync
+        QTimer.singleShot(100, self._check_cloud_pull_on_startup)
         # Check CuddeLink after cloud sync
-        QTimer.singleShot(100, self._check_cuddelink_on_startup)
+        QTimer.singleShot(200, self._check_cuddelink_on_startup)
+
+    def _check_user_setup_on_startup(self):
+        """Prompt for username and hunting clubs if not set."""
+        from user_config import get_username, get_hunting_clubs, is_admin
+
+        username = get_username()
+        clubs = get_hunting_clubs()
+
+        # Show setup if no username, or no clubs selected (unless admin)
+        if not username or (not clubs and not is_admin()):
+            self._show_user_setup_dialog()
 
     def _check_cloud_pull_on_startup(self):
         """Check if we should pull from cloud on startup."""
         settings = QSettings("TrailCam", "Trainer")
 
-        # Check if we have Supabase credentials
-        url = settings.value("supabase_url", "")
-        key = settings.value("supabase_key", "")
-        if not url or not key:
+        # Check if we have Supabase credentials (bundled or user-configured)
+        has_supabase = False
+        try:
+            import json
+            from pathlib import Path
+            config_paths = [
+                Path(__file__).parent.parent / "cloud_config.json",
+                Path(__file__).parent / "cloud_config.json",
+                Path.cwd() / "cloud_config.json",
+            ]
+            for config_path in config_paths:
+                if config_path.exists():
+                    with open(config_path) as f:
+                        config = json.load(f)
+                    if config.get("supabase", {}).get("url") and config.get("supabase", {}).get("anon_key"):
+                        has_supabase = True
+                        break
+        except:
+            pass
+
+        # Also check user settings as fallback
+        if not has_supabase:
+            url = settings.value("supabase_url", "")
+            key = settings.value("supabase_key", "")
+            has_supabase = bool(url and key)
+
+        if not has_supabase:
             return  # No cloud configured, skip
 
         # Check the "always" setting
@@ -2337,6 +2403,9 @@ class TrainerWindow(QMainWindow):
     def save_current(self):
         if not self.photos:
             return
+        # Prevent saving during photo load - UI fields may be in transitional state
+        if getattr(self, '_loading_photo_data', False):
+            return
         photo = self.photos[self.index]
         pid = photo["id"]
         species = self.species_combo.currentText().strip()
@@ -2445,6 +2514,9 @@ class TrainerWindow(QMainWindow):
         self._bump_recent_buck(deer_id)
         self._update_recent_buck_buttons()
         self._update_photo_list_item(self.index)
+        # Queue for cloud sync
+        if hasattr(self, 'sync_manager'):
+            self.sync_manager.queue_change()
         # If in review mode and resolved, remove from queue and advance
         if self.in_review_mode and self._current_photo_resolved(pid):
             # Remove photo from list at current index
@@ -5183,8 +5255,30 @@ class TrainerWindow(QMainWindow):
                 if skip_hash and file_hash:
                     self._known_hashes.add(file_hash)
                 imported += 1
+
+                # Queue for R2 upload
+                if hasattr(self, 'r2_manager'):
+                    photo_id = self.db.get_photo_id(dest_path)
+                    if photo_id:
+                        # Compute hash if not already done
+                        upload_hash = file_hash or self._hash_file(Path(dest_path))
+                        if upload_hash:
+                            # Update hash in database
+                            self.db.update_photo_hash(photo_id, upload_hash)
+                            # Queue for R2 upload
+                            self.r2_manager.queue_photo(
+                                photo_id=photo_id,
+                                file_hash=upload_hash,
+                                file_path=Path(dest_path),
+                                thumbnail_path=Path(thumb_path) if thumb_path else None
+                            )
             except Exception as exc:
                 logger.error(f"DB insert failed for {dest_path}: {exc}")
+
+        # Start background R2 upload after import batch completes
+        if imported > 0 and hasattr(self, 'r2_manager') and self.r2_manager.pending_count > 0:
+            self.r2_manager.start_background_upload()
+
         return imported
 
     def _hash_file(self, path: Path) -> Optional[str]:
@@ -6104,6 +6198,137 @@ class TrainerWindow(QMainWindow):
         self._cudde_dialog.show()
 
     # ─────────────────────────────────────────────────────────────────────
+    # User Setup (Username & Hunting Club)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _show_user_setup_dialog(self):
+        """Show dialog for username and hunting club selection."""
+        from user_config import (
+            get_username, set_username, get_hunting_clubs, set_hunting_clubs,
+            get_available_clubs, add_club, is_admin, set_admin
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Welcome to Trail Camera Organizer")
+        dialog.setMinimumWidth(400)
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+
+        # Welcome message
+        welcome = QLabel("Welcome! Please enter your name and select your club(s).")
+        welcome.setWordWrap(True)
+        welcome.setStyleSheet("font-size: 14px; margin-bottom: 10px;")
+        layout.addWidget(welcome)
+
+        # Username field
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Your Name:"))
+        name_edit = QLineEdit()
+        name_edit.setText(get_username() or "")
+        name_edit.setPlaceholderText("Enter your name")
+        name_layout.addWidget(name_edit)
+        layout.addLayout(name_layout)
+
+        # Club selection with checkboxes (multi-select)
+        club_label = QLabel("Select your club(s):")
+        layout.addWidget(club_label)
+
+        clubs = get_available_clubs()
+        current_clubs = get_hunting_clubs()
+        club_checkboxes = {}
+
+        club_group = QWidget()
+        club_layout = QVBoxLayout(club_group)
+        club_layout.setContentsMargins(20, 0, 0, 0)
+
+        for club in clubs:
+            cb = QCheckBox(club)
+            cb.setChecked(club in current_clubs)
+            club_checkboxes[club] = cb
+            club_layout.addWidget(cb)
+
+        layout.addWidget(club_group)
+
+        # Add new club field
+        new_club_layout = QHBoxLayout()
+        new_club_layout.addWidget(QLabel("Add new club:"))
+        new_club_edit = QLineEdit()
+        new_club_edit.setPlaceholderText("Type new club name and press Enter")
+        new_club_layout.addWidget(new_club_edit)
+        layout.addLayout(new_club_layout)
+
+        def add_new_club():
+            new_club = new_club_edit.text().strip()
+            if new_club and new_club not in club_checkboxes:
+                cb = QCheckBox(new_club)
+                cb.setChecked(True)
+                club_checkboxes[new_club] = cb
+                club_layout.addWidget(cb)
+                new_club_edit.clear()
+
+        new_club_edit.returnPressed.connect(add_new_club)
+
+        # Admin checkbox (hidden by default, shown with secret key)
+        admin_check = QCheckBox("Admin mode (view all clubs)")
+        admin_check.setChecked(is_admin())
+        admin_check.setVisible(False)  # Hidden until secret key
+        layout.addWidget(admin_check)
+
+        # Info label
+        info = QLabel("Select one or more clubs to see their photos.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray; font-size: 11px; margin-top: 10px;")
+        layout.addWidget(info)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        save_btn = QPushButton("Continue")
+        save_btn.setDefault(True)
+        btn_layout.addWidget(save_btn)
+        layout.addLayout(btn_layout)
+
+        # Secret: Ctrl+Shift+A to show admin option
+        def keyPressEvent(event):
+            if (event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+                and event.key() == Qt.Key.Key_A):
+                admin_check.setVisible(True)
+            QDialog.keyPressEvent(dialog, event)
+        dialog.keyPressEvent = keyPressEvent
+
+        def save_and_close():
+            name = name_edit.text().strip()
+
+            if not name or len(name) < 2:
+                QMessageBox.warning(dialog, "Setup", "Please enter your name (at least 2 characters).")
+                return
+
+            # Get selected clubs
+            selected_clubs = [club for club, cb in club_checkboxes.items() if cb.isChecked()]
+
+            if not selected_clubs and not admin_check.isChecked():
+                QMessageBox.warning(dialog, "Setup", "Please select at least one club (or enable admin mode).")
+                return
+
+            set_username(name)
+            set_hunting_clubs(selected_clubs)
+            set_admin(admin_check.isChecked())
+
+            # Add any new clubs to the available list
+            for club in selected_clubs:
+                if club not in clubs:
+                    add_club(club)
+
+            dialog.accept()
+
+        save_btn.clicked.connect(save_and_close)
+        dialog.exec()
+
+    def show_user_settings(self):
+        """Show user settings dialog (can be called from menu)."""
+        self._show_user_setup_dialog()
+
+    # ─────────────────────────────────────────────────────────────────────
     # Supabase Cloud Sync
     # ─────────────────────────────────────────────────────────────────────
 
@@ -6205,11 +6430,134 @@ class TrainerWindow(QMainWindow):
         cancel_btn.clicked.connect(dialog.reject)
         dialog.exec()
 
+    def _get_supabase_client_silent(self):
+        """Get Supabase client without showing dialogs (for background sync)."""
+        url = None
+        key = None
+
+        # Try bundled cloud_config.json
+        try:
+            import json
+            config_paths = [
+                Path(__file__).parent.parent / "cloud_config.json",
+                Path(__file__).parent / "cloud_config.json",
+                Path.cwd() / "cloud_config.json",
+            ]
+            for config_path in config_paths:
+                if config_path.exists():
+                    with open(config_path) as f:
+                        config = json.load(f)
+                    if "supabase" in config:
+                        url = config["supabase"].get("url", "")
+                        key = config["supabase"].get("anon_key", "")
+                        if url and key:
+                            break
+        except Exception:
+            pass
+
+        # Fall back to user settings
+        if not url or not key:
+            settings = QSettings("TrailCam", "Trainer")
+            url = settings.value("supabase_url", "")
+            key = settings.value("supabase_key", "")
+
+        if not url or not key:
+            return None
+
+        try:
+            from supabase_rest import create_client
+            return create_client(url, key)
+        except Exception:
+            return None
+
+    def _on_sync_status_changed(self, status: str):
+        """Handle sync status changes for UI update."""
+        if hasattr(self, 'sync_status_label'):
+            status_text = {
+                'idle': 'Synced',
+                'pending': 'Pending...',
+                'syncing': 'Syncing...',
+                'offline': 'Offline'
+            }.get(status, status)
+            self.sync_status_label.setText(f"Cloud: {status_text}")
+            # Update color based on status
+            colors = {
+                'idle': 'green',
+                'pending': 'orange',
+                'syncing': 'blue',
+                'offline': 'gray'
+            }
+            color = colors.get(status, 'gray')
+            self.sync_status_label.setStyleSheet(f"color: {color};")
+
+    def _on_sync_completed(self, count: int):
+        """Handle successful sync."""
+        if count > 0:
+            logger.info(f"Auto-sync completed: {count} items synced")
+
+    def _on_sync_failed(self, error: str):
+        """Handle sync failure."""
+        logger.warning(f"Auto-sync failed: {error}")
+
+    def _get_r2_storage(self):
+        """Get R2 storage instance."""
+        try:
+            from r2_storage import R2Storage
+            return R2Storage()
+        except Exception:
+            return None
+
+    def _on_r2_status_changed(self, status: str):
+        """Handle R2 upload status changes."""
+        if hasattr(self, 'r2_status_label'):
+            self.r2_status_label.setText(status)
+            # Update color based on status
+            if 'Synced' in status:
+                self.r2_status_label.setStyleSheet("color: green; padding: 0 10px;")
+            elif 'pending' in status or 'Uploading' in status:
+                self.r2_status_label.setStyleSheet("color: orange; padding: 0 10px;")
+            elif 'failed' in status:
+                self.r2_status_label.setStyleSheet("color: red; padding: 0 10px;")
+            else:
+                self.r2_status_label.setStyleSheet("color: gray; padding: 0 10px;")
+
+    def _on_r2_upload_completed(self, uploaded: int, failed: int):
+        """Handle R2 upload batch completion."""
+        if uploaded > 0:
+            logger.info(f"R2 upload completed: {uploaded} photos")
+
     def _get_supabase_client(self):
-        """Get Supabase client, prompting for credentials if needed."""
-        settings = QSettings("TrailCam", "Trainer")
-        url = settings.value("supabase_url", "")
-        key = settings.value("supabase_key", "")
+        """Get Supabase client, loading from bundled config or user settings."""
+        url = None
+        key = None
+
+        # First try bundled cloud_config.json
+        try:
+            import json
+            from pathlib import Path
+            # Try multiple locations for bundled config
+            config_paths = [
+                Path(__file__).parent.parent / "cloud_config.json",  # Dev
+                Path(__file__).parent / "cloud_config.json",  # PyInstaller
+                Path.cwd() / "cloud_config.json",  # Current dir
+            ]
+            for config_path in config_paths:
+                if config_path.exists():
+                    with open(config_path) as f:
+                        config = json.load(f)
+                    if "supabase" in config:
+                        url = config["supabase"].get("url", "")
+                        key = config["supabase"].get("anon_key", "")
+                        if url and key:
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to load bundled Supabase config: {e}")
+
+        # Fall back to user settings if bundled config not found
+        if not url or not key:
+            settings = QSettings("TrailCam", "Trainer")
+            url = settings.value("supabase_url", "")
+            key = settings.value("supabase_key", "")
 
         if not url or not key:
             # Open the credentials setup dialog directly
@@ -11268,8 +11616,8 @@ class TrainerWindow(QMainWindow):
                 )
                 return
 
-            # Get photos
-            photos = self.db.get_photos(archived=False)
+            # Get photos (excludes archived by default)
+            photos = self.db.get_all_photos()
             if not photos:
                 QMessageBox.information(self, "Cloud Upload", "No photos to upload.")
                 return
@@ -11296,7 +11644,6 @@ class TrainerWindow(QMainWindow):
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.show()
 
-            thumb_dir = Path.home() / "TrailCamLibrary" / ".thumbnails"
             uploaded = 0
             skipped = 0
             errors = 0
@@ -11305,30 +11652,36 @@ class TrainerWindow(QMainWindow):
                 if progress.wasCanceled():
                     break
 
-                photo_id = str(photo['id'])
+                file_hash = photo.get('file_hash')
+                if not file_hash:
+                    errors += 1
+                    continue
+
                 progress.setValue(i)
                 progress.setLabelText(f"Uploading {i+1}/{len(photos)}...")
                 QApplication.processEvents()
 
-                # Upload thumbnail
-                thumb_path = thumb_dir / f"{photo_id}.jpg"
-                if thumb_path.exists():
-                    r2_key = f"users/{username}/thumbnails/{photo_id}_thumb.jpg"
-                    if not storage.check_exists(r2_key):
-                        if storage.upload_thumbnail(thumb_path, username, photo_id):
-                            uploaded += 1
+                # Upload thumbnail using actual path from database
+                thumb_path_str = photo.get('thumbnail_path')
+                if thumb_path_str:
+                    thumb_path = Path(thumb_path_str)
+                    if thumb_path.exists():
+                        r2_key = f"users/{username}/thumbnails/{file_hash}_thumb.jpg"
+                        if not storage.check_exists(r2_key):
+                            if storage.upload_file(thumb_path, r2_key):
+                                uploaded += 1
+                            else:
+                                errors += 1
                         else:
-                            errors += 1
-                    else:
-                        skipped += 1
+                            skipped += 1
 
                 # Upload full photo if requested
                 if not thumbnails_only:
                     photo_path = Path(photo['file_path'])
                     if photo_path.exists():
-                        r2_key = f"users/{username}/photos/{photo_id}.jpg"
+                        r2_key = f"users/{username}/photos/{file_hash}.jpg"
                         if not storage.check_exists(r2_key):
-                            if storage.upload_photo(photo_path, username, photo_id):
+                            if storage.upload_file(photo_path, r2_key):
                                 uploaded += 1
                             else:
                                 errors += 1

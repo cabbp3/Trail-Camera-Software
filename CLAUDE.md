@@ -311,7 +311,67 @@ When the user is looking for something to run overnight or while away:
 
 ---
 
-## Recent Session (Jan 6-7, 2026)
+## Recent Session (Jan 8-9, 2026)
+
+### Mobile App - Google Play Store Submission
+
+**Trail Camera Organizer Mobile** (`/Users/brookebratcher/Desktop/trailcam_mobile/`)
+
+Flutter app for viewing trail camera photos on Android. Connects to same Supabase/R2 backend as desktop app.
+
+**Completed:**
+- App renamed to "Trail Camera Organizer"
+- Removed login/username requirement (simplified for read-only browsing)
+- Fixed species filter pagination (Supabase 1000 row limit)
+- Created release signing keystore
+- Built and uploaded AAB to Google Play Console
+- Privacy policy hosted: https://cabbp3.github.io/Trail-Camera-Software/privacy_policy.html
+- Phone screenshots captured
+- Tablet screenshots created (padded from phone)
+- Closed testing track "Beta Testers" created
+
+**Play Store Status:**
+- In closed testing
+- Need 12 testers opted-in for 14 days before production access
+
+**TODO:**
+- Set up real tablet emulators for proper 7"/10" screenshots
+- Add offline download feature
+- iOS build (future)
+- **Fix username system** - Currently hardcoded to "brooke" in mobile app; need proper multi-user support where mobile app uses logged-in user's R2 folder
+
+### R2 & Supabase Sync Issues (Jan 9-10, 2026)
+
+**Problems Fixed:**
+
+1. **Corrupted thumbnails in R2** - New photos showed as broken images on mobile
+   - Root cause: Desktop used wrong thumbnail paths and ID-based naming
+   - Fix: Updated `label_tool.py` to use `photo['thumbnail_path']` and `file_hash` for R2 keys
+   - 138 corrupted thumbnails re-uploaded by other Claude session
+
+2. **Corrupted camera_model data** - EXIF parsing left null bytes and garbage in database
+   - Caused photo_key mismatches between local and Supabase
+   - Fix: Cleaned 254 camera_model values by stripping non-printable characters
+
+3. **Supabase sync incomplete** - 6,942 photos in Supabase vs 7,255 local
+   - Root cause: Upsert only updates existing records, doesn't insert new ones
+   - Also: 66 orphaned records with corrupt keys in Supabase
+   - Fix: Deleted orphans, directly inserted 379 missing photos
+
+4. **Missing thumbnails in R2** - 23 new photos lacked thumbnails
+   - Fix: Uploaded all missing thumbnails using correct hash-based naming
+
+**Final State:**
+- Supabase: 7,255 photos (all with file_hash)
+- R2: All thumbnails uploaded with `{file_hash}_thumb.jpg` naming
+- Desktop upload code fixed to use correct paths and hash-based keys
+
+**Key Files Changed:**
+- `training/label_tool.py:11500-11542` - Fixed upload_to_cloud() to use thumbnail_path and file_hash
+
+---
+
+## Session (Jan 6-7, 2026)
 
 ### v1.0.5 Release
 

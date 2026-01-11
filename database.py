@@ -1849,6 +1849,12 @@ class TrailCamDatabase:
         with_hash = cursor.fetchone()[0]
         return {"total": total, "with_hash": with_hash, "missing": total - with_hash}
 
+    def update_photo_hash(self, photo_id: int, file_hash: str):
+        """Update the file_hash for a specific photo."""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE photos SET file_hash = ? WHERE id = ?", (file_hash, photo_id))
+        self.conn.commit()
+
     # ─────────────────────────────────────────────────────────────────────
     # Supabase Sync Methods
     # ─────────────────────────────────────────────────────────────────────
@@ -1922,11 +1928,14 @@ class TrailCamDatabase:
         BATCH_SIZE = 500  # Supabase handles batches well
 
         # Build WHERE clause for incremental sync
+        # Normalize last_sync to match SQLite datetime format (space instead of T)
         def since_clause(table_alias=""):
             if last_sync is None:
                 return ""
+            # SQLite datetime uses space, Python ISO uses T - normalize for comparison
+            normalized_sync = last_sync.replace('T', ' ')
             prefix = f"{table_alias}." if table_alias else ""
-            return f" AND {prefix}updated_at > '{last_sync}'"
+            return f" AND {prefix}updated_at > '{normalized_sync}'"
 
         def batch_upsert(table_name, data_list, on_conflict):
             """Upsert data in batches."""
@@ -1953,6 +1962,8 @@ class TrailCamDatabase:
                 "season_year": photo.get("season_year"),
                 "favorite": bool(photo.get("favorite")),
                 "notes": photo.get("notes"),
+                "collection": photo.get("collection"),  # Club/collection name
+                "r2_photo_id": str(photo.get("id")),  # Local photo ID for R2 URL mapping
                 "updated_at": now
             })
         batch_upsert("photos_sync", photos_data, "photo_key")
@@ -2124,6 +2135,8 @@ class TrailCamDatabase:
                     "x2": d.get("x2"),
                     "y2": d.get("y2"),
                     "confidence": d.get("confidence"),
+                    "species": d.get("species"),
+                    "species_conf": d.get("species_conf"),
                     "updated_at": now
                 })
             # For incremental sync, use upsert instead of delete+insert

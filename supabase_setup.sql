@@ -5,13 +5,16 @@
 CREATE TABLE photos_sync (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     photo_key TEXT UNIQUE NOT NULL,  -- original_name|date_taken|camera_model
+    file_hash TEXT,                  -- MD5 hash for cross-computer matching
     original_name TEXT,
     date_taken TEXT,
     camera_model TEXT,
     camera_location TEXT,
+    collection TEXT,                 -- Club/collection name (Brooke Farm, etc.)
     season_year INTEGER,
     favorite BOOLEAN DEFAULT FALSE,
     notes TEXT,
+    r2_photo_id TEXT,               -- Local photo ID for R2 URL mapping
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -20,6 +23,7 @@ CREATE TABLE tags (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     photo_key TEXT NOT NULL,
     tag_name TEXT NOT NULL,
+    file_hash TEXT,                  -- MD5 hash for cross-computer matching
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(photo_key, tag_name)
 );
@@ -137,3 +141,18 @@ CREATE POLICY "Allow all access" ON deer_additional FOR ALL USING (true) WITH CH
 CREATE POLICY "Allow all access" ON buck_profiles FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all access" ON buck_profile_seasons FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all access" ON annotation_boxes FOR ALL USING (true) WITH CHECK (true);
+
+-- ============================================================
+-- MIGRATION: Run this if tables already exist
+-- ============================================================
+-- Add new columns to photos_sync (for mobile app R2 integration)
+ALTER TABLE photos_sync ADD COLUMN IF NOT EXISTS file_hash TEXT;
+ALTER TABLE photos_sync ADD COLUMN IF NOT EXISTS collection TEXT;
+ALTER TABLE photos_sync ADD COLUMN IF NOT EXISTS r2_photo_id TEXT;
+
+-- Add file_hash to tags
+ALTER TABLE tags ADD COLUMN IF NOT EXISTS file_hash TEXT;
+
+-- Create index on r2_photo_id for faster lookups
+CREATE INDEX IF NOT EXISTS idx_photos_sync_r2_photo_id ON photos_sync(r2_photo_id);
+CREATE INDEX IF NOT EXISTS idx_photos_sync_collection ON photos_sync(collection);

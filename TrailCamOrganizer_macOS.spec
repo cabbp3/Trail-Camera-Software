@@ -24,6 +24,12 @@ datas = [
     ('image_processor.py', '.'),
     ('duplicate_dialog.py', '.'),
     ('site_clustering.py', '.'),
+    ('organizer_ui.py', '.'),
+    ('updater.py', '.'),
+    ('version.py', '.'),
+    ('r2_storage.py', '.'),
+    ('user_config.py', '.'),
+    ('cloud_config.json', '.'),
 ]
 
 # Hidden imports - only what we actually need

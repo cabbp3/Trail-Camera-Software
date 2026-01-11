@@ -1,18 +1,25 @@
 """
 User Configuration
 
-Simple username management for Phase 1 user system.
-Stores username locally - no authentication yet.
+Simple username and hunting club management.
+Stores settings locally - no authentication yet.
 """
 
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path.home() / ".trailcam" / "user_config.json"
+
+# Default clubs (matches collections in database)
+DEFAULT_CLUBS = [
+    "Brooke Farm",
+    "Tightwad House",
+    "Hunting Club",
+]
 
 
 def get_username() -> Optional[str]:
@@ -50,6 +57,87 @@ def set_username(username: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to save username: {e}")
         return False
+
+
+def get_hunting_clubs() -> List[str]:
+    """Get the stored hunting clubs (user can be in multiple)."""
+    if not CONFIG_PATH.exists():
+        return []
+
+    try:
+        with open(CONFIG_PATH) as f:
+            config = json.load(f)
+        clubs = config.get("hunting_clubs", [])
+        # Handle legacy single club format
+        if not clubs and config.get("hunting_club"):
+            clubs = [config.get("hunting_club")]
+        return clubs
+    except Exception as e:
+        logger.error(f"Failed to read user config: {e}")
+        return []
+
+
+def get_hunting_club() -> Optional[str]:
+    """Get the first hunting club (for backwards compatibility)."""
+    clubs = get_hunting_clubs()
+    return clubs[0] if clubs else None
+
+
+def set_hunting_clubs(clubs: List[str]) -> bool:
+    """Store the hunting clubs (multiple allowed)."""
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        config = {}
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH) as f:
+                config = json.load(f)
+
+        config["hunting_clubs"] = clubs
+        # Clear legacy single club field
+        config.pop("hunting_club", None)
+
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=2)
+
+        logger.info(f"Hunting clubs set to: {clubs}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save hunting clubs: {e}")
+        return False
+
+
+def set_hunting_club(club: str) -> bool:
+    """Store a single hunting club (legacy, wraps set_hunting_clubs)."""
+    return set_hunting_clubs([club])
+
+
+def is_admin() -> bool:
+    """Check if current user is admin (can see all clubs)."""
+    config = get_config()
+    return config.get("is_admin", False)
+
+
+def set_admin(is_admin: bool) -> bool:
+    """Set admin status."""
+    return set_config_value("is_admin", is_admin)
+
+
+def get_available_clubs() -> List[str]:
+    """Get list of available hunting clubs."""
+    config = get_config()
+    custom_clubs = config.get("custom_clubs", [])
+    return sorted(set(DEFAULT_CLUBS + custom_clubs))
+
+
+def add_club(club: str) -> bool:
+    """Add a new hunting club to the list."""
+    config = get_config()
+    custom_clubs = config.get("custom_clubs", [])
+    if club not in custom_clubs and club not in DEFAULT_CLUBS:
+        custom_clubs.append(club)
+        return set_config_value("custom_clubs", custom_clubs)
+    return True
 
 
 def get_config() -> dict:

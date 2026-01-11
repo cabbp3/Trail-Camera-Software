@@ -98,9 +98,10 @@ class TableQuery:
 
             elif self._upsert_data is not None:
                 # UPSERT query
+                # on_conflict must be a URL parameter, not in Prefer header
                 headers["Prefer"] = "resolution=merge-duplicates"
                 if self._upsert_conflict:
-                    headers["Prefer"] += f",on_conflict={self._upsert_conflict}"
+                    url += f"?on_conflict={self._upsert_conflict}"
                 response = requests.post(url, headers=headers, json=self._upsert_data, timeout=60)
                 response.raise_for_status()
                 return SupabaseResponse([])

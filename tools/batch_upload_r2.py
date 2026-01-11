@@ -3,7 +3,7 @@
 Batch Upload to Cloudflare R2
 
 Uploads photos from the local library to R2 cloud storage.
-Can upload full photos, thumbnails only, or both.
+Uses file_hash for filenames (deduplication + security).
 
 Usage:
     python tools/batch_upload_r2.py --username brooke --thumbnails-only
@@ -16,7 +16,8 @@ Options:
     --full-photos   Upload full resolution photos (~5GB)
     --both          Upload both thumbnails and full photos
     --limit N       Only upload first N photos (for testing)
-    --resume        Skip photos already uploaded
+
+Note: Automatically skips files that already exist in R2 (by hash).
 """
 
 import sys
@@ -57,7 +58,6 @@ def main():
     parser.add_argument('--full-photos', action='store_true', help='Upload full resolution photos')
     parser.add_argument('--both', action='store_true', help='Upload both thumbnails and full photos')
     parser.add_argument('--limit', type=int, help='Limit number of photos to upload')
-    parser.add_argument('--resume', action='store_true', help='Skip already uploaded photos')
     parser.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompt')
 
     args = parser.parse_args()
@@ -139,39 +139,45 @@ def main():
     start_time = time.time()
 
     for i, photo in enumerate(photos):
-        photo_id = str(photo['id'])
+        file_hash = photo.get('file_hash')
+        if not file_hash:
+            errors += 1
+            continue
+
         progress = f"[{i+1}/{len(photos)}]"
 
-        # Upload thumbnail
+        # Upload thumbnail (using hash-based filename)
         if upload_thumbs:
             thumb_path_str = photo.get('thumbnail_path')
             if thumb_path_str:
                 thumb_path = Path(thumb_path_str)
                 if thumb_path.exists():
-                    r2_key = f"users/{args.username}/thumbnails/{photo_id}_thumb.jpg"
+                    r2_key = f"users/{args.username}/thumbnails/{file_hash}_thumb.jpg"
 
-                    if args.resume and storage.check_exists(r2_key):
+                    # Always check if exists (deduplication)
+                    if storage.check_exists(r2_key):
                         skipped += 1
                     else:
-                        result = storage.upload_thumbnail(thumb_path, args.username, photo_id)
+                        result = storage.upload_file(thumb_path, r2_key)
                         if result:
                             uploaded_thumbs += 1
                             bytes_uploaded += thumb_path.stat().st_size
                         else:
                             errors += 1
 
-        # Upload full photo
+        # Upload full photo (using hash-based filename)
         if upload_full:
             file_path_str = photo.get('file_path')
             if file_path_str:
                 photo_path = Path(file_path_str)
                 if photo_path.exists():
-                    r2_key = f"users/{args.username}/photos/{photo_id}.jpg"
+                    r2_key = f"users/{args.username}/photos/{file_hash}.jpg"
 
-                    if args.resume and storage.check_exists(r2_key):
+                    # Always check if exists (deduplication)
+                    if storage.check_exists(r2_key):
                         skipped += 1
                     else:
-                        result = storage.upload_photo(photo_path, args.username, photo_id)
+                        result = storage.upload_file(photo_path, r2_key)
                         if result:
                             uploaded_photos += 1
                             bytes_uploaded += photo_path.stat().st_size

@@ -164,6 +164,47 @@ class R2Storage:
             logger.error(f"Failed to upload thumbnail {local_path}: {e}")
             return None
 
+    def upload_file(self, local_path: Path, r2_key: str, content_type: str = "image/jpeg") -> bool:
+        """
+        Upload a file to R2 with a specific key.
+
+        Args:
+            local_path: Path to the local file
+            r2_key: Full R2 key (path) for the file
+
+        Returns:
+            True if successful
+        """
+        if not self.is_configured():
+            return False
+
+        if not local_path.exists():
+            logger.error(f"File not found: {local_path}")
+            return False
+
+        try:
+            # Determine content type from extension
+            ext = local_path.suffix.lower()
+            if ext == ".png":
+                content_type = "image/png"
+            elif ext in (".heic", ".heif"):
+                content_type = "image/heic"
+            else:
+                content_type = "image/jpeg"
+
+            self.client.upload_file(
+                str(local_path),
+                self.bucket_name,
+                r2_key,
+                ExtraArgs={"ContentType": content_type}
+            )
+            logger.debug(f"Uploaded: {r2_key}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to upload {local_path} to {r2_key}: {e}")
+            return False
+
     def upload_bytes(self, data: bytes, r2_key: str, content_type: str = "image/jpeg") -> bool:
         """
         Upload raw bytes to R2.
