@@ -147,12 +147,13 @@ def main():
         progress = f"[{i+1}/{len(photos)}]"
 
         # Upload thumbnail (using hash-based filename)
+        # Shared structure: thumbnails/{hash}_thumb.jpg (no username prefix)
         if upload_thumbs:
             thumb_path_str = photo.get('thumbnail_path')
             if thumb_path_str:
                 thumb_path = Path(thumb_path_str)
                 if thumb_path.exists():
-                    r2_key = f"users/{args.username}/thumbnails/{file_hash}_thumb.jpg"
+                    r2_key = f"thumbnails/{file_hash}_thumb.jpg"
 
                     # Always check if exists (deduplication)
                     if storage.check_exists(r2_key):
@@ -166,12 +167,13 @@ def main():
                             errors += 1
 
         # Upload full photo (using hash-based filename)
+        # Shared structure: photos/{hash}.jpg (no username prefix)
         if upload_full:
             file_path_str = photo.get('file_path')
             if file_path_str:
                 photo_path = Path(file_path_str)
                 if photo_path.exists():
-                    r2_key = f"users/{args.username}/photos/{file_hash}.jpg"
+                    r2_key = f"photos/{file_hash}.jpg"
 
                     # Always check if exists (deduplication)
                     if storage.check_exists(r2_key):

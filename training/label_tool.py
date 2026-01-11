@@ -11553,24 +11553,16 @@ class TrainerWindow(QMainWindow):
                 )
                 return
 
-            # Count user's files
-            user_photos = storage.list_photos(username, "photos/")
-            user_thumbs = storage.list_photos(username, "thumbnails/")
-
+            # Count files in shared structure
+            # Photos and thumbnails are now stored in shared paths, not per-user
             status_text = f"""
 <h3>Cloud Storage Status</h3>
-<p><b>Username:</b> {username}</p>
 <p><b>Bucket:</b> trailcam-photos</p>
 <hr>
 <p><b>Total in bucket:</b></p>
 <ul>
 <li>Objects: {stats.get('object_count', 0)}</li>
 <li>Size: {stats.get('total_size_mb', 0):.1f} MB</li>
-</ul>
-<p><b>Your uploads:</b></p>
-<ul>
-<li>Photos: {len(user_photos)}</li>
-<li>Thumbnails: {len(user_thumbs)}</li>
 </ul>
 <hr>
 <p><b>Free tier:</b> 10 GB storage, unlimited downloads</p>
@@ -11662,11 +11654,12 @@ class TrainerWindow(QMainWindow):
                 QApplication.processEvents()
 
                 # Upload thumbnail using actual path from database
+                # Shared structure: thumbnails/{hash}_thumb.jpg (no username prefix)
                 thumb_path_str = photo.get('thumbnail_path')
                 if thumb_path_str:
                     thumb_path = Path(thumb_path_str)
                     if thumb_path.exists():
-                        r2_key = f"users/{username}/thumbnails/{file_hash}_thumb.jpg"
+                        r2_key = f"thumbnails/{file_hash}_thumb.jpg"
                         if not storage.check_exists(r2_key):
                             if storage.upload_file(thumb_path, r2_key):
                                 uploaded += 1
@@ -11676,10 +11669,11 @@ class TrainerWindow(QMainWindow):
                             skipped += 1
 
                 # Upload full photo if requested
+                # Shared structure: photos/{hash}.jpg (no username prefix)
                 if not thumbnails_only:
                     photo_path = Path(photo['file_path'])
                     if photo_path.exists():
-                        r2_key = f"users/{username}/photos/{file_hash}.jpg"
+                        r2_key = f"photos/{file_hash}.jpg"
                         if not storage.check_exists(r2_key):
                             if storage.upload_file(photo_path, r2_key):
                                 uploaded += 1

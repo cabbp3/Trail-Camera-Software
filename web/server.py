@@ -292,33 +292,36 @@ def get_cloud_stats():
 
 
 def get_cloud_photos(username=None):
-    """Get list of photos from cloud storage."""
+    """Get list of photos from cloud storage.
+
+    Note: username parameter is kept for API compatibility but ignored.
+    All photos use shared structure: thumbnails/{hash}_thumb.jpg
+    """
     storage = get_r2_storage()
     if not storage:
         return []
 
     try:
         photos = []
-        prefix = f"users/{username}/thumbnails/" if username else "users/"
+        # Shared structure: thumbnails are at root level, not per-user
+        prefix = "thumbnails/"
 
         paginator = storage.client.get_paginator('list_objects_v2')
         for page in paginator.paginate(Bucket=storage.bucket_name, Prefix=prefix):
             for obj in page.get('Contents', []):
                 key = obj['Key']
-                if '/thumbnails/' in key and key.endswith('.jpg'):
-                    # Extract photo ID from thumbnail key
-                    parts = key.split('/')
-                    photo_id = parts[-1].replace('_thumb.jpg', '')
-                    user = parts[1] if len(parts) > 1 else 'unknown'
+                if key.endswith('_thumb.jpg'):
+                    # Extract file hash from thumbnail key (thumbnails/{hash}_thumb.jpg)
+                    file_hash = key.replace('thumbnails/', '').replace('_thumb.jpg', '')
 
                     # Generate signed URLs
                     thumb_url = storage.get_signed_url(key, expires_in=3600)
-                    photo_key = key.replace('/thumbnails/', '/photos/').replace('_thumb.jpg', '.jpg')
+                    photo_key = f"photos/{file_hash}.jpg"
                     photo_url = storage.get_signed_url(photo_key, expires_in=3600)
 
                     photos.append({
-                        'id': photo_id,
-                        'user': user,
+                        'id': file_hash,
+                        'user': 'shared',  # Shared structure, no per-user folders
                         'thumbnail_url': thumb_url,
                         'photo_url': photo_url
                     })

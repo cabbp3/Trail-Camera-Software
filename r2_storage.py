@@ -91,11 +91,13 @@ class R2Storage:
 
         Args:
             local_path: Path to the local photo file
-            user_id: User identifier for organizing storage
-            photo_id: Unique photo identifier
+            user_id: User identifier (kept for API compatibility, not used)
+            photo_id: Unique photo identifier (should be file hash)
 
         Returns:
             R2 key (path) if successful, None if failed
+
+        Note: Uses shared structure photos/{photo_id}.jpg (no user prefix)
         """
         if not self.is_configured():
             logger.error("R2 not configured")
@@ -108,8 +110,8 @@ class R2Storage:
         # Determine file extension
         ext = local_path.suffix.lower() or ".jpg"
 
-        # Build R2 key
-        r2_key = f"users/{user_id}/photos/{photo_id}{ext}"
+        # Build R2 key - shared structure (no user prefix)
+        r2_key = f"photos/{photo_id}{ext}"
 
         try:
             # Determine content type
@@ -138,17 +140,20 @@ class R2Storage:
 
         Args:
             local_path: Path to the thumbnail file
-            user_id: User identifier
-            photo_id: Unique photo identifier
+            user_id: User identifier (kept for API compatibility, not used)
+            photo_id: Unique photo identifier (should be file hash)
 
         Returns:
             R2 key if successful, None if failed
+
+        Note: Uses shared structure thumbnails/{photo_id}_thumb.jpg (no user prefix)
         """
         if not self.is_configured():
             logger.error("R2 not configured")
             return None
 
-        r2_key = f"users/{user_id}/thumbnails/{photo_id}_thumb.jpg"
+        # Shared structure - no user prefix
+        r2_key = f"thumbnails/{photo_id}_thumb.jpg"
 
         try:
             self.client.upload_file(
@@ -294,21 +299,24 @@ class R2Storage:
             logger.error(f"Failed to delete {r2_key}: {e}")
             return False
 
-    def list_photos(self, user_id: str, prefix: str = "photos/") -> list:
+    def list_photos(self, user_id: str = None, prefix: str = "photos/") -> list:
         """
-        List photos for a user.
+        List photos in shared storage.
 
         Args:
-            user_id: User identifier
-            prefix: Sub-path within user folder (default "photos/")
+            user_id: User identifier (kept for API compatibility, not used)
+            prefix: Path prefix (default "photos/")
 
         Returns:
             List of R2 keys
+
+        Note: Uses shared structure - no user prefix
         """
         if not self.is_configured():
             return []
 
-        full_prefix = f"users/{user_id}/{prefix}"
+        # Shared structure - no user prefix
+        full_prefix = prefix
 
         try:
             response = self.client.list_objects_v2(
