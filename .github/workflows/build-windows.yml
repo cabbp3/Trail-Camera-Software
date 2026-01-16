@@ -6,7 +6,7 @@ on:
       version:
         description: 'Version tag (e.g., v1.0.5)'
         required: true
-        default: 'v1.0.9'
+        default: 'v1.0.10'
 
 permissions:
   contents: write
@@ -79,10 +79,10 @@ jobs:
           2. Extract to a folder
           3. Run TrailCamOrganizer.exe
 
-          ### What's New in v1.0.9
-          - Integrated cloud sync into consumer app
+          ### What's New in v1.0.10
+          - Fixed PyInstaller bundled config path (now uses sys._MEIPASS)
+          - R2 and Supabase credentials now properly load in frozen exe
           - Auto-syncs labels to Supabase when you make changes
           - Status indicator shows sync state (☁️ idle, ⏳ pending, 🔄 syncing)
-          - R2 and Supabase credentials bundled - works out of the box
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

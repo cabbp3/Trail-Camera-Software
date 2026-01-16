@@ -7,15 +7,26 @@ Uses S3-compatible API via boto3.
 
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Optional
 import hashlib
 
 logger = logging.getLogger(__name__)
 
+
+def _get_bundled_config_path() -> Path:
+    """Get path to bundled config, works for dev and PyInstaller bundle."""
+    if hasattr(sys, '_MEIPASS'):
+        # Running as PyInstaller bundle
+        return Path(sys._MEIPASS) / "cloud_config.json"
+    # Running in development
+    return Path(__file__).parent / "cloud_config.json"
+
+
 # Config file locations (checked in order)
 USER_CONFIG_PATH = Path.home() / ".trailcam" / "r2_config.json"
-BUNDLED_CONFIG_PATH = Path(__file__).parent / "cloud_config.json"
+BUNDLED_CONFIG_PATH = _get_bundled_config_path()
 
 
 class R2Storage:
