@@ -6,7 +6,7 @@ on:
       version:
         description: 'Version tag (e.g., v1.0.5)'
         required: true
-        default: 'v1.0.6'
+        default: 'v1.0.7'
 
 permissions:
   contents: write
@@ -31,6 +31,23 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
+
+    - name: Create cloud config
+      run: |
+        @"
+        {
+          "r2": {
+            "endpoint_url": "${{ secrets.R2_ENDPOINT }}",
+            "access_key_id": "${{ secrets.R2_ACCESS_KEY }}",
+            "secret_access_key": "${{ secrets.R2_SECRET_KEY }}",
+            "bucket_name": "${{ secrets.R2_BUCKET }}"
+          },
+          "supabase": {
+            "url": "${{ secrets.SUPABASE_URL }}",
+            "key": "${{ secrets.SUPABASE_ANON_KEY }}"
+          }
+        }
+        "@ | Out-File -FilePath cloud_config.json -Encoding utf8
 
     - name: Build executable
       run: |
@@ -62,11 +79,11 @@ jobs:
           2. Extract to a folder
           3. Run TrailCamOrganizer.exe
 
-          ### What's New in v1.0.6
-          - Automatic cloud sync on photo changes
-          - R2 photo upload integration
-          - Shared R2 path structure (fixes multi-device sync)
-          - Standardized species list and improved filter UX
-          - Various bug fixes and stability improvements
+          ### What's New in v1.0.7
+          - Bundled cloud credentials (R2 + Supabase work out of the box)
+          - All features from v1.0.6:
+            - Automatic cloud sync on photo changes
+            - Hybrid site detection (OCR + visual matching)
+            - Standardized species list and improved filter UX
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -35,6 +35,7 @@ datas = [
     ('site_detector.py', '.'),
     ('site_embedder.py', '.'),
     ('site_identifier.py', '.'),
+    ('cloud_config.json', '.'),
 ]
 datas += pyqt6_datas
 
