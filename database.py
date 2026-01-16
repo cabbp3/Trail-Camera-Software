@@ -376,6 +376,11 @@ class TrailCamDatabase:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_y2 REAL")
         if "head_notes" not in cols:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN head_notes TEXT")
+        # Per-box sex (buck/doe) prediction columns
+        if "sex" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN sex TEXT")
+        if "sex_conf" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN sex_conf REAL")
         self.conn.commit()
 
     def _ensure_sync_tracking(self):
@@ -1208,6 +1213,8 @@ class TrailCamDatabase:
             conf = b.get("confidence")
             species = b.get("species", "")
             species_conf = b.get("species_conf")
+            sex = b.get("sex", "")
+            sex_conf = b.get("sex_conf")
             to_insert.append((
                 photo_id,
                 b.get("label", ""),
@@ -1217,11 +1224,13 @@ class TrailCamDatabase:
                 float(b["y2"]),
                 float(conf) if conf is not None else None,
                 species if species else None,
-                float(species_conf) if species_conf is not None else None
+                float(species_conf) if species_conf is not None else None,
+                sex if sex else None,
+                float(sex_conf) if sex_conf is not None else None
             ))
         if to_insert:
             cursor.executemany(
-                "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf, sex, sex_conf) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 to_insert,
             )
         self.conn.commit()
@@ -1230,7 +1239,7 @@ class TrailCamDatabase:
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf,
-                   head_x1, head_y1, head_x2, head_y2, head_notes
+                   head_x1, head_y1, head_x2, head_y2, head_notes, sex, sex_conf
             FROM annotation_boxes WHERE photo_id = ?
         """, (photo_id,))
         out = []
@@ -1250,6 +1259,11 @@ class TrailCamDatabase:
                 box["head_y2"] = row[12]
             if row[13]:
                 box["head_notes"] = row[13]
+            # Per-box sex (buck/doe)
+            if row[14]:
+                box["sex"] = row[14]
+            if row[15] is not None:
+                box["sex_conf"] = row[15]
             out.append(box)
         return out
 
@@ -1259,6 +1273,15 @@ class TrailCamDatabase:
         cursor.execute(
             "UPDATE annotation_boxes SET species = ?, species_conf = ? WHERE id = ?",
             (species, confidence, box_id)
+        )
+        self.conn.commit()
+
+    def set_box_sex(self, box_id: int, sex: str, confidence: float = None):
+        """Set sex (buck/doe) classification for a specific box."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE annotation_boxes SET sex = ?, sex_conf = ? WHERE id = ?",
+            (sex, confidence, box_id)
         )
         self.conn.commit()
 
@@ -1562,12 +1585,30 @@ class TrailCamDatabase:
         self.conn.commit()
 
     def archive_photos(self, photo_ids: List[int]):
-        """Archive multiple photos using batch update."""
+        """Archive multiple photos using batch update. Favorites are protected."""
         if not photo_ids:
             return
         cursor = self.conn.cursor()
         placeholders = ",".join(["?"] * len(photo_ids))
-        cursor.execute(f"UPDATE photos SET archived = 1 WHERE id IN ({placeholders})", photo_ids)
+        # Skip favorites - they are protected from archiving
+        cursor.execute(f"UPDATE photos SET archived = 1 WHERE id IN ({placeholders}) AND (favorite IS NULL OR favorite = 0)", photo_ids)
+        self.conn.commit()
+
+    def toggle_favorite(self, photo_id: int) -> bool:
+        """Toggle favorite status for a photo. Returns new favorite status."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT favorite FROM photos WHERE id = ?", (photo_id,))
+        row = cursor.fetchone()
+        current = row[0] if row and row[0] else 0
+        new_value = 0 if current else 1
+        cursor.execute("UPDATE photos SET favorite = ? WHERE id = ?", (new_value, photo_id))
+        self.conn.commit()
+        return bool(new_value)
+
+    def set_favorite(self, photo_id: int, favorite: bool):
+        """Set favorite status for a photo."""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE photos SET favorite = ? WHERE id = ?", (1 if favorite else 0, photo_id))
         self.conn.commit()
 
     def get_archived_count(self) -> int:
@@ -1764,18 +1805,18 @@ class TrailCamDatabase:
         """, (photo_id, embedding, model_version))
         self.conn.commit()
 
-    def get_embedding(self, photo_id: int) -> Optional[bytes]:
-        """Get embedding bytes for a photo."""
+    def get_embedding(self, photo_id: int) -> Optional[Tuple[bytes, str]]:
+        """Get embedding bytes and version for a photo."""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT embedding FROM photo_embeddings WHERE photo_id = ?", (photo_id,))
+        cursor.execute("SELECT embedding, model_version FROM photo_embeddings WHERE photo_id = ?", (photo_id,))
         row = cursor.fetchone()
-        return row[0] if row else None
+        return (row[0], row[1]) if row else None
 
-    def get_all_embeddings(self) -> List[Tuple[int, bytes]]:
-        """Get all photo embeddings as (photo_id, embedding_bytes) tuples."""
+    def get_all_embeddings(self) -> List[Tuple[int, bytes, str]]:
+        """Get all photo embeddings as (photo_id, embedding_bytes, model_version) tuples."""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT photo_id, embedding FROM photo_embeddings")
-        return [(row[0], row[1]) for row in cursor.fetchall()]
+        cursor.execute("SELECT photo_id, embedding, model_version FROM photo_embeddings")
+        return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
 
     def get_photos_without_embeddings(self) -> List[Dict]:
         """Get photos that don't have embeddings yet."""
@@ -1964,6 +2005,7 @@ class TrailCamDatabase:
                 "notes": photo.get("notes"),
                 "collection": photo.get("collection"),  # Club/collection name
                 "r2_photo_id": str(photo.get("id")),  # Local photo ID for R2 URL mapping
+                "archived": bool(photo.get("archived")),  # Hide from mobile by default
                 "updated_at": now
             })
         batch_upsert("photos_sync", photos_data, "photo_key")
@@ -1988,6 +2030,39 @@ class TrailCamDatabase:
             })
         batch_upsert("tags", tags_data, "photo_key,tag_name")
         counts["tags"] = len(tags_data)
+
+        # Delete tags from Supabase that were deleted locally
+        # Get ALL local tags (not just recent) to compare
+        cursor.execute("""
+            SELECT t.tag_name, p.file_hash
+            FROM tags t
+            JOIN photos p ON t.photo_id = p.id
+            WHERE p.file_hash IS NOT NULL
+        """)
+        local_tags = set()
+        for row in cursor.fetchall():
+            local_tags.add((row["file_hash"], row["tag_name"]))
+
+        # Get all tags from Supabase
+        try:
+            result = supabase_client.table("tags").select("file_hash,tag_name").execute(fetch_all=True)
+            cloud_tags = set()
+            for row in result.data:
+                if row.get("file_hash"):
+                    cloud_tags.add((row["file_hash"], row["tag_name"]))
+
+            # Find tags in cloud but not local (deleted locally)
+            deleted_tags = cloud_tags - local_tags
+            if deleted_tags:
+                logger.info(f"Deleting {len(deleted_tags)} tags from Supabase that were deleted locally")
+                for file_hash, tag_name in deleted_tags:
+                    try:
+                        supabase_client.table("tags").delete().eq("file_hash", file_hash).eq("tag_name", tag_name).execute()
+                    except Exception as e:
+                        logger.warning(f"Failed to delete tag {tag_name} for {file_hash}: {e}")
+                counts["tags_deleted"] = len(deleted_tags)
+        except Exception as e:
+            logger.warning(f"Could not sync tag deletions: {e}")
 
         # Push deer_metadata
         report(3, "Syncing deer metadata...")
@@ -2137,6 +2212,8 @@ class TrailCamDatabase:
                     "confidence": d.get("confidence"),
                     "species": d.get("species"),
                     "species_conf": d.get("species_conf"),
+                    "sex": d.get("sex"),
+                    "sex_conf": d.get("sex_conf"),
                     "updated_at": now
                 })
             # For incremental sync, use upsert instead of delete+insert

@@ -6,7 +6,7 @@ on:
       version:
         description: 'Version tag (e.g., v1.0.5)'
         required: true
-        default: 'v1.0.5'
+        default: 'v1.0.6'
 
 permissions:
   contents: write
@@ -62,12 +62,11 @@ jobs:
           2. Extract to a folder
           3. Run TrailCamOrganizer.exe
 
-          ### What is New in v1.0.5
-          - Fixed startup crash on Windows with existing databases
-          - Smart sync: Only push changed records to Supabase (much faster)
-          - Cloudflare R2 cloud photo storage support
-          - Removed box-related and Claude queue items from review menus
-          - Fixed progress bar visibility when pushing labels
-          - Tighter zoom on deer head annotations (15% padding)
+          ### What's New in v1.0.6
+          - Automatic cloud sync on photo changes
+          - R2 photo upload integration
+          - Shared R2 path structure (fixes multi-device sync)
+          - Standardized species list and improved filter UX
+          - Various bug fixes and stability improvements
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

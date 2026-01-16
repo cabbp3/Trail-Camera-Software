@@ -313,3 +313,81 @@ Stage 1 ──► Stage 2 ──► Stage 3 ──► Stage 4 ──► Stage 5
 - Detection threshold set to 0.2 confidence
 - Labels: ai_animal (category 1), ai_person (category 2), ai_vehicle (category 3)
 - Review queue green highlighting added but may need refinement
+
+---
+
+## Augmentation Experiment (Run Overnight)
+
+**Goal:** Systematically evaluate which image augmentations improve model accuracy, using multiple replicates for statistical confidence.
+
+**Baseline:** v5.0 model (95% test accuracy, current augmentations: flip, rotation, color jitter)
+
+**Augmentations to test:**
+| ID | Augmentation | Description |
+|----|--------------|-------------|
+| A0 | Baseline | Current augmentations only |
+| A1 | +Grayscale | 30% of samples converted to grayscale (simulates IR) |
+| A2 | +Noise | Gaussian noise (simulates low-light grain) |
+| A3 | +Brightness | Stronger brightness extremes (flash/dark) |
+| A4 | +Blur | Random Gaussian blur (motion blur) |
+| A5 | +Erasing | Random erasing/cutout (obstructions) |
+| A6 | +All | All augmentations combined |
+
+**Experimental design:**
+- 3 replicates per augmentation (different random seeds: 42, 123, 456)
+- Same stratified train/val/test split across all runs
+- Record: test accuracy (overall), per-class accuracy, training time
+- Total runs: 7 augmentations × 3 replicates = 21 training runs
+
+**Run command:** `python training/train_augmentation_experiment.py`
+
+**Expected runtime:** ~7-10 hours (21 runs × 20 min each)
+
+**Analysis:**
+- Compare mean ± std test accuracy across replicates
+- Identify augmentations that significantly improve rare species (Coyote, Fox, Bobcat)
+- Check for augmentations that hurt performance (remove those)
+
+---
+
+## Future AI Ideas
+
+### Camera Location Re-ID via Visual Anchor Points
+
+**Concept:** Use visual features in photo backgrounds (trees, terrain, structures) to automatically identify which camera location a photo came from, even without EXIF data or folder structure.
+
+**How it could work:**
+1. Extract visual features from background regions (excluding detected animals)
+2. Build a feature embedding for each known camera location from labeled photos
+3. For new photos, compare background features to known location embeddings
+4. Suggest most likely camera location based on visual similarity
+
+**Potential approaches:**
+- **Triplet loss / contrastive learning** - Train to make same-location photos embed close together
+- **Image retrieval** - Find most similar labeled photos and use their location
+- **Scene recognition backbone** - Use places365 or similar pretrained model for scene features
+
+**Benefits:**
+- Works even when cameras are moved (learns the scene, not camera metadata)
+- Could detect when a camera has been moved to a new location
+- Helps organize photos from cameras without reliable EXIF/naming
+
+**Challenges:**
+- Seasonal changes (leaves, snow) may confuse matching
+- Night photos vs day photos look very different
+- Need sufficient labeled examples per location
+
+**Status:** Long-term idea - revisit after head keypoint model is mature
+
+### Individual Deer Re-ID
+
+**Goal:** Recognize specific bucks across multiple photos/seasons.
+
+**Current state:**
+- `photo_embeddings` table exists with 1,803 embeddings
+- Re-ID model trained but not integrated into UI
+
+**Next steps:**
+- Build UI to show "similar deer" suggestions
+- Test matching accuracy on known bucks
+- Consider body markings, not just antlers (for year-round ID)

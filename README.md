@@ -1,95 +1,78 @@
 # Trail Camera Software
 
-Two cross-platform Python desktop applications for organizing trail camera photos, with a focus on deer tracking and identification.
+Cross-platform desktop application for organizing trail camera photos, with a focus on deer tracking and identification. Also includes a Flutter mobile app for viewing photos on Android.
 
-## Two Apps
+## Apps
 
-| App | Command | Purpose |
-|-----|---------|---------|
-| **Organizer** | `python main.py` | Simplified photo browser for end users |
-| **Trainer** | `python trainer_main.py` | Advanced labeling tool for AI training (internal) |
-
-Both apps share the same database and AI models.
+| App | Platform | Purpose |
+|-----|----------|---------|
+| **Desktop** | macOS, Windows | Full-featured photo organizer with AI labeling |
+| **Mobile** | Android | View and filter photos from anywhere |
 
 ## Features
 
 - **Automatic Import**: Import photos from SD cards or folders with automatic organization
 - **EXIF Extraction**: Automatically extracts date/time and camera model from photos
 - **Smart Organization**: Photos are organized by Year/Month in your library folder
-- **Tagging System**: Tag photos as Buck, Doe, Fawn, Turkey, Coyote, or Trash
-- **Deer Tracking**: Track individual deer with custom IDs and age classes
-- **Search & Filter**: Search by tags, deer ID, or date range
-- **Thumbnail Grid**: Browse photos in a clean 5×5 grid layout
-- **Full Preview**: Click any thumbnail to view full-size image with tagging options
+- **AI Detection**: MegaDetector v5 for animal detection, species classifier, buck/doe classifier
+- **Tagging System**: Tag photos as Buck, Doe, Deer, Turkey, Coyote, or 25+ other species
+- **Deer Tracking**: Track individual bucks with custom IDs across seasons
+- **Search & Filter**: Filter by tags, deer ID, camera location, date range, collection
+- **Cloud Sync**: Supabase for metadata, Cloudflare R2 for photo storage
+- **CuddeLink Integration**: Download photos directly from CuddeLink cameras
 
 ## Requirements
 
-- Python 3.8 or higher
+- Python 3.9+ (3.11 recommended for Windows)
 - PyQt6
-- Pillow (PIL)
+- See `requirements.txt` for full dependencies
 
 ## Installation
 
-1. Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
 ## Usage
 
-1. Run the application:
+### Desktop App
+
 ```bash
+# macOS/Linux
+python main.py
+
+# Windows
 python main.py
 ```
 
-2. **Import Photos**:
-   - Click `File → Import Folder...` (or press `Ctrl+I`)
-   - Select the folder containing your trail camera photos (e.g., SD card)
-   - The app will automatically:
-     - Copy all JPG files to your library folder
-     - Extract EXIF data (date/time, camera model)
-     - Rename files as `YYYY-MM-DD_HH-MM-SS_CameraModel.jpg`
-     - Organize by Year/Month
+### Mobile App
 
-3. **Library Location**:
-   - **macOS**: `~/TrailCamLibrary/Year/Month/`
-   - **Windows**: `C:\TrailCamLibrary\Year\Month\`
+See `/trailcam_mobile/` folder for Flutter app source.
 
-4. **Tagging Photos**:
-   - Click any thumbnail to open the preview window
-   - Click tag buttons (Buck, Doe, Fawn, etc.) to tag the photo
-   - Enter a Deer ID (e.g., "Bucky-2025")
-   - Select an age class from the dropdown
+## Data Locations
 
-5. **Searching**:
-   - Use the search bar at the top to filter by:
-     - Tag type
-     - Deer ID
-     - Date range
+- **Photo Library**: `~/TrailCamLibrary/Year/Month/` (macOS) or `C:\TrailCamLibrary\` (Windows)
+- **Database**: `~/.trailcam/trailcam.db`
+- **Thumbnails**: `~/TrailCamLibrary/.thumbnails/`
 
-## Keyboard Shortcuts
+## Cloud Services
 
-- `Ctrl+I`: Import Folder
-- `Ctrl+Q`: Quit Application
+- **Supabase**: Metadata sync (photos, tags, deer IDs)
+- **Cloudflare R2**: Photo and thumbnail storage (zero egress fees)
 
-## Database
+## Documentation
 
-All metadata is stored in a SQLite database located at:
-- **macOS/Linux**: `~/.trailcam/trailcam.db`
-- **Windows**: `%USERPROFILE%\.trailcam\trailcam.db`
+- `CLAUDE.md` - Developer context and commands
+- `HANDOFF.md` - System audit and technical debt
+- `AI_REFINEMENT_PLAN.md` - AI model development roadmap
+- `PLAN.md` - Product roadmap and session history
 
-The database stores:
-- Photo metadata (path, date, camera model)
-- Tags (permanently saved)
-- Deer IDs and age classes
+## GitHub
 
-## Notes
+https://github.com/cabbp3/Trail-Camera-Software
 
-- The app only imports JPG files (case-insensitive)
-- Duplicate filenames are automatically handled with a counter
-- Thumbnails are cached in `.thumbnails` folder within the library
-- If EXIF date is missing, file modification time is used
+## Current Stats
 
-
-
-
+- ~7,500 photos in database
+- Species model: 12 classes, 97% accuracy
+- Buck/doe model: 84% accuracy (needs more Doe training data)

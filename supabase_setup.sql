@@ -114,6 +114,10 @@ CREATE TABLE annotation_boxes (
     x2 REAL,
     y2 REAL,
     confidence REAL,
+    species TEXT,
+    species_conf REAL,
+    sex TEXT,
+    sex_conf REAL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -156,3 +160,13 @@ ALTER TABLE tags ADD COLUMN IF NOT EXISTS file_hash TEXT;
 -- Create index on r2_photo_id for faster lookups
 CREATE INDEX IF NOT EXISTS idx_photos_sync_r2_photo_id ON photos_sync(r2_photo_id);
 CREATE INDEX IF NOT EXISTS idx_photos_sync_collection ON photos_sync(collection);
+
+-- Add species and sex columns to annotation_boxes (Jan 11, 2026)
+ALTER TABLE annotation_boxes ADD COLUMN IF NOT EXISTS species TEXT;
+ALTER TABLE annotation_boxes ADD COLUMN IF NOT EXISTS species_conf REAL;
+ALTER TABLE annotation_boxes ADD COLUMN IF NOT EXISTS sex TEXT;
+ALTER TABLE annotation_boxes ADD COLUMN IF NOT EXISTS sex_conf REAL;
+
+-- Add archived column to photos_sync (Jan 12, 2026)
+ALTER TABLE photos_sync ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_photos_sync_archived ON photos_sync(archived);

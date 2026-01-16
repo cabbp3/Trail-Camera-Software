@@ -155,6 +155,10 @@ class SupabaseRestClient:
         """Get a table query builder."""
         return TableQuery(self, name)
 
+    def is_configured(self) -> bool:
+        """Check if the client has valid URL and key configured."""
+        return bool(self.url and self.key)
+
     def test_connection(self) -> bool:
         """Test if the connection works."""
         try:

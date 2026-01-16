@@ -391,7 +391,12 @@ def run_site_clustering(
         progress_callback(0, 1, "Loading embeddings...")
 
     raw_embeddings = db.get_all_embeddings()
-    all_embeddings = {pid: clusterer.bytes_to_embedding(data) for pid, data in raw_embeddings}
+    # Handle both old (pid, data) and new (pid, data, version) format
+    all_embeddings = {}
+    for item in raw_embeddings:
+        if len(item) >= 2:
+            pid, data = item[0], item[1]
+            all_embeddings[pid] = clusterer.bytes_to_embedding(data)
 
     # Build reference set from labeled photos
     # Each entry: (photo_id, embedding, camera_location)

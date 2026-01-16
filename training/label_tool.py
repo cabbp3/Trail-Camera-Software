@@ -1342,9 +1342,13 @@ class TrainerWindow(QMainWindow):
         self.select_all_btn = QPushButton("Select All")
         self.select_all_btn.setToolTip("Select all photos in current filter")
         self.select_all_btn.clicked.connect(self._select_all_photos)
+        # Favorite checkbox
+        self.favorite_checkbox = QCheckBox("Favorite")
+        self.favorite_checkbox.setToolTip("Favorites are protected from archiving")
+        self.favorite_checkbox.stateChanged.connect(self._on_favorite_changed)
         # Archive/Unarchive buttons
         self.archive_btn = QPushButton("Archive")
-        self.archive_btn.setToolTip("Archive selected photo(s) - hides from default view")
+        self.archive_btn.setToolTip("Archive selected photo(s) - hides from default view (favorites protected)")
         self.archive_btn.clicked.connect(self.archive_current_photo)
         self.unarchive_btn = QPushButton("Unarchive")
         self.unarchive_btn.setToolTip("Restore archived photo(s) to default view")
@@ -1360,6 +1364,7 @@ class TrainerWindow(QMainWindow):
         nav.addWidget(self.compare_btn)
         nav.addWidget(self.multi_select_toggle)
         nav.addWidget(self.select_all_btn)
+        nav.addWidget(self.favorite_checkbox)
         nav.addWidget(self.archive_btn)
         nav.addWidget(self.unarchive_btn)
         nav.addStretch()
@@ -1444,10 +1449,11 @@ class TrainerWindow(QMainWindow):
         self.sort_combo.addItem("Species", "species")
         self.sort_combo.addItem("Deer ID", "deer_id")
         self.sort_combo.currentIndexChanged.connect(self._populate_photo_list)
-        # Archive filter
+        # Archive/Favorites filter (combined)
         self.archive_filter_combo = QComboBox()
         self.archive_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.archive_filter_combo.addItem("Active Photos", "active")
+        self.archive_filter_combo.addItem("Favorites", "favorites")
         self.archive_filter_combo.addItem("Archived", "archived")
         self.archive_filter_combo.addItem("All Photos", "all")
         self.archive_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
@@ -2286,6 +2292,8 @@ class TrainerWindow(QMainWindow):
         self._draw_boxes()
         # Update box tab bar
         self._update_box_tab_bar()
+        # In queue mode (species review), keep at fit-to-window for full context
+        # (zoom_fit already called above at line 2274)
         # Only auto-advance if photo not already reviewed (user may be clicking back to view)
         if self.ai_review_mode and not self._photo_has_ai_boxes(self.current_boxes):
             if photo.get("id") not in self.ai_reviewed_photos:
@@ -2299,6 +2307,11 @@ class TrainerWindow(QMainWindow):
         pid = photo["id"]
         tags = self.db.get_tags(pid)
         self.tags_edit.setText(", ".join(tags))
+
+        # Update favorite checkbox
+        self.favorite_checkbox.blockSignals(True)
+        self.favorite_checkbox.setChecked(bool(photo.get("favorite")))
+        self.favorite_checkbox.blockSignals(False)
 
         deer = self.db.get_deer_metadata(pid)
         self._populate_deer_id_dropdown()
@@ -2453,17 +2466,44 @@ class TrainerWindow(QMainWindow):
             species_set.update(self.db.list_custom_species())
         except Exception:
             pass
-        # Always keep existing species and add the new one (multi-species support)
-        existing_species = [t for t in tags if t in species_set]
-        # Only remove species tags if explicitly replacing (not adding)
-        # Add current species and sex (only if valid - known species or length >= 3)
-        if species and species not in tags:
-            # Only save if it's a known species OR at least 3 characters (avoid partial typing)
-            if species in species_set or len(species) >= 3:
+
+        # For photos WITHOUT boxes, species selection replaces the current species tag
+        # For photos WITH boxes, _persist_boxes handles tag sync
+        has_subject_boxes = any(not self._is_head_box(b) for b in self.current_boxes) if self.current_boxes else False
+
+        if not has_subject_boxes:
+            # No boxes - this is photo-level species, replace all species tags with current selection
+            non_species_tags = [t for t in tags if t not in species_set]
+            tags = non_species_tags
+            if species and (species in species_set or len(species) >= 3):
                 tags.append(species)
+        else:
+            # Has boxes - add species if not present (boxes handle the real sync)
+            if species and species not in tags:
+                user_removed_species = tags_text and species not in tags_text
+                if not user_removed_species:
+                    if species in species_set or len(species) >= 3:
+                        tags.append(species)
+
+        # Add sex tag if applicable
         if sex.lower() in ("buck", "doe") and sex not in tags:
             tags.append(sex)
+        # If a real species exists, remove Empty/Unknown tags
+        real_species = [t for t in tags if t in species_set and t not in ("Empty", "Unknown")]
+        if real_species:
+            tags = [t for t in tags if t not in ("Empty", "Unknown")]
+        # If Empty is in tags, it should be the ONLY tag (clear everything else)
+        if "Empty" in tags:
+            tags = ["Empty"]
         self.db.update_photo_tags(pid, tags)
+        # Update UI to reflect tag changes
+        self.tags_edit.setText(", ".join(tags))
+        # If user tags as Empty or Unknown, clear species from all boxes (removes AI suggestions)
+        if "Empty" in tags or "Unknown" in tags:
+            for box in self.current_boxes:
+                box["species"] = None
+                box["species_conf"] = None
+            self._draw_boxes()  # Refresh overlay
         self.db.set_deer_metadata(
             photo_id=pid,
             deer_id=deer_id or None,
@@ -2596,6 +2636,10 @@ class TrainerWindow(QMainWindow):
 
         # Update box species and tab name
         species = self.species_combo.currentText().strip()
+        # Debug: trace species changes in queue mode
+        if self.queue_mode:
+            has_boxes = hasattr(self, "current_boxes") and bool(self.current_boxes)
+            print(f"[DEBUG] _on_species_changed: species='{species}', queue_mode={self.queue_mode}, has_boxes={has_boxes}")
         if hasattr(self, "current_boxes") and self.current_boxes:
             if self.current_box_index < len(self.current_boxes):
                 self.current_boxes[self.current_box_index]["species"] = species
@@ -2607,11 +2651,15 @@ class TrainerWindow(QMainWindow):
         if self.queue_mode and not self._loading_photo_data:
             # Don't auto-advance if "Multiple species" is checked
             if hasattr(self, 'queue_multi_species') and self.queue_multi_species.isChecked():
+                print("[DEBUG] queue advance blocked: multi_species checked")
                 return
             species = self.species_combo.currentText().strip()
             if species:  # Only check if a species was actually selected
                 # Only advance when ALL boxes are labeled
-                if not self._all_boxes_labeled():
+                all_labeled = self._all_boxes_labeled()
+                print(f"[DEBUG] queue advance check: species='{species}', all_labeled={all_labeled}")
+                if not all_labeled:
+                    print("[DEBUG] queue advance blocked: not all boxes labeled")
                     return  # Still have unlabeled boxes
                 current_pid = None
                 if self.photos and self.index < len(self.photos):
@@ -2802,11 +2850,8 @@ class TrainerWindow(QMainWindow):
             self._advance_ai_review()
 
     def _clear_all_labels(self):
-        """Clear all labels (species, sex, age, deer_id, points) from all subject boxes."""
-        if not self.current_boxes:
-            return
-
-        # Clear labels from all subject boxes
+        """Clear all labels (species, sex, age, deer_id, points) from all subject boxes and photo tags."""
+        # Clear labels from all subject boxes (if any)
         for box in self.current_boxes:
             # Skip head boxes
             if self._is_head_box(box):
@@ -3011,6 +3056,24 @@ class TrainerWindow(QMainWindow):
         if tab_index < 0 or not hasattr(self, "current_boxes"):
             return
 
+        # Handle "Photo" tab case (no boxes) - load photo-level tags into species combo
+        if not self.current_boxes:
+            self.current_box_index = 0
+            # Load photo-level species tag into combo
+            if self.photos and self.index < len(self.photos):
+                photo = self.photos[self.index]
+                tags = self.db.get_tags(photo.get("id"))
+                # Find species tag (from SPECIES_OPTIONS)
+                species_tag = ""
+                for t in tags:
+                    if t in SPECIES_OPTIONS:
+                        species_tag = t
+                        break
+                self.species_combo.blockSignals(True)
+                self.species_combo.setCurrentText(species_tag)
+                self.species_combo.blockSignals(False)
+            return
+
         # Convert tab index to actual box index
         box_index = self._tab_index_to_box_index(tab_index)
         if box_index >= len(self.current_boxes):
@@ -3032,6 +3095,49 @@ class TrainerWindow(QMainWindow):
                 if hasattr(item, "idx"):  # DraggableBoxItem
                     item.setSelected(item.idx == box_index)
 
+        # In queue mode (species review), zoom to the box for better visibility
+        if self.queue_mode:
+            self._zoom_to_box(box_index)
+
+    def _zoom_to_box(self, box_idx: int, padding: float = 0.15):
+        """Zoom and center the view on a specific detection box.
+
+        Args:
+            box_idx: Index of the box in current_boxes
+            padding: Extra padding around the box (0.15 = 15% padding)
+        """
+        if not hasattr(self, "current_boxes") or box_idx >= len(self.current_boxes):
+            return
+        if not self.current_pixmap:
+            return
+
+        box = self.current_boxes[box_idx]
+        x1, y1 = box.get("x1", 0), box.get("y1", 0)
+        x2, y2 = box.get("x2", 1), box.get("y2", 1)
+
+        # Convert normalized coords to pixel coords
+        w = self.current_pixmap.width()
+        h = self.current_pixmap.height()
+        px1, py1 = x1 * w, y1 * h
+        px2, py2 = x2 * w, y2 * h
+
+        # Add padding
+        box_w = px2 - px1
+        box_h = py2 - py1
+        pad_w = box_w * padding
+        pad_h = box_h * padding
+
+        # Create padded rect (clamped to image bounds)
+        rect = QRectF(
+            max(0, px1 - pad_w),
+            max(0, py1 - pad_h),
+            min(w, box_w + 2 * pad_w),
+            min(h, box_h + 2 * pad_h)
+        )
+
+        # Zoom to fit the box with padding
+        self.view.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+
     def _save_current_box_data(self):
         """Save form field values to the current box."""
         if not hasattr(self, "current_boxes") or not self.current_boxes:
@@ -3042,10 +3148,15 @@ class TrainerWindow(QMainWindow):
         box = self.current_boxes[self.current_box_index]
 
         # Save species
-        box["species"] = self.species_combo.currentText().strip()
+        species = self.species_combo.currentText().strip()
+        box["species"] = species
 
-        # Save sex
-        box["sex"] = self._get_sex()
+        # Save sex (only for Deer - clear for other species)
+        if species.lower() == "deer":
+            box["sex"] = self._get_sex()
+        else:
+            box["sex"] = None
+            box["sex_conf"] = None
 
         # Save deer ID
         box["deer_id"] = self.deer_id_edit.currentText().strip()
@@ -3108,11 +3219,46 @@ class TrainerWindow(QMainWindow):
         label = str(box.get("label", "")).lower()
         return "deer_head" in label or "head" in label
 
+    def _box_sort_priority(self, box: dict) -> int:
+        """Return sort priority for a box (lower = higher priority).
+
+        Priority order:
+        0 = Deer with buck ID (highest)
+        1 = Buck
+        2 = Doe
+        3 = Deer (general)
+        4 = Other species (lowest)
+        """
+        species = (box.get("species") or "").lower()
+        sex = (box.get("sex") or "").lower()
+        deer_id = box.get("deer_id") or ""
+
+        # Deer with buck ID = highest priority
+        if deer_id and species == "deer":
+            return 0
+        # Buck
+        if sex == "buck" or species == "deer" and sex == "buck":
+            return 1
+        # Doe
+        if sex == "doe" or species == "deer" and sex == "doe":
+            return 2
+        # Deer (general, no sex specified)
+        if species == "deer":
+            return 3
+        # Other species
+        return 4
+
     def _get_subject_boxes(self) -> list:
-        """Get only subject boxes (not head boxes) for tab display."""
+        """Get only subject boxes (not head boxes) for tab display, sorted by priority.
+
+        Priority: Deer with buck ID > Bucks > Does > Deer > Other species
+        """
         if not hasattr(self, "current_boxes") or not self.current_boxes:
             return []
-        return [b for b in self.current_boxes if not self._is_head_box(b)]
+        boxes = [b for b in self.current_boxes if not self._is_head_box(b)]
+        # Sort by priority (stable sort preserves original order for equal priorities)
+        boxes.sort(key=self._box_sort_priority)
+        return boxes
 
     def _get_subject_box_indices(self) -> list:
         """Get indices of subject boxes in current_boxes."""
@@ -3288,6 +3434,20 @@ class TrainerWindow(QMainWindow):
         font_size = max(12, int(ref_size * 0.018))  # 1.8% of image, min 12pt
         label_offset = max(16, int(ref_size * 0.025))  # 2.5% of image, min 16px
 
+        # Build mapping from box to sorted subject number
+        # Subject boxes are sorted by priority (deer first, etc.)
+        sorted_subjects = self._get_subject_boxes()
+        box_to_subject_num = {}
+        for subj_idx, subj_box in enumerate(sorted_subjects):
+            # Find this box in current_boxes by matching coordinates
+            for orig_idx, orig_box in enumerate(self.current_boxes):
+                if (orig_box.get("x1") == subj_box.get("x1") and
+                    orig_box.get("y1") == subj_box.get("y1") and
+                    orig_box.get("x2") == subj_box.get("x2") and
+                    orig_box.get("y2") == subj_box.get("y2")):
+                    box_to_subject_num[orig_idx] = subj_idx + 1
+                    break
+
         def _on_change(idx, scene_rect: QRectF):
             if idx < 0 or idx >= len(self.current_boxes):
                 return
@@ -3317,17 +3477,24 @@ class TrainerWindow(QMainWindow):
             self.scene.addItem(item)
             self.box_items.append(item)
 
-            # Add subject label text (Subject 1, Subject 2, etc.) with species if known
-            box_num = idx + 1
+            # Add subject label text (Subject 1, Subject 2, etc.) with species and sex if known
+            # Use sorted subject number if this is a subject box, otherwise use original index
+            box_num = box_to_subject_num.get(idx, idx + 1)
             species = b.get("species", "")
+            sex = b.get("sex", "")
             # If no per-box species, check for photo-level suggestion
             if not species and self.photos and self.index < len(self.photos):
                 photo = self.photos[self.index]
                 species = photo.get("suggested_tag", "")
                 if species:
                     species = f"{species}?"  # Add ? to indicate it's a suggestion
-            if species:
+            # Build label with species and sex
+            if species and sex and sex != "Unknown":
+                label_text = f"Subject {box_num}: {species} ({sex})"
+            elif species:
                 label_text = f"Subject {box_num}: {species}"
+            elif sex and sex != "Unknown":
+                label_text = f"Subject {box_num}: ({sex})"
             else:
                 label_text = f"Subject {box_num}"
 
@@ -3353,6 +3520,24 @@ class TrainerWindow(QMainWindow):
             return
         try:
             self.db.set_boxes(pid, self.current_boxes)
+            # Sync box species to photo tags - tags should exactly match current box species
+            box_species = set(box.get("species") for box in self.current_boxes if box.get("species") and box.get("species") != "Unknown")
+            current_tags = self.db.get_tags(pid)
+
+            # Build new tags list:
+            # - Keep non-species tags (any custom tags not in SPECIES_OPTIONS)
+            # - Replace species tags with current box species
+            species_set = set(SPECIES_OPTIONS)
+            new_tags = [t for t in current_tags if t not in species_set]  # Keep non-species tags
+
+            if box_species:
+                # Add current box species (removes Empty/Unknown implicitly since they won't be in box_species)
+                new_tags.extend(sorted(box_species))
+
+            if set(new_tags) != set(current_tags):
+                self.db.update_photo_tags(pid, new_tags)
+                # Update UI
+                self.tags_edit.setText(", ".join(new_tags))
         except Exception as exc:
             logger.error(f"Box save failed: {exc}")
 
@@ -3965,7 +4150,7 @@ class TrainerWindow(QMainWindow):
         if not species:
             # Check if ANY box has a saved label
             for box in subject_boxes:
-                box_species = box.get("species", "").strip()
+                box_species = (box.get("species") or "").strip()
                 if box_species:
                     species = box_species
                     break  # Use the first labeled box
@@ -4077,7 +4262,8 @@ class TrainerWindow(QMainWindow):
         if not subject_boxes:
             return True  # No boxes = nothing to label
         for box in subject_boxes:
-            if not box.get("species", "").strip():
+            species = box.get("species") or ""
+            if not species.strip():
                 return False
         return True
 
@@ -4477,35 +4663,41 @@ class TrainerWindow(QMainWindow):
         self.deer_id_filter_combo.blockSignals(False)
 
     def _populate_site_filter_options(self):
-        """Fill the site filter combo with camera_location values."""
+        """Fill the site filter combo with locations (contextual to other filters)."""
         if not hasattr(self, "site_filter_combo"):
             return
         current = self.site_filter_combo.currentData()
         self.site_filter_combo.blockSignals(True)
         self.site_filter_combo.clear()
         self.site_filter_combo.addItem("All locations", None)
-        self.site_filter_combo.addItem("Unassigned", "__unassigned__")
         try:
+            context_photos = self._get_context_filtered_photos(exclude_filter='site')
             # Count photos by camera_location
             location_counts = {}
-            for photo in self._get_all_photos_cached():
+            unassigned_count = 0
+            for photo in context_photos:
                 loc = photo.get("camera_location")
                 if loc and loc.strip():
                     loc = loc.strip()
                     location_counts[loc] = location_counts.get(loc, 0) + 1
+                else:
+                    unassigned_count += 1
+            # Add unassigned first if any
+            if unassigned_count > 0:
+                self.site_filter_combo.addItem(f"Unassigned ({unassigned_count})", "__unassigned__")
             # Add sorted locations with counts
             for loc in sorted(location_counts.keys()):
                 count = location_counts[loc]
                 label = f"{loc} ({count})"
                 self.site_filter_combo.addItem(label, loc)
         except Exception:
-            pass
+            self.site_filter_combo.addItem("Unassigned", "__unassigned__")
         idx = self.site_filter_combo.findData(current)
         self.site_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
         self.site_filter_combo.blockSignals(False)
 
     def _populate_year_filter_options(self):
-        """Fill the year filter combo with antler years (May-April, displayed as YYYY-YYYY)."""
+        """Fill the year filter combo with years (contextual to other filters)."""
         if not hasattr(self, "year_filter_combo"):
             return
         current = self.year_filter_combo.currentData()
@@ -4513,9 +4705,10 @@ class TrainerWindow(QMainWindow):
         self.year_filter_combo.clear()
         self.year_filter_combo.addItem("All Years", None)
         try:
+            context_photos = self._get_context_filtered_photos(exclude_filter='year')
             # Count photos by antler year
             year_counts = {}
-            for photo in self._get_all_photos_cached():
+            for photo in context_photos:
                 date_taken = photo.get("date_taken")
                 if date_taken:
                     season_year = TrailCamDatabase.compute_season_year(date_taken)
@@ -4533,7 +4726,7 @@ class TrainerWindow(QMainWindow):
         self.year_filter_combo.blockSignals(False)
 
     def _populate_collection_filter_options(self):
-        """Fill the collection/farm filter combo."""
+        """Fill the collection filter combo (contextual to other filters)."""
         if not hasattr(self, "collection_filter_combo"):
             return
         current = self.collection_filter_combo.currentData()
@@ -4541,22 +4734,22 @@ class TrainerWindow(QMainWindow):
         self.collection_filter_combo.clear()
         self.collection_filter_combo.addItem("All Collections", None)
         try:
-            cursor = self.db.conn.cursor()
-            cursor.execute("""
-                SELECT collection, COUNT(*) as cnt
-                FROM photos
-                WHERE collection IS NOT NULL AND collection != ''
-                GROUP BY collection
-                ORDER BY cnt DESC
-            """)
-            for row in cursor.fetchall():
-                coll, count = row
+            context_photos = self._get_context_filtered_photos(exclude_filter='collection')
+            # Count photos by collection
+            collection_counts = {}
+            unassigned_count = 0
+            for photo in context_photos:
+                coll = photo.get("collection") or ""
+                if coll:
+                    collection_counts[coll] = collection_counts.get(coll, 0) + 1
+                else:
+                    unassigned_count += 1
+            # Add collections sorted by count (descending)
+            for coll, count in sorted(collection_counts.items(), key=lambda x: -x[1]):
                 self.collection_filter_combo.addItem(f"{coll} ({count})", coll)
             # Add unassigned option
-            cursor.execute("SELECT COUNT(*) FROM photos WHERE collection IS NULL OR collection = ''")
-            unassigned = cursor.fetchone()[0]
-            if unassigned > 0:
-                self.collection_filter_combo.addItem(f"Unassigned ({unassigned})", "__unassigned__")
+            if unassigned_count > 0:
+                self.collection_filter_combo.addItem(f"Unassigned ({unassigned_count})", "__unassigned__")
         except Exception:
             pass
         idx = self.collection_filter_combo.findData(current)
@@ -4579,7 +4772,7 @@ class TrainerWindow(QMainWindow):
             filtered.sort(key=lambda x: id_to_order.get(x[1].get("id"), 999999))
             return filtered
 
-        # Apply archive filter
+        # Apply archive/favorites filter
         if hasattr(self, "archive_filter_combo"):
             archive_flt = self.archive_filter_combo.currentData()
             if archive_flt == "active":
@@ -4588,6 +4781,9 @@ class TrainerWindow(QMainWindow):
             elif archive_flt == "archived":
                 # Show only archived photos
                 result = [(idx, p) for idx, p in result if p.get("archived")]
+            elif archive_flt == "favorites":
+                # Show only favorites (non-archived)
+                result = [(idx, p) for idx, p in result if p.get("favorite") and not p.get("archived")]
             # "all" shows everything, no filter needed
 
         # Apply species filter
@@ -4922,9 +5118,14 @@ class TrainerWindow(QMainWindow):
 
     def _populate_photo_list(self):
         """Fill the navigation list with photos (sorted)."""
+        # Refresh all filter dropdowns with contextual options
         self._populate_suggest_filter_options()
+        self._populate_species_filter_options()
+        self._populate_sex_filter_options()
+        self._populate_deer_id_filter_options()
         self._populate_site_filter_options()
         self._populate_year_filter_options()
+        self._populate_collection_filter_options()
         self.photo_list_widget.blockSignals(True)
         self.photo_list_widget.clear()
         filtered = self._filtered_photos()
@@ -5082,6 +5283,18 @@ class TrainerWindow(QMainWindow):
         """Clear list selection."""
         self.photo_list_widget.clearSelection()
 
+    def _on_favorite_changed(self, state):
+        """Toggle favorite status for current photo."""
+        if not self.photos or self.index >= len(self.photos):
+            return
+        photo = self.photos[self.index]
+        pid = photo.get("id")
+        if not pid:
+            return
+        is_favorite = state == Qt.CheckState.Checked.value
+        self.db.set_favorite(pid, is_favorite)
+        photo["favorite"] = 1 if is_favorite else 0
+
     def archive_current_photo(self):
         """Archive the current photo or selected photos."""
         selected = self.photo_list_widget.selectedItems()
@@ -5096,15 +5309,27 @@ class TrainerWindow(QMainWindow):
                         photo_ids.append(pid)
             if photo_ids:
                 self.db.archive_photos(photo_ids)
-                # Update in-memory data
+                # Update in-memory data (skip favorites - they're protected)
+                archived_count = 0
+                skipped_favorites = 0
                 for p in self.photos:
                     if p.get("id") in photo_ids:
-                        p["archived"] = 1
+                        if p.get("favorite"):
+                            skipped_favorites += 1
+                        else:
+                            p["archived"] = 1
+                            archived_count += 1
                 self._populate_photo_list()
-                QMessageBox.information(self, "Archived", f"Archived {len(photo_ids)} photos.")
+                if skipped_favorites > 0:
+                    QMessageBox.information(self, "Archived", f"Archived {archived_count} photos.\n{skipped_favorites} favorites were protected.")
+                else:
+                    QMessageBox.information(self, "Archived", f"Archived {archived_count} photos.")
         elif self.photos and 0 <= self.index < len(self.photos):
             # Archive single current photo
             photo = self.photos[self.index]
+            if photo.get("favorite"):
+                QMessageBox.information(self, "Protected", "This photo is a favorite and cannot be archived.")
+                return
             pid = photo.get("id")
             if pid:
                 self.db.archive_photo(pid)
@@ -5642,6 +5867,115 @@ class TrainerWindow(QMainWindow):
             return tmp
         except Exception:
             return None
+
+    def _predict_sex_for_deer_boxes(self, photo: dict) -> int:
+        """Run buck/doe prediction on all deer boxes in a photo.
+
+        Returns the number of boxes that got sex predictions.
+        Only runs on boxes where species='Deer' (case-insensitive).
+        Uses deer_head crops when available for better accuracy.
+        """
+        if not self.suggester or not self.suggester.buckdoe_ready:
+            return 0
+
+        pid = photo.get("id")
+        if not pid:
+            return 0
+
+        boxes = self.db.get_boxes(pid)
+        if not boxes:
+            return 0
+
+        # Find deer boxes that need sex prediction
+        deer_boxes = []
+        head_boxes = {}  # Map head boxes for potential association
+
+        for box in boxes:
+            species = (box.get("species") or "").lower()
+            label = (box.get("label") or "").lower()
+
+            # Skip if already has sex prediction
+            if box.get("sex"):
+                continue
+
+            # Identify deer boxes (by species)
+            if species == "deer":
+                deer_boxes.append(box)
+
+            # Track head boxes for potential association
+            if label in ("deer_head", "ai_deer_head"):
+                head_boxes[box["id"]] = box
+
+        if not deer_boxes:
+            return 0
+
+        path = photo.get("file_path")
+        if not path or not os.path.exists(path):
+            return 0
+
+        count = 0
+        try:
+            from PIL import Image
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+
+            for deer_box in deer_boxes:
+                crop_path = None
+                try:
+                    # Try to find associated head box within this deer box
+                    best_head = None
+                    deer_x1, deer_y1 = deer_box["x1"], deer_box["y1"]
+                    deer_x2, deer_y2 = deer_box["x2"], deer_box["y2"]
+
+                    for hbox in head_boxes.values():
+                        hx1, hy1, hx2, hy2 = hbox["x1"], hbox["y1"], hbox["x2"], hbox["y2"]
+                        # Check if head box center is within deer box
+                        hcx, hcy = (hx1 + hx2) / 2, (hy1 + hy2) / 2
+                        if deer_x1 <= hcx <= deer_x2 and deer_y1 <= hcy <= deer_y2:
+                            best_head = hbox
+                            break
+
+                    # Crop either head box (preferred) or deer box
+                    box_to_crop = best_head if best_head else deer_box
+                    x1 = int(box_to_crop["x1"] * w)
+                    x2 = int(box_to_crop["x2"] * w)
+                    y1 = int(box_to_crop["y1"] * h)
+                    y2 = int(box_to_crop["y2"] * h)
+
+                    # Add padding for context
+                    pad_x = int((x2 - x1) * 0.1)
+                    pad_y = int((y2 - y1) * 0.1)
+                    x1 = max(0, x1 - pad_x)
+                    x2 = min(w, x2 + pad_x)
+                    y1 = max(0, y1 - pad_y)
+                    y2 = min(h, y2 + pad_y)
+
+                    if x2 - x1 < 32 or y2 - y1 < 32:
+                        continue
+
+                    import tempfile
+                    crop_path = Path(tempfile.mkstemp(suffix=".jpg")[1])
+                    img.crop((x1, y1, x2, y2)).save(crop_path, "JPEG", quality=90)
+
+                    # Run prediction
+                    sex_res = self.suggester.predict_sex(str(crop_path))
+                    if sex_res:
+                        sex_label, sex_conf = sex_res
+                        self.db.set_box_sex(deer_box["id"], sex_label, sex_conf)
+                        count += 1
+
+                finally:
+                    if crop_path:
+                        try:
+                            Path(crop_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Error in _predict_sex_for_deer_boxes: {e}")
+
+        return count
 
     # ====== FILE/TOOLS/SETTINGS INTEGRATIONS ======
     def import_folder(self):
@@ -7045,19 +7379,11 @@ class TrainerWindow(QMainWindow):
                 if self._add_deer_head_boxes(p, detector=detector, names=names):
                     head_count += 1
 
-            # Step 4: Buck vs Doe ID
-            if options["buck_doe"] and is_deer and self.suggester.buckdoe_ready:
-                head_crop = self._best_head_crop_for_photo(p)
-                if head_crop:
-                    sex_res = self.suggester.predict_sex(str(head_crop))
-                    if sex_res:
-                        sex_label, sex_conf = sex_res
-                        self.db.set_suggested_sex(p["id"], sex_label, sex_conf)
-                        sex_count += 1
-                    try:
-                        Path(head_crop).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            # Step 4: Buck vs Doe ID (per-box on deer boxes)
+            if options["buck_doe"] and self.suggester.buckdoe_ready:
+                # Run per-box sex prediction on all deer boxes in this photo
+                box_sex_count = self._predict_sex_for_deer_boxes(p)
+                sex_count += box_sex_count
 
         progress.setValue(total)
         progress.close()
@@ -7093,70 +7419,52 @@ class TrainerWindow(QMainWindow):
         self.run_ai_suggestions_background()
 
     def run_sex_suggestions_on_deer(self):
-        """Run buck/doe suggestions on photos already tagged as Deer.
+        """Run buck/doe suggestions on deer boxes without sex predictions.
 
-        Automatically runs detection first if no boxes exist, then uses
-        deer_head crops for best accuracy on buck/doe classification.
+        Runs per-box: each deer box gets its own buck/doe prediction.
+        Automatically runs detection first if no boxes exist.
         """
         if not self.suggester or not self.suggester.buckdoe_ready:
             QMessageBox.information(self, "Buck/Doe Model Not Available",
                 "Buck/doe classifier not loaded.\nPlace buckdoe.onnx in the models/ folder.")
             return
-        # Find photos tagged as Deer but without buck/doe tags
+
+        # Find photos with deer boxes that need sex prediction
         all_photos = self.db.get_all_photos()
-        deer_photos = []
+        photos_to_process = []
+
         for p in all_photos:
-            tags = set(t.lower() for t in self.db.get_tags(p["id"]))
-            is_deer = "deer" in tags
-            has_sex = "buck" in tags or "doe" in tags
-            # Check if already has suggestion
-            has_sex_suggestion = bool(p.get("suggested_sex"))
-            if is_deer and not has_sex and not has_sex_suggestion:
-                deer_photos.append(p)
-        if not deer_photos:
+            pid = p.get("id")
+            if not pid:
+                continue
+            boxes = self.db.get_boxes(pid)
+            # Check if any deer box lacks sex prediction
+            has_deer_without_sex = False
+            for box in boxes:
+                species = (box.get("species") or "").lower()
+                if species == "deer" and not box.get("sex"):
+                    has_deer_without_sex = True
+                    break
+            if has_deer_without_sex:
+                photos_to_process.append(p)
+
+        if not photos_to_process:
             QMessageBox.information(self, "Buck/Doe Suggestions",
-                "No deer photos without buck/doe labels found.")
+                "No deer boxes without buck/doe predictions found.")
             return
+
         # Get detector for auto-detection if needed
         detector, names = self._get_detector_for_suggestions()
-        count = 0
-        count_fallback = 0
-        for p in deer_photos:
+
+        total_boxes = 0
+        for p in photos_to_process:
             # Auto-detect boxes if none exist (enables head crops)
             self._ensure_detection_boxes(p, detector=detector, names=names)
-            # Try deer_head crop first (more accurate)
-            head_crop = self._best_head_crop_for_photo(p)
-            if head_crop:
-                sex_res = self.suggester.predict_sex(str(head_crop))
-                if sex_res:
-                    sex_label, sex_conf = sex_res
-                    self.db.set_suggested_sex(p["id"], sex_label, sex_conf)
-                    count += 1
-                try:
-                    Path(head_crop).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            else:
-                # Fallback: use full photo or subject crop (less accurate but better than nothing)
-                crop = self._best_crop_for_photo(p)
-                path = str(crop) if crop else p.get("file_path")
-                if path and os.path.exists(path):
-                    sex_res = self.suggester.predict_sex(path)
-                    if sex_res:
-                        sex_label, sex_conf = sex_res
-                        # Lower confidence for fallback predictions
-                        adjusted_conf = sex_conf * 0.7  # Reduce confidence since not using head crop
-                        self.db.set_suggested_sex(p["id"], sex_label, adjusted_conf)
-                        count += 1
-                        count_fallback += 1
-                if crop:
-                    try:
-                        Path(crop).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-        msg = f"Suggested buck/doe for {count} deer photo(s)."
-        if count_fallback > 0:
-            msg += f"\n({count_fallback} used full photo - may be less accurate)"
+            # Run per-box sex prediction
+            box_count = self._predict_sex_for_deer_boxes(p)
+            total_boxes += box_count
+
+        msg = f"Suggested buck/doe for {total_boxes} deer box(es) across {len(photos_to_process)} photo(s)."
         msg += "\nUse 'Review Buck/Doe Suggestions' to verify."
         QMessageBox.information(self, "Buck/Doe Suggestions", msg)
         self._populate_photo_list()
@@ -9079,6 +9387,21 @@ class TrainerWindow(QMainWindow):
         filter_row3.addStretch()
         left_panel.addLayout(filter_row3)
 
+        # Collection filter
+        filter_row4 = QHBoxLayout()
+        filter_row4.addWidget(QLabel("Collection:"))
+        collection_filter = QComboBox()
+        # Get unique collections from pending items
+        unique_collections = sorted(set(item.get("collection", "") for item in pending if item.get("collection")))
+        collection_filter.addItem("All")
+        for c in unique_collections:
+            if c:
+                collection_filter.addItem(c)
+        collection_filter.setMaximumWidth(180)
+        filter_row4.addWidget(collection_filter)
+        filter_row4.addStretch()
+        left_panel.addLayout(filter_row4)
+
         left_panel.addWidget(QLabel("Pending suggestions:"))
         list_widget = QListWidget()
         list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
@@ -9092,6 +9415,7 @@ class TrainerWindow(QMainWindow):
             sex_val = sex_filter.currentText()
             conf_val = conf_filter.currentText()
             date_val = date_filter.currentText()
+            collection_val = collection_filter.currentText()
 
             for item in all_pending:
                 # Skip if already reviewed
@@ -9113,6 +9437,11 @@ class TrainerWindow(QMainWindow):
                     item_date = (item.get("date") or "")[:10]
                     if item_date != date_val:
                         continue
+                # Apply collection filter
+                if collection_val != "All":
+                    item_collection = item.get("collection") or ""
+                    if item_collection != collection_val:
+                        continue
 
                 pct = int(conf_pct)
                 text = f"{item['sex'].title()} ({pct}%) - {item['name'][:22]}"
@@ -9127,6 +9456,7 @@ class TrainerWindow(QMainWindow):
         sex_filter.currentIndexChanged.connect(_populate_list)
         conf_filter.currentIndexChanged.connect(_populate_list)
         date_filter.currentIndexChanged.connect(_populate_list)
+        collection_filter.currentIndexChanged.connect(_populate_list)
 
         # Initial population
         _populate_list()
@@ -9204,6 +9534,8 @@ class TrainerWindow(QMainWindow):
                 return
             data = item.data(Qt.ItemDataRole.UserRole)
             path = data.get("path")
+            pid = data.get("photo_id")
+            target_box = data.get("box")
             sex = data.get("sex", "").title()
             conf = data.get("conf", 0)
             pct = int(conf * 100) if conf <= 1 else int(conf)
@@ -9215,6 +9547,28 @@ class TrainerWindow(QMainWindow):
                     scene.addPixmap(pixmap)
                     scene.setSceneRect(pixmap.rect().toRectF())
                     current_pixmap[0] = pixmap
+                    w, h = pixmap.width(), pixmap.height()
+                    # Draw all detection boxes, highlight the target box
+                    if pid:
+                        boxes = self.db.get_boxes(pid)
+                        for box in boxes:
+                            lbl = box.get("label", "")
+                            if "head" in str(lbl).lower():
+                                continue
+                            x1, y1 = box.get("x1", 0) * w, box.get("y1", 0) * h
+                            x2, y2 = box.get("x2", 0) * w, box.get("y2", 0) * h
+                            rect = QRectF(x1, y1, x2 - x1, y2 - y1)
+                            # Highlight target box in yellow, others in gray
+                            is_target = (target_box and
+                                        box.get("x1") == target_box.get("x1") and
+                                        box.get("y1") == target_box.get("y1"))
+                            if is_target:
+                                pen = QPen(Qt.GlobalColor.yellow)
+                                pen.setWidth(4)
+                            else:
+                                pen = QPen(Qt.GlobalColor.gray)
+                                pen.setWidth(2)
+                            scene.addRect(rect, pen)
                     _zoom_fit()
                 else:
                     scene.clear()
@@ -9252,20 +9606,25 @@ class TrainerWindow(QMainWindow):
         def _zoom_100():
             view.resetTransform()
 
-        reviewed_ids = set()  # Track reviewed photo IDs
+        reviewed_rows = set()  # Track reviewed list rows (per-box)
         reviewed_data = {}  # Track what action was taken: {pid: action}
+        navigate_to_photo = None  # Store photo to navigate to after dialog closes
+
+        def _get_box_key(data):
+            """Get unique key for a box."""
+            box = data.get("box", {})
+            return (data.get("photo_id"), box.get("x1"), box.get("y1"), box.get("x2"), box.get("y2"))
 
         def _mark_reviewed(item, action_text: str):
             """Mark item as reviewed with green highlight and update text."""
+            row = list_widget.row(item)
+            reviewed_rows.add(row)
             data = item.data(Qt.ItemDataRole.UserRole)
-            pid = data["id"]
-            reviewed_ids.add(pid)
             original_name = data.get("name", "")[:22]
             item.setText(f"✓ {action_text} - {original_name}")
             item.setBackground(QColor(144, 238, 144))  # Light green
             # Update window title with remaining count
-            remaining = sum(1 for i in range(list_widget.count())
-                          if list_widget.item(i).data(Qt.ItemDataRole.UserRole)["id"] not in reviewed_ids)
+            remaining = list_widget.count() - len(reviewed_rows)
             dlg.setWindowTitle(f"Review Buck/Doe Suggestions ({remaining} remaining)")
 
         def _next_unreviewed():
@@ -9273,15 +9632,13 @@ class TrainerWindow(QMainWindow):
             current = list_widget.currentRow()
             # Look forward first
             for i in range(current + 1, list_widget.count()):
-                item_data = list_widget.item(i).data(Qt.ItemDataRole.UserRole)
-                if item_data["id"] not in reviewed_ids:
+                if i not in reviewed_rows:
                     list_widget.setCurrentRow(i)
                     _update_preview()
                     return
             # Then look from beginning
             for i in range(0, current):
-                item_data = list_widget.item(i).data(Qt.ItemDataRole.UserRole)
-                if item_data["id"] not in reviewed_ids:
+                if i not in reviewed_rows:
                     list_widget.setCurrentRow(i)
                     _update_preview()
                     return
@@ -9293,24 +9650,43 @@ class TrainerWindow(QMainWindow):
             if not item:
                 return
             data = item.data(Qt.ItemDataRole.UserRole)
-            pid = data["id"]
+            pid = data.get("photo_id")
+            box = data.get("box")
             ai_suggested = data.get("sex", "")
+            # Only allow sex labels on deer boxes
+            box_species = (box.get("species") or "").lower() if box else ""
+            if box_species and box_species != "deer":
+                _mark_reviewed(item, "SKIPPED (not deer)")
+                _next_unreviewed()
+                return
             # Log if user corrected the AI (accepted different label)
             if ai_suggested and ai_suggested != sex_tag:
                 self.db.log_ai_rejection(
                     photo_id=pid,
                     suggestion_type="sex",
                     ai_suggested=ai_suggested,
-                    correct_label=sex_tag,  # What user said was correct
+                    correct_label=sex_tag,
                     model_version=get_model_version("buckdoe")
                 )
-            # Add tag
-            tags = set(self.db.get_tags(pid))
-            if sex_tag not in tags:
-                self.db.add_tag(pid, sex_tag)
-            # Track for clearing suggestion on close
+            # Update the box's sex field (clear sex_conf to mark as reviewed)
+            if box and pid:
+                box["sex"] = sex_tag
+                box["sex_conf"] = None  # Clear confidence = reviewed
+                # Get all boxes for this photo and update the matching one
+                all_boxes = self.db.get_boxes(pid)
+                for b in all_boxes:
+                    if (b.get("x1") == box.get("x1") and b.get("y1") == box.get("y1") and
+                        b.get("x2") == box.get("x2") and b.get("y2") == box.get("y2")):
+                        b["sex"] = sex_tag
+                        b["sex_conf"] = None
+                self.db.set_boxes(pid, all_boxes)
+                # Also add tag to photo if it's a buck/doe
+                if sex_tag in ("Buck", "Doe"):
+                    tags = set(self.db.get_tags(pid))
+                    if sex_tag not in tags:
+                        self.db.add_tag(pid, sex_tag)
+            # Track for cleanup
             reviewed_data[pid] = sex_tag
-            # Mark as reviewed (green) instead of removing
             _mark_reviewed(item, sex_tag)
             _next_unreviewed()
 
@@ -9319,20 +9695,28 @@ class TrainerWindow(QMainWindow):
             if not item:
                 return
             data = item.data(Qt.ItemDataRole.UserRole)
-            pid = data["id"]
+            pid = data.get("photo_id")
+            box = data.get("box")
             ai_suggested = data.get("sex", "")
             # Log rejection for future model training
-            if ai_suggested:
+            if ai_suggested and pid:
                 self.db.log_ai_rejection(
                     photo_id=pid,
                     suggestion_type="sex",
                     ai_suggested=ai_suggested,
-                    correct_label=None,  # Unknown - user just rejected
+                    correct_label=None,
                     model_version=get_model_version("buckdoe")
                 )
-            # Track for clearing suggestion on close
+            # Clear the box's sex suggestion (mark as reviewed/rejected)
+            if box and pid:
+                all_boxes = self.db.get_boxes(pid)
+                for b in all_boxes:
+                    if (b.get("x1") == box.get("x1") and b.get("y1") == box.get("y1") and
+                        b.get("x2") == box.get("x2") and b.get("y2") == box.get("y2")):
+                        b["sex"] = None
+                        b["sex_conf"] = None
+                self.db.set_boxes(pid, all_boxes)
             reviewed_data[pid] = "REJECTED"
-            # Mark as reviewed (green) instead of removing
             _mark_reviewed(item, "REJECTED")
             _next_unreviewed()
 
@@ -9348,26 +9732,34 @@ class TrainerWindow(QMainWindow):
             if not item:
                 return
             data = item.data(Qt.ItemDataRole.UserRole)
-            pid = data["id"]
-            # Track for clearing suggestion on close
+            pid = data.get("photo_id")
+            box = data.get("box")
+            # Clear the box's sex suggestion
+            if box and pid:
+                all_boxes = self.db.get_boxes(pid)
+                for b in all_boxes:
+                    if (b.get("x1") == box.get("x1") and b.get("y1") == box.get("y1") and
+                        b.get("x2") == box.get("x2") and b.get("y2") == box.get("y2")):
+                        b["sex"] = "Unknown"
+                        b["sex_conf"] = None
+                self.db.set_boxes(pid, all_boxes)
             reviewed_data[pid] = "UNKNOWN"
-            # Mark as reviewed (green)
             _mark_reviewed(item, "UNKNOWN")
             _next_unreviewed()
 
         def _open_properties():
             """Navigate to photo in main window and close review dialog."""
+            nonlocal navigate_to_photo
             item = list_widget.currentItem()
             if not item:
                 return
             data = item.data(Qt.ItemDataRole.UserRole)
-            pid = data["id"]
-            # Find photo index in main window
-            for i, photo in enumerate(self.photos):
-                if photo["id"] == pid:
-                    self.index = i
-                    break
-            # Close the dialog - cleanup will run via finished signal
+            # Store target photo info for navigation after dialog closes
+            navigate_to_photo = {
+                "photo_id": data.get("photo_id"),
+                "collection": data.get("collection", "")
+            }
+            # Close the dialog - navigation happens after dlg.exec() returns
             dlg.accept()
 
         def _cleanup_reviewed():
@@ -9482,35 +9874,85 @@ class TrainerWindow(QMainWindow):
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(200, _zoom_fit)
         dlg.exec()
+
+        # Handle navigation to specific photo if Properties was clicked
+        if navigate_to_photo:
+            target_pid = navigate_to_photo.get("photo_id")
+            # Refresh photos from database INCLUDING archived (target may be archived)
+            self.photos = self._sorted_photos(self.db.search_photos(include_archived=True))
+            # Find the target photo index
+            target_index = None
+            for i, p in enumerate(self.photos):
+                if p.get("id") == target_pid:
+                    target_index = i
+                    break
+            if target_index is not None:
+                # Reset ALL filters to ensure target photo is visible
+                self.collection_filter_combo.blockSignals(True)
+                self.collection_filter_combo.setCurrentIndex(0)  # "All Collections"
+                self.collection_filter_combo.blockSignals(False)
+                self.species_filter_combo.blockSignals(True)
+                self.species_filter_combo.setCurrentIndex(0)  # "All Species"
+                self.species_filter_combo.blockSignals(False)
+                self.archive_filter_combo.blockSignals(True)
+                self.archive_filter_combo.setCurrentIndex(3)  # "All Photos" (index 3)
+                self.archive_filter_combo.blockSignals(False)
+                # Set target index BEFORE populating so _populate_photo_list selects it
+                self.index = target_index
+                self._populate_photo_list()
+                self.load_photo()
+                return
+        # Default: just refresh normally
         self._populate_photo_list()
         if self.photos and 0 <= self.index < len(self.photos):
             self.load_photo()
 
     def _gather_pending_sex_suggestions(self) -> list:
-        """Return list of photos with pending buck/doe suggestions."""
-        # Non-deer species tags - if photo has any of these, skip buck/doe suggestion
-        non_deer_species = {"rabbit", "turkey", "coyote", "raccoon", "squirrel",
-                           "opossum", "bobcat", "quail", "person", "vehicle",
-                           "empty", "other", "other mammal", "other bird"}
+        """Return list of boxes with pending buck/doe suggestions (per-box, not per-photo).
+
+        Optimized: Uses single SQL query instead of N+1 queries.
+        """
         pending = []
-        for p in self.db.get_all_photos():
-            pid = p["id"]
-            tags = set(t.lower() for t in self.db.get_tags(pid))
-            has_sex = "buck" in tags or "doe" in tags
-            # Skip if already has non-deer species tag
-            has_non_deer = bool(tags & non_deer_species)
-            sugg_sex = p.get("suggested_sex") or ""
-            sugg_conf = p.get("suggested_sex_confidence")
-            if sugg_sex and not has_sex and not has_non_deer:
+        try:
+            cursor = self.db.conn.cursor()
+            # Single query to get all boxes with pending sex suggestions
+            cursor.execute("""
+                SELECT
+                    b.id as box_id,
+                    b.photo_id,
+                    b.x1, b.y1, b.x2, b.y2,
+                    b.label, b.species, b.sex, b.sex_conf,
+                    p.original_name, p.file_path, p.date_taken, p.import_date, p.collection
+                FROM annotation_boxes b
+                JOIN photos p ON b.photo_id = p.id
+                WHERE b.sex IS NOT NULL
+                  AND b.sex != ''
+                  AND b.sex_conf IS NOT NULL
+                  AND b.sex_conf > 0
+                  AND (b.label IS NULL OR b.label NOT LIKE '%head%')
+                  AND (b.species IS NULL OR b.species = '' OR LOWER(b.species) = 'deer')
+                ORDER BY b.sex_conf DESC
+            """)
+
+            for row in cursor.fetchall():
+                box = {
+                    "id": row[0],
+                    "x1": row[2], "y1": row[3], "x2": row[4], "y2": row[5],
+                    "label": row[6], "species": row[7], "sex": row[8], "sex_conf": row[9]
+                }
                 pending.append({
-                    "id": pid,
-                    "name": p.get("original_name") or Path(p.get("file_path", "")).name,
-                    "sex": sugg_sex,
-                    "conf": sugg_conf or 0,
-                    "path": p.get("file_path"),
-                    "date": p.get("taken_date") or p.get("import_date") or "",
+                    "photo_id": row[1],
+                    "box_idx": 0,  # Not used for display, just compatibility
+                    "box": box,
+                    "name": row[10] or Path(row[11] or "").name,
+                    "sex": row[8],
+                    "conf": row[9],
+                    "path": row[11],
+                    "date": row[12] or row[13] or "",
+                    "collection": row[14] or "",
                 })
-        pending.sort(key=lambda x: x["conf"], reverse=True)
+        except Exception as e:
+            logger.warning(f"Failed to gather pending sex suggestions: {e}")
         return pending
 
     def run_ai_boxes(self):
@@ -9622,8 +10064,14 @@ class TrainerWindow(QMainWindow):
 
         results = []
 
-        # Step 1: Clear existing AI boxes
+        # Step 1: Clear existing AI boxes AND suggested tag
         self.current_boxes = [b for b in self.current_boxes if not str(b.get("label", "")).startswith("ai_")]
+        try:
+            self.db.set_suggested_tag(pid, None, None)
+            photo["suggested_tag"] = None
+            photo["suggested_confidence"] = None
+        except Exception as e:
+            print(f"[AI] Warning: Could not clear suggested tag: {e}")
 
         # Step 2: Run MegaDetector
         try:
@@ -9677,7 +10125,7 @@ class TrainerWindow(QMainWindow):
                         if first_label:
                             self.db.set_suggested_tag(pid, first_label, conf)
                             photo["suggested_tag"] = first_label
-                            photo["suggested_tag_confidence"] = conf
+                            photo["suggested_confidence"] = conf
         except Exception as e:
             results.append(f"Classification failed: {e}")
 
@@ -11051,115 +11499,143 @@ class TrainerWindow(QMainWindow):
     # ========== Site Clustering ==========
 
     def run_site_clustering(self):
-        """Auto-detect camera sites using image similarity clustering."""
+        """Auto-detect camera sites using hybrid OCR + visual approach."""
         try:
-            from site_clustering import SiteClusterer, run_site_clustering, suggest_cluster_parameters
+            from site_identifier import SiteIdentifier
         except ImportError as e:
-            QMessageBox.warning(self, "Site Clustering", f"Failed to load clustering module: {e}")
+            QMessageBox.warning(self, "Site Detection", f"Failed to load site identifier: {e}")
             return
 
-        # Check if there are already sites assigned
-        existing_sites = self.db.get_all_sites()
-        unassigned = self.db.get_unassigned_photo_count()
-        total_photos = len(self.db.get_all_photos())
+        # Get photo counts
+        all_photos = self.db.get_all_photos()
+        labeled = [p for p in all_photos if (p.get('camera_location') or '').strip()]
+        unlabeled = [p for p in all_photos if not (p.get('camera_location') or '').strip()]
 
-        if existing_sites:
-            msg = (f"Found {len(existing_sites)} existing site(s) with {total_photos - unassigned} "
-                   f"photos assigned.\n\n{unassigned} photos are unassigned.\n\n"
-                   "What would you like to do?")
-            btn = QMessageBox.question(
-                self, "Site Clustering",
-                msg,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Yes
-            )
-            btn_text = {
-                QMessageBox.StandardButton.Yes: "Cluster unassigned only",
-                QMessageBox.StandardButton.No: "Re-cluster all photos (clears existing sites)",
-            }
-            if btn == QMessageBox.StandardButton.Cancel:
-                return
-            if btn == QMessageBox.StandardButton.No:
-                # Clear existing sites
-                confirm = QMessageBox.question(
-                    self, "Clear Sites",
-                    "This will delete all existing sites and re-cluster all photos. Continue?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if confirm != QMessageBox.StandardButton.Yes:
-                    return
-                for site in existing_sites:
-                    self.db.delete_site(site["id"])
-                self.db.clear_all_embeddings()
+        if not labeled:
+            QMessageBox.warning(self, "Site Detection",
+                "No labeled photos found.\n\n"
+                "Please label some photos with camera locations first\n"
+                "(use the 'Camera Location' field in the photo info panel).")
+            return
 
-        # Get suggested parameters
-        params = suggest_cluster_parameters(self.db)
+        # Get unique locations
+        locations = set(p['camera_location'].strip() for p in labeled)
+
         info_msg = (
-            f"Ready to analyze {params['photo_count']} photos.\n\n"
-            "This will:\n"
-            "1. Extract visual features from each photo (may take a few minutes)\n"
-            "2. Cluster similar backgrounds together\n"
-            "3. Create site SUGGESTIONS for you to review\n\n"
+            f"Ready to auto-detect sites for {len(unlabeled)} unlabeled photos.\n\n"
+            f"Using {len(labeled)} labeled photos from {len(locations)} sites as reference:\n"
+            f"  {', '.join(sorted(locations))}\n\n"
+            "Detection methods:\n"
+            "1. OCR - reads site name from camera text overlay (most accurate)\n"
+            "2. Visual - matches scene appearance (fallback)\n\n"
             "Continue?"
         )
-        if QMessageBox.question(self, "Site Clustering", info_msg,
+        if QMessageBox.question(self, "Site Detection", info_msg,
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                                 ) != QMessageBox.StandardButton.Yes:
             return
 
-        # Run clustering with progress dialog
-        progress = QProgressDialog("Analyzing photos...", "Cancel", 0, 100, self)
+        # Run detection with progress dialog
+        progress = QProgressDialog("Detecting sites...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Auto-Detect Sites")
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.show()
         QCoreApplication.processEvents()
 
+        cancelled = False
+
         def progress_cb(current, total, msg):
+            nonlocal cancelled
+            if progress.wasCanceled():
+                cancelled = True
+                return
             if total > 0:
                 progress.setMaximum(total)
                 progress.setValue(current)
             progress.setLabelText(msg)
             QCoreApplication.processEvents()
-            return not progress.wasCanceled()
 
         try:
-            clusterer = SiteClusterer()
-            if not clusterer.ready:
+            # Create identifier
+            progress.setLabelText("Loading detection models...")
+            QCoreApplication.processEvents()
+
+            identifier = SiteIdentifier(self.db)
+            if not identifier.ready:
                 progress.close()
-                QMessageBox.warning(self, "Site Clustering",
-                    "Clustering model not available. Check torch installation.")
+                QMessageBox.warning(self, "Site Detection",
+                    "Site detection not available.\n"
+                    "Install pytesseract (OCR) and/or PyTorch (visual).")
                 return
 
-            result = run_site_clustering(
-                self.db,
-                clusterer=clusterer,
-                eps=params["eps"],
-                min_samples=params["min_samples"],
-                confidence_threshold=params.get("confidence_threshold", 0.7),
-                incremental=True,
-                progress_callback=progress_cb
-            )
+            # Build reference embeddings from labeled photos
+            progress.setLabelText("Building site references from labeled photos...")
+            QCoreApplication.processEvents()
+            identifier.build_site_references(labeled, samples_per_site=20)
+
+            # Process unlabeled photos
+            ocr_count = 0
+            semantic_count = 0
+            failed_count = 0
+            by_site = {}
+
+            for i, photo in enumerate(unlabeled):
+                if cancelled:
+                    break
+
+                path = photo.get('file_path')
+                if not path:
+                    failed_count += 1
+                    continue
+
+                result = identifier.identify_site(path)
+
+                if result:
+                    site_name, confidence, method = result
+
+                    # Save suggestion to database
+                    site = self.db.get_site_by_name(site_name)
+                    if site:
+                        self.db.set_photo_site_suggestion(photo['id'], site['id'], confidence)
+                    else:
+                        site_id = self.db.create_site(site_name, confirmed=True)
+                        self.db.set_photo_site_suggestion(photo['id'], site_id, confidence)
+
+                    by_site[site_name] = by_site.get(site_name, 0) + 1
+
+                    if method == "ocr":
+                        ocr_count += 1
+                    else:
+                        semantic_count += 1
+                else:
+                    failed_count += 1
+
+                if (i + 1) % 10 == 0:
+                    progress_cb(i + 1, len(unlabeled),
+                        f"OCR: {ocr_count}, Visual: {semantic_count}, Undetected: {failed_count}")
+
             progress.close()
 
-            if "error" in result:
-                QMessageBox.warning(self, "Site Clustering", result["error"])
+            if cancelled:
+                QMessageBox.information(self, "Site Detection", "Detection cancelled.")
                 return
 
-            # Build detailed results message
-            matched_existing = result.get('photos_matched_existing', 0)
-            low_conf = result.get('low_confidence_count', 0)
-            msg = (f"Site clustering complete!\n\n"
-                   f"⭐ Site suggestions created: {result['sites_created']}\n"
-                   f"Photos suggested (high confidence): {result['photos_assigned']}\n")
-            if matched_existing > 0:
-                msg += f"Matched to existing sites: {matched_existing}\n"
-            if low_conf > 0:
-                msg += f"Low confidence (kept unassigned): {low_conf}\n"
-            msg += f"Unassigned (need more data): {result['noise_count']}\n\n"
-            msg += "Go to Tools → Manage Sites to review and confirm suggestions.\n"
-            msg += "Run again later to assign more photos as confidence grows."
-            QMessageBox.information(self, "Site Clustering", msg)
+            # Show results
+            total_detected = ocr_count + semantic_count
+            msg = (f"Site detection complete!\n\n"
+                   f"Detected via OCR (text overlay): {ocr_count}\n"
+                   f"Detected via visual matching: {semantic_count}\n"
+                   f"Could not detect: {failed_count}\n\n")
+
+            if by_site:
+                msg += "By site:\n"
+                for site, count in sorted(by_site.items()):
+                    msg += f"  {site}: {count}\n"
+                msg += "\n"
+
+            msg += "Go to Tools → Manage Sites to review suggestions."
+            QMessageBox.information(self, "Site Detection", msg)
 
             # Refresh UI
             self._populate_site_filter_options()
@@ -11168,7 +11644,9 @@ class TrainerWindow(QMainWindow):
 
         except Exception as e:
             progress.close()
-            QMessageBox.warning(self, "Site Clustering", f"Clustering failed: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "Site Detection", f"Detection failed: {e}")
 
     def manage_sites(self):
         """Open dialog to view/rename/confirm/reject sites."""

@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Quick Start:**
+> 1. Check `TASKS.md` first - see what other Claudes are working on
+> 2. Use `INDEX.md` to find the right doc for your task
+
 ## Role & Communication Style
 
 You are a **senior software engineer** specializing in building useful, not-complicated software. When starting a session:
@@ -220,6 +224,10 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 - **cuddelink_downloader.py** - CuddeLink camera cloud photo scraper
 - **duplicate_dialog.py** - Find duplicates by MD5 hash
 - **compare_window.py** - Side-by-side photo comparison (up to 4)
+- **site_identifier.py** - Hybrid site detection (OCR + visual)
+- **site_detector.py** - OCR-based site detection from camera text overlays
+- **site_embedder.py** - MobileNetV2 semantic scene embeddings
+- **site_clustering.py** - Legacy edge-based clustering (replaced by hybrid)
 
 ### Tools (tools/) - Standalone utility scripts
 - **windows_fix.py** - Windows database diagnostics and maintenance
@@ -311,7 +319,70 @@ When the user is looking for something to run overnight or while away:
 
 ---
 
-## Recent Session (Jan 8-9, 2026)
+## Recent Session (Jan 14, 2026)
+
+### Buck/Doe Review Queue Improvements
+
+**Collection Filter Added:**
+- Added collection dropdown filter to the buck/doe review queue dialog
+- Users can now filter pending suggestions by collection (e.g., "Brooke Farm")
+
+**Properties Button Fixed:**
+- Fixed bug where clicking "Properties" didn't navigate to the correct photo
+- Root cause: Target photo was archived and excluded from `self.photos` by default
+- Fix: Now loads photos with `include_archived=True` and sets archive filter to "All Photos"
+
+**N+1 Query Optimization:**
+- Fixed app lockup (198% CPU) when opening review queue
+- Changed from N+1 queries (7500+ DB queries) to single SQL JOIN query
+- Review queue now opens instantly
+
+**Key Files Changed:**
+- `training/label_tool.py` - Review queue dialog (`_open_sex_review_dialog`)
+
+### Site Identification - Hybrid OCR + Visual Approach
+
+**Problem:** Previous edge-based site clustering had poor accuracy (~50-60%). Needed a better way to identify which camera site a photo came from.
+
+**Solution:** Hybrid approach that tries OCR first, falls back to visual matching:
+
+1. **OCR Detection** (`site_detector.py`) - 91% accuracy
+   - Reads text overlay burned into images by cameras
+   - Extracts site names like "RAYS LINE 003", "SALT LICK E 002"
+   - Maps camera text to database site names
+
+2. **Semantic Embeddings** (`site_embedder.py`) - 70% accuracy
+   - Uses MobileNetV2 (pre-trained on ImageNet)
+   - Creates "scene fingerprints" for visual matching
+   - Masks out detected animals before computing embeddings
+   - Falls back when cameras don't have text overlays
+
+3. **Hybrid Identifier** (`site_identifier.py`)
+   - Tries OCR first (most reliable when available)
+   - Falls back to semantic matching when OCR fails
+   - Builds reference embeddings from labeled photos
+
+**Results on labeled photos:**
+- 90% detected via OCR (96.7% accurate)
+- 10% fell back to semantic (40% accurate)
+- 91% overall accuracy (up from ~50-60%)
+
+**Integration:**
+- Tools → Auto-Detect Sites now uses hybrid approach
+- Shows detection method breakdown (OCR vs Visual)
+- Updated `run_site_clustering()` in `label_tool.py`
+
+**Database Changes:**
+- `get_embedding()` now returns `(bytes, version)` tuple
+- `get_all_embeddings()` now returns `(photo_id, bytes, version)` tuples
+
+**Known Limitation:**
+- "West Salt Lick" and "West Triangle" share camera text "WEST OF ROAD 004"
+- These get confused; would need visual features to disambiguate
+
+---
+
+## Session (Jan 8-9, 2026)
 
 ### Mobile App - Google Play Store Submission
 
