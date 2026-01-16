@@ -6,7 +6,7 @@ on:
       version:
         description: 'Version tag (e.g., v1.0.5)'
         required: true
-        default: 'v1.0.8'
+        default: 'v1.0.9'
 
 permissions:
   contents: write
@@ -79,12 +79,10 @@ jobs:
           2. Extract to a folder
           3. Run TrailCamOrganizer.exe
 
-          ### What's New in v1.0.8
-          - Fixed Supabase config loading from bundled cloud_config.json
-          - R2 and Supabase now work out of the box
-          - All features from v1.0.6:
-            - Automatic cloud sync on photo changes
-            - Hybrid site detection (OCR + visual matching)
-            - Standardized species list and improved filter UX
+          ### What's New in v1.0.9
+          - Integrated cloud sync into consumer app
+          - Auto-syncs labels to Supabase when you make changes
+          - Status indicator shows sync state (☁️ idle, ⏳ pending, 🔄 syncing)
+          - R2 and Supabase credentials bundled - works out of the box
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

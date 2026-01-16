@@ -30,6 +30,8 @@ from compare_window import CompareWindow
 from ai_detection import MegaDetectorV5
 from ai_suggester import SpeciesSuggester, BuckDoeSuggester
 from cuddelink_downloader import download_new_photos, check_server_status
+import supabase_rest
+from sync_manager import SyncManager
 
 # Common species for quick labeling
 QUICK_SPECIES = ["Empty", "Deer", "Turkey", "Raccoon", "Coyote", "Squirrel"]
@@ -230,6 +232,10 @@ class OrganizerWindow(QMainWindow):
         # Apply dark theme
         self.setStyleSheet(DARK_STYLE)
 
+        # Cloud sync
+        self.sync_manager = None
+        self._init_sync()
+
     def _load_ai_models(self):
         """Load AI detection and classification models."""
         try:
@@ -243,6 +249,50 @@ class OrganizerWindow(QMainWindow):
             logger.info(f"Loaded species model with {len(self.species_suggester.labels)} labels")
         except Exception as e:
             logger.warning(f"Could not load species model: {e}")
+
+    def _init_sync(self):
+        """Initialize cloud sync if configured."""
+        try:
+            client = supabase_rest.get_client()
+            if client and client.is_configured():
+                self.sync_manager = SyncManager(self.db, lambda: supabase_rest.get_client())
+                self.sync_manager.status_changed.connect(self._on_sync_status_changed)
+                self.sync_manager.sync_completed.connect(self._on_sync_completed)
+                self.sync_manager.sync_failed.connect(self._on_sync_failed)
+                logger.info("Cloud sync initialized")
+                self._update_sync_status("idle")
+            else:
+                logger.info("Supabase not configured, cloud sync disabled")
+        except Exception as e:
+            logger.warning(f"Could not initialize cloud sync: {e}")
+
+    def _on_sync_status_changed(self, status: str):
+        """Handle sync status changes."""
+        self._update_sync_status(status)
+
+    def _on_sync_completed(self, count: int):
+        """Handle sync completion."""
+        if count > 0:
+            self.status_label.setText(f"Synced {count} items to cloud")
+        else:
+            self.status_label.setText("Cloud sync complete")
+
+    def _on_sync_failed(self, error: str):
+        """Handle sync failure."""
+        logger.error(f"Cloud sync failed: {error}")
+        self.status_label.setText("Sync failed - will retry")
+
+    def _update_sync_status(self, status: str):
+        """Update the sync status indicator."""
+        status_icons = {
+            'idle': '☁️',
+            'pending': '⏳',
+            'syncing': '🔄',
+            'offline': '📴'
+        }
+        icon = status_icons.get(status, '')
+        if icon:
+            self.status_label.setText(f"{icon} {status.capitalize()}")
 
     def _setup_ui(self):
         """Build the main UI."""
@@ -1260,6 +1310,10 @@ class OrganizerWindow(QMainWindow):
             self.suggestion_banner.hide()
 
         self.status_label.setText("Saved")
+
+        # Queue cloud sync
+        if self.sync_manager:
+            self.sync_manager.queue_change()
 
     def _accept_suggestion(self):
         """Accept the AI suggestion."""
