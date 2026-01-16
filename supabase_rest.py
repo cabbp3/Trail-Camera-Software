@@ -2,8 +2,22 @@
 Simple Supabase REST API client using only the requests library.
 This eliminates the need for the supabase package which requires C++ build tools on Windows.
 """
-import requests
+import json
+import logging
+import sys
+from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Config file locations (checked in order)
+USER_CONFIG_PATH = Path.home() / ".trailcam" / "supabase_config.json"
+BUNDLED_CONFIG_PATH = Path(__file__).parent / "cloud_config.json"
+
+# Cached client instance
+_cached_client: Optional['SupabaseRestClient'] = None
 
 
 class SupabaseResponse:
@@ -173,3 +187,70 @@ class SupabaseRestClient:
 def create_client(url: str, key: str) -> SupabaseRestClient:
     """Create a Supabase REST client (drop-in replacement for supabase.create_client)."""
     return SupabaseRestClient(url, key)
+
+
+def _load_config() -> Optional[Dict]:
+    """Load Supabase credentials from config file.
+
+    Checks in order:
+    1. User config (~/.trailcam/supabase_config.json)
+    2. Bundled config (cloud_config.json in app folder)
+    """
+    config = None
+
+    # Try user config first
+    if USER_CONFIG_PATH.exists():
+        try:
+            with open(USER_CONFIG_PATH) as f:
+                config = json.load(f)
+            logger.info("Using user Supabase config")
+            return config
+        except Exception as e:
+            logger.warning(f"Failed to load user Supabase config: {e}")
+
+    # Fall back to bundled config
+    if BUNDLED_CONFIG_PATH.exists():
+        try:
+            with open(BUNDLED_CONFIG_PATH) as f:
+                data = json.load(f)
+                config = data.get("supabase", data)  # Handle nested or flat format
+            logger.info("Using bundled Supabase config")
+            return config
+        except Exception as e:
+            logger.warning(f"Failed to load bundled Supabase config: {e}")
+
+    logger.warning("No Supabase config found")
+    return None
+
+
+def get_client() -> Optional[SupabaseRestClient]:
+    """Get a configured Supabase client.
+
+    Loads credentials from config files and returns a cached client instance.
+    Returns None if no valid config is found.
+    """
+    global _cached_client
+
+    if _cached_client is not None:
+        return _cached_client
+
+    config = _load_config()
+    if not config:
+        return None
+
+    url = config.get("url")
+    key = config.get("key")
+
+    if not url or not key:
+        logger.error("Supabase config missing 'url' or 'key'")
+        return None
+
+    _cached_client = SupabaseRestClient(url, key)
+    logger.info(f"Supabase client initialized for: {url}")
+    return _cached_client
+
+
+def is_configured() -> bool:
+    """Check if Supabase is configured and accessible."""
+    client = get_client()
+    return client is not None and client.is_configured()
