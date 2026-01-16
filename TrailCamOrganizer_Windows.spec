@@ -32,7 +32,9 @@ datas = [
     ('version.py', '.'),
     ('r2_storage.py', '.'),
     ('user_config.py', '.'),
-    ('cloud_config.json', '.'),
+    ('site_detector.py', '.'),
+    ('site_embedder.py', '.'),
+    ('site_identifier.py', '.'),
 ]
 datas += pyqt6_datas
 
@@ -72,8 +74,12 @@ hiddenimports = [
     'version',
     'r2_storage',
     'user_config',
+    'site_detector',
+    'site_embedder',
+    'site_identifier',
     'boto3',
     'botocore',
+    'pytesseract',
 ]
 hiddenimports += pyqt6_hiddenimports
 hiddenimports += collect_submodules('PIL')
