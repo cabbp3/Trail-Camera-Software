@@ -391,3 +391,47 @@ Stage 1 ──► Stage 2 ──► Stage 3 ──► Stage 4 ──► Stage 5
 - Build UI to show "similar deer" suggestions
 - Test matching accuracy on known bucks
 - Consider body markings, not just antlers (for year-round ID)
+
+---
+
+### Ensemble Methods for Confidence Calibration
+
+**Concept:** Train multiple models that focus on different features, then combine predictions for better accuracy and confidence estimation.
+
+**Why this helps:**
+- Different models catch different edge cases
+- Model disagreement = natural confidence signal
+- "All 3 models agree" is more trustworthy than "1 model says 95%"
+
+**Potential ensemble members:**
+
+| Model | Focus | Input |
+|-------|-------|-------|
+| Model A | Overall appearance | Full detection crop |
+| Model B | Body shape/silhouette | Edge-detected or masked image |
+| Model C | Body proportions | Aspect ratio, height-to-length ratio |
+| Model D | Texture/fur pattern | High-frequency features |
+
+**Size as a feature:**
+- Absolute size doesn't work (animals appear smaller when farther away)
+- **Proportions are scale-invariant** - deer have different height/length ratios than coyotes
+- Aspect ratio of bounding box already captures some of this
+- Could add explicit proportion features: leg length vs body, head size vs body
+
+**Confidence from agreement:**
+- All models agree → Very high confidence
+- 3/4 agree → High confidence
+- 2/4 agree → Low confidence, flag for human review
+- Disagreement pattern may indicate specific confusion (e.g., Coyote vs Fox)
+
+**Implementation approach:**
+1. **Simple start:** Train same architecture with different augmentations, average predictions (low effort, often effective)
+2. **Medium:** Train different architectures (ResNet + EfficientNet + ViT)
+3. **Advanced:** Train on different input representations (RGB, edges, masked)
+
+**Best use case:**
+- Species model at 97% - marginal gains expected
+- Buck/doe model at 84% - ensemble could help more here
+- **Biggest win:** Knowing *when* to trust the model
+
+**Status:** Future idea - consider after buck/doe accuracy improves with more Doe training data

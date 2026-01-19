@@ -60,7 +60,7 @@ Key capabilities:
 ### High Priority
 - [ ] Fix buck/doe model bias (97% predicts Buck) - need more Doe training data
 - [ ] Get Android app to production (need testers)
-- [ ] Add annotation_boxes to `pull_from_supabase()` (data loss risk)
+- [x] Add annotation_boxes to `pull_from_supabase()` (data loss risk) - Fixed Jan 18
 
 ### Medium Priority
 - [ ] Build iOS app (Flutter makes this straightforward)

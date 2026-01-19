@@ -19,6 +19,7 @@
 
 ## Recently Completed
 
+- (Jan 18) Fixed `pull_from_supabase()` to include annotation_boxes - was missing entirely, now syncs box coordinates, species, sex, and head annotations
 - (Jan 14) [W8KP] Fixed Properties button in buck/doe review queue - now correctly navigates to photo (even if archived) by resetting filters and refreshing photo list
 - (Jan 14) [Q3KJ] Added collection filter to buck/doe review queue - filter by collection when reviewing pending suggestions
 - (Jan 14) [P7XM] Fixed mobile app "!" errors: uploaded 47 missing thumbnails to R2, deleted 130 duplicate Supabase records, fixed mobile compile error (finalHashes scope bug from M3QP changes)

@@ -16,6 +16,43 @@ logger = logging.getLogger(__name__)
 EXIF_MODEL = 0x0110  # 272 - Camera model
 EXIF_DATETIME = 0x0132  # 306 - DateTime
 EXIF_DATETIME_ORIGINAL = 0x9003  # 36867 - DateTimeOriginal
+EXIF_USER_COMMENT = 0x9286  # 37510 - UserComment (contains camera ID for CuddeLink)
+
+
+def _sanitize_camera_model(value: str) -> Optional[str]:
+    """Sanitize camera_model to prevent corrupted EXIF data from causing sync issues.
+
+    Returns None if the value is clearly garbage (mostly non-printable chars).
+    """
+    if not value:
+        return None
+
+    # Convert to string and strip
+    value = str(value).strip()
+    if not value:
+        return None
+
+    # Remove null bytes and other control characters
+    cleaned = ''.join(c for c in value if c.isprintable() or c in ' \t')
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        return None
+
+    # Check if it's mostly garbage (less than 50% alphanumeric/space)
+    alnum_count = sum(1 for c in cleaned if c.isalnum() or c in ' -_')
+    if len(cleaned) > 0 and alnum_count / len(cleaned) < 0.5:
+        return None
+
+    # Reject if it looks like date fragments (common corruption pattern)
+    if len(cleaned) > 3 and cleaned[0].isdigit() and '/' in cleaned:
+        return None
+
+    # Truncate very long values (likely corruption)
+    if len(cleaned) > 50:
+        cleaned = cleaned[:50]
+
+    return cleaned if cleaned else None
 
 
 def get_library_path() -> Path:
@@ -66,7 +103,7 @@ def extract_exif_data(image_path: str) -> Tuple[Optional[str], Optional[str]]:
                             pass
                 
                 elif tag_id == EXIF_MODEL:
-                    camera_model = str(value).strip()
+                    camera_model = _sanitize_camera_model(value)
             
             # If no date found in EXIF, try file modification time
             if date_taken is None:
@@ -88,6 +125,83 @@ def extract_exif_data(image_path: str) -> Tuple[Optional[str], Optional[str]]:
             return dt.isoformat(), None
         except OSError:
             return None, None
+
+
+def _get_cuddelink_user_comment(image_path: str) -> Optional[str]:
+    """Extract UserComment field from CuddeLink EXIF data."""
+    import re
+    try:
+        with Image.open(image_path) as img:
+            exifdata = img.getexif()
+            if exifdata is None:
+                return None
+
+            # Get IFD (EXIF sub-IFD) for UserComment
+            exif_ifd = exifdata.get_ifd(0x8769)  # ExifOffset IFD
+            if not exif_ifd:
+                return None
+
+            user_comment = exif_ifd.get(EXIF_USER_COMMENT)
+            if not user_comment:
+                return None
+
+            # UserComment can be bytes or string
+            if isinstance(user_comment, bytes):
+                try:
+                    user_comment = user_comment.decode('utf-8', errors='ignore').strip('\x00')
+                except:
+                    user_comment = str(user_comment)
+
+            return str(user_comment)
+    except Exception as e:
+        logger.debug(f"Error extracting UserComment from {image_path}: {e}")
+        return None
+
+
+def extract_cuddelink_camera_id(image_path: str) -> Optional[str]:
+    """Extract camera ID (location name) from CuddeLink EXIF UserComment field.
+
+    CuddeLink cameras store metadata in UserComment like:
+    "MR=C.1,AD=8/11/2025,...,ID=SALT LICK E,LO=002,MA=1328AD88A36E,..."
+
+    Args:
+        image_path: Path to the image file
+
+    Returns:
+        Camera ID string (e.g., "SALT LICK E") or None if not found
+    """
+    import re
+    user_comment = _get_cuddelink_user_comment(image_path)
+    if not user_comment:
+        return None
+
+    match = re.search(r'ID=([^,]+)', user_comment)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def extract_cuddelink_mac_address(image_path: str) -> Optional[str]:
+    """Extract camera MAC address (unique hardware ID) from CuddeLink EXIF.
+
+    The MAC address is unique to each physical camera and doesn't change
+    when the camera is moved to a new location.
+
+    Args:
+        image_path: Path to the image file
+
+    Returns:
+        MAC address string (e.g., "1328AD88A36E") or None if not found
+    """
+    import re
+    user_comment = _get_cuddelink_user_comment(image_path)
+    if not user_comment:
+        return None
+
+    match = re.search(r'MA=([^,]+)', user_comment)
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 def generate_new_filename(date_taken: Optional[str], camera_model: Optional[str]) -> str:

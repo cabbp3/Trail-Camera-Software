@@ -26,7 +26,7 @@ from r2_upload_queue import R2UploadManager
 
 logger = logging.getLogger(__name__)
 
-from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QCoreApplication, QSettings, QPoint, QRect, QSize, QThread, QDate
+from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QCoreApplication, QSettings, QPoint, QRect, QSize, QThread, QDate, QEventLoop
 from PyQt6.QtGui import QPixmap, QIcon, QAction, QPen, QShortcut, QKeySequence, QColor, QBrush, QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -75,10 +75,167 @@ from PyQt6.QtWidgets import (
 )
 import PyQt6  # used for plugin path detection
 import sysconfig
+from PyQt6.QtGui import QStandardItemModel, QStandardItem
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from database import TrailCamDatabase  # noqa: E402
 from preview_window import ImageGraphicsView  # reuse zoom/pan behavior
+
+
+class CheckableComboBox(QComboBox):
+    """A combo box with checkable items for multi-select filtering."""
+    selectionChanged = pyqtSignal()  # Emitted when selection changes
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self._all_text = "All"
+        self._placeholder = "Select..."
+        self.view().pressed.connect(self._on_item_pressed)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText(self._placeholder)
+        self._updating = False
+
+    def set_all_text(self, text: str):
+        """Set the text for the 'All' option."""
+        self._all_text = text
+        if self._model.rowCount() > 0:
+            self._model.item(0).setText(text)
+
+    def add_item(self, text: str, data=None, checked: bool = False):
+        """Add a checkable item."""
+        item = QStandardItem(text)
+        item.setCheckable(True)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        item.setData(data if data is not None else text, Qt.ItemDataRole.UserRole)
+        self._model.appendRow(item)
+        self._update_display()
+
+    def add_items(self, items: list):
+        """Add multiple items. Items can be strings or (text, data) tuples."""
+        for item in items:
+            if isinstance(item, tuple):
+                self.add_item(item[0], item[1])
+            else:
+                self.add_item(item, item)
+
+    def clear(self):
+        """Clear all items."""
+        self._model.clear()
+
+    def _on_item_pressed(self, index):
+        """Handle item click - toggle checkbox."""
+        item = self._model.itemFromIndex(index)
+        if item is None:
+            return
+
+        self._updating = True
+        if item.checkState() == Qt.CheckState.Checked:
+            item.setCheckState(Qt.CheckState.Unchecked)
+        else:
+            item.setCheckState(Qt.CheckState.Checked)
+
+        # If "All" is clicked, affect all other items
+        if index.row() == 0:
+            all_checked = item.checkState() == Qt.CheckState.Checked
+            for i in range(1, self._model.rowCount()):
+                self._model.item(i).setCheckState(
+                    Qt.CheckState.Checked if all_checked else Qt.CheckState.Unchecked
+                )
+        else:
+            # If any item is unchecked, uncheck "All"
+            # If all items are checked, check "All"
+            all_checked = all(
+                self._model.item(i).checkState() == Qt.CheckState.Checked
+                for i in range(1, self._model.rowCount())
+            )
+            self._model.item(0).setCheckState(
+                Qt.CheckState.Checked if all_checked else Qt.CheckState.Unchecked
+            )
+
+        self._updating = False
+        self._update_display()
+        self.selectionChanged.emit()
+
+    def _update_display(self):
+        """Update the displayed text based on selection."""
+        if self._updating:
+            return
+        selected = self.get_checked_data()
+        if not selected or len(selected) == self._model.rowCount() - 1:
+            # None selected or all selected
+            self.lineEdit().setText(self._all_text)
+        elif len(selected) == 1:
+            # Single selection - show the item text
+            for i in range(1, self._model.rowCount()):
+                item = self._model.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    self.lineEdit().setText(item.text())
+                    break
+        else:
+            # Multiple selections - show count
+            self.lineEdit().setText(f"{len(selected)} selected")
+
+    def get_checked_data(self) -> list:
+        """Get list of data values for checked items (excluding 'All')."""
+        result = []
+        for i in range(1, self._model.rowCount()):
+            item = self._model.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                result.append(item.data(Qt.ItemDataRole.UserRole))
+        return result
+
+    def get_checked_texts(self) -> list:
+        """Get list of text values for checked items (excluding 'All')."""
+        result = []
+        for i in range(1, self._model.rowCount()):
+            item = self._model.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                result.append(item.text())
+        return result
+
+    def set_checked_data(self, data_list: list):
+        """Set which items are checked by their data values."""
+        self._updating = True
+        data_set = set(data_list)
+        for i in range(1, self._model.rowCount()):
+            item = self._model.item(i)
+            item_data = item.data(Qt.ItemDataRole.UserRole)
+            item.setCheckState(
+                Qt.CheckState.Checked if item_data in data_set else Qt.CheckState.Unchecked
+            )
+        # Update "All" checkbox
+        all_checked = all(
+            self._model.item(i).checkState() == Qt.CheckState.Checked
+            for i in range(1, self._model.rowCount())
+        ) if self._model.rowCount() > 1 else True
+        self._model.item(0).setCheckState(
+            Qt.CheckState.Checked if all_checked else Qt.CheckState.Unchecked
+        )
+        self._updating = False
+        self._update_display()
+
+    def select_all(self):
+        """Select all items."""
+        self._updating = True
+        for i in range(self._model.rowCount()):
+            self._model.item(i).setCheckState(Qt.CheckState.Checked)
+        self._updating = False
+        self._update_display()
+
+    def hidePopup(self):
+        """Override to keep popup open when clicking items."""
+        # Don't hide - let user check multiple items
+        pass
+
+    def mousePressEvent(self, event):
+        """Show/hide popup on click."""
+        if self.view().isVisible():
+            self.view().hide()
+        else:
+            self.showPopup()
 
 
 def get_model_version(model_type: str = "species") -> str:
@@ -235,7 +392,7 @@ from compare_window import CompareWindow
 from ai_suggester import CombinedSuggester
 from duplicate_dialog import DuplicateDialog, HashCalculationThread
 from stamp_reader import StampReader
-from image_processor import import_photo, create_thumbnail
+from image_processor import import_photo, create_thumbnail, extract_cuddelink_camera_id, extract_cuddelink_mac_address
 from cuddelink_downloader import download_new_photos, check_server_status
 
 # Ensure Qt finds the platform plugin (Cocoa on macOS, qwindows on Windows) and image plugins
@@ -341,6 +498,7 @@ SPECIES_OPTIONS = [
     "Turkey Buzzard",
     "Unknown",
     "Vehicle",
+    "Verification",
 ]
 SEX_TAGS = {"buck", "doe"}
 
@@ -503,33 +661,49 @@ class AIWorker(QThread):
 
     # Signals emitted during processing
     progress = pyqtSignal(int, int, str)  # current, total, message
-    photo_processed = pyqtSignal(dict)  # {id, species, species_conf, sex, sex_conf}
-    finished_all = pyqtSignal(int, int)  # species_count, sex_count
+    photo_processed = pyqtSignal(dict)  # {id, species, species_conf, sex, sex_conf, boxes_added, heads_added}
+    finished_all = pyqtSignal(dict)  # counts dict with all stats
     error = pyqtSignal(str)  # error message
 
-    def __init__(self, photos: list, db, suggester, detector_getter, parent=None):
+    def __init__(self, photos: list, db, suggester, detector_getter, parent=None, options=None):
         super().__init__(parent)
         self.photos = photos
         self.db = db
         self.suggester = suggester
         self._get_detector = detector_getter
         self._cancelled = False
+        # Options control which AI steps to run
+        self.options = options or {
+            "detect_boxes": True,
+            "species_id": True,
+            "deer_head_boxes": True,
+            "buck_doe": True
+        }
 
     def cancel(self):
         self._cancelled = True
 
     def run(self):
         """Run AI processing in background thread."""
-        total = len(self.photos)
-        species_count = 0
-        sex_count = 0
-
-        # Get detector (may need to load model)
         try:
-            detector, names = self._get_detector()
+            self._run_impl()
         except Exception as e:
-            self.error.emit(f"Failed to load detector: {e}")
-            return
+            logger.error(f"AIWorker crashed: {e}", exc_info=True)
+            self.error.emit(f"AI processing crashed: {e}")
+
+    def _run_impl(self):
+        """Internal implementation of run()."""
+        total = len(self.photos)
+        counts = {"detect": 0, "species": 0, "heads": 0, "sex": 0}
+
+        # Get detector if needed for any detection step
+        detector, names = None, None
+        if self.options.get("detect_boxes") or self.options.get("deer_head_boxes"):
+            try:
+                detector, names = self._get_detector()
+            except Exception as e:
+                self.error.emit(f"Failed to load detector: {e}")
+                return
 
         for i, p in enumerate(self.photos):
             if self._cancelled:
@@ -543,87 +717,89 @@ class AIWorker(QThread):
                 "species": None,
                 "species_conf": 0,
                 "sex": None,
-                "sex_conf": 0
+                "sex_conf": 0,
+                "boxes_added": False,
+                "heads_added": False
             }
 
             try:
-                # Run detection if no boxes exist
-                self._ensure_detection_boxes(p, detector, names)
+                pid = p.get("id")
+                crop = None
 
-                # Check detection boxes and auto-classify based on MegaDetector
-                boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
-                has_person = any(b.get("label") == "ai_person" for b in boxes)
-                has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
-                has_animal = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+                # Step 1: Detect subject boxes (MegaDetector)
+                if self.options.get("detect_boxes"):
+                    if self._ensure_detection_boxes(p, detector, names):
+                        result["boxes_added"] = True
+                        counts["detect"] += 1
 
-                label = None
-                conf = None
+                # Step 2: Species ID
+                if self.options.get("species_id"):
+                    boxes = self.db.get_boxes(pid) if pid else []
+                    has_person = any(b.get("label") == "ai_person" for b in boxes)
+                    has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
+                    has_animal = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
 
-                if has_person:
-                    # MegaDetector found person - auto-classify as Person
-                    label, conf = "Person", 0.95
-                elif has_vehicle:
-                    # MegaDetector found vehicle - auto-classify as Vehicle
-                    label, conf = "Vehicle", 0.95
-                elif has_animal:
-                    # Run classifier on animal crop
-                    crop = self._best_crop_for_photo(p)
-                    path = str(crop) if crop else p.get("file_path")
-                    res = self.suggester.predict(path)
-                    if res:
-                        label, conf = res
-                        # If classifier says Empty but detector found animals, use Unknown
-                        # Also convert "Other" to "Unknown" - Other is for manual entry only
-                        if label in ("Empty", "Other"):
-                            label = "Unknown"
-                            conf = 0.5
-                    if crop:
-                        try:
-                            Path(crop).unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                else:
-                    # No detections at all - suggest Empty
-                    label, conf = "Empty", 0.95
+                    label = None
+                    conf = None
 
-                if label:
-                    self.db.set_suggested_tag(p["id"], label, conf)
-                    result["species"] = label
-                    result["species_conf"] = conf
-                    species_count += 1
+                    if has_person:
+                        label, conf = "Person", 0.95
+                    elif has_vehicle:
+                        label, conf = "Vehicle", 0.95
+                    elif has_animal:
+                        crop = self._best_crop_for_photo(p)
+                        path = str(crop) if crop else p.get("file_path")
+                        res = self.suggester.predict(path) if self.suggester else None
+                        if res:
+                            label, conf = res
+                            if label in ("Empty", "Other"):
+                                label = "Unknown"
+                                conf = 0.5
+                    else:
+                        label, conf = "Empty", 0.95
 
-                    # If Deer, also suggest buck/doe
-                    if label == "Deer":
-                                self._add_deer_head_boxes(p, detector, names)
-                                if self.suggester.buckdoe_ready:
-                                    head_crop = self._best_head_crop_for_photo(p)
-                                    if head_crop:
-                                        sex_res = self.suggester.predict_sex(str(head_crop))
-                                        if sex_res:
-                                            sex_label, sex_conf = sex_res
-                                            self.db.set_suggested_sex(p["id"], sex_label, sex_conf)
-                                            result["sex"] = sex_label
-                                            result["sex_conf"] = sex_conf
-                                            sex_count += 1
-                                        try:
-                                            Path(head_crop).unlink(missing_ok=True)
-                                        except Exception:
-                                            pass
+                    if label and pid:
+                        self.db.set_suggested_tag(pid, label, conf)
+                        result["species"] = label
+                        result["species_conf"] = conf
+                        counts["species"] += 1
 
-                    if crop:
-                        try:
-                            Path(crop).unlink(missing_ok=True)
-                        except Exception:
-                            pass
+                        # Step 3 & 4: If Deer, handle head detection and buck/doe
+                        if label == "Deer":
+                            if self.options.get("deer_head_boxes"):
+                                if self._add_deer_head_boxes(p, detector, names):
+                                    result["heads_added"] = True
+                                    counts["heads"] += 1
+
+                            if self.options.get("buck_doe") and self.suggester and self.suggester.buckdoe_ready:
+                                head_crop = self._best_head_crop_for_photo(p)
+                                if head_crop:
+                                    sex_res = self.suggester.predict_sex(str(head_crop))
+                                    if sex_res:
+                                        sex_label, sex_conf = sex_res
+                                        self.db.set_suggested_sex(pid, sex_label, sex_conf)
+                                        result["sex"] = sex_label
+                                        result["sex_conf"] = sex_conf
+                                        counts["sex"] += 1
+                                    try:
+                                        Path(head_crop).unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+
+                # Clean up crop
+                if crop:
+                    try:
+                        Path(crop).unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 logger.warning(f"AI processing failed for photo {p.get('id')}: {e}")
 
             # Emit result for this photo
-            if result["species"]:
-                self.photo_processed.emit(result)
+            self.photo_processed.emit(result)
 
-        self.finished_all.emit(species_count, sex_count)
+        self.finished_all.emit(counts)
 
     def _ensure_detection_boxes(self, photo: dict, detector, names) -> bool:
         """Run detector on photo if it has no boxes."""
@@ -850,6 +1026,224 @@ class AIOptionsDialog(QDialog):
             "deer_head_boxes": self.step_deer_head_boxes.isChecked(),
             "buck_doe": self.step_buck_doe.isChecked(),
         }
+
+
+class TightwadComparisonDialog(QDialog):
+    """Dialog for reviewing Tightwad House photos where AI disagrees with existing labels."""
+    photo_selected = pyqtSignal(int)  # Emits photo_id when user wants to view in main app
+
+    def __init__(self, parent, items: list, db, queue_file: str):
+        super().__init__(parent)
+        self.items = items
+        self.db = db
+        self.queue_file = queue_file
+        self.current_index = 0
+
+        self.setWindowTitle(f"Tightwad Comparison Review ({len(items)} photos)")
+        self.resize(900, 700)
+
+        layout = QVBoxLayout(self)
+
+        # Header with progress
+        header = QHBoxLayout()
+        self.progress_label = QLabel(f"1 / {len(items)}")
+        self.progress_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        header.addWidget(self.progress_label)
+        header.addStretch()
+
+        skip_btn = QPushButton("Skip")
+        skip_btn.clicked.connect(self._skip)
+        header.addWidget(skip_btn)
+
+        layout.addLayout(header)
+
+        # Image display
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(600, 400)
+        self.image_label.setStyleSheet("background-color: #222;")
+        layout.addWidget(self.image_label, 1)
+
+        # Comparison info
+        info_frame = QFrame()
+        info_frame.setStyleSheet("QFrame { background-color: #333; border-radius: 6px; padding: 10px; }")
+        info_layout = QHBoxLayout(info_frame)
+
+        self.old_label = QLabel()
+        self.old_label.setStyleSheet("font-size: 16px; color: #f88;")
+        self.ai_label = QLabel()
+        self.ai_label.setStyleSheet("font-size: 16px; color: #8f8;")
+
+        info_layout.addWidget(QLabel("Old Label:"))
+        info_layout.addWidget(self.old_label)
+        info_layout.addStretch()
+        info_layout.addWidget(QLabel("AI Suggestion:"))
+        info_layout.addWidget(self.ai_label)
+
+        layout.addWidget(info_frame)
+
+        # Action buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(20)
+
+        self.accept_ai_btn = QPushButton("Accept AI (A)")
+        self.accept_ai_btn.setStyleSheet("background-color: #4a4; color: white; font-weight: bold; font-size: 14px; padding: 10px 20px;")
+        self.accept_ai_btn.clicked.connect(self._accept_ai)
+
+        self.keep_old_btn = QPushButton("Keep Old (K)")
+        self.keep_old_btn.setStyleSheet("background-color: #44a; color: white; font-weight: bold; font-size: 14px; padding: 10px 20px;")
+        self.keep_old_btn.clicked.connect(self._keep_old)
+
+        self.clear_btn = QPushButton("Clear (C)")
+        self.clear_btn.setStyleSheet("background-color: #a44; color: white; font-weight: bold; font-size: 14px; padding: 10px 20px;")
+        self.clear_btn.clicked.connect(self._clear_label)
+
+        self.view_btn = QPushButton("View in App (V)")
+        self.view_btn.setStyleSheet("background-color: #666; color: white; font-size: 14px; padding: 10px 20px;")
+        self.view_btn.clicked.connect(self._view_in_app)
+
+        btn_layout.addWidget(self.accept_ai_btn)
+        btn_layout.addWidget(self.keep_old_btn)
+        btn_layout.addWidget(self.clear_btn)
+        btn_layout.addWidget(self.view_btn)
+
+        layout.addLayout(btn_layout)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximum(len(items))
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        # Keyboard shortcuts
+        QShortcut(QKeySequence("A"), self, self._accept_ai)
+        QShortcut(QKeySequence("K"), self, self._keep_old)
+        QShortcut(QKeySequence("C"), self, self._clear_label)
+        QShortcut(QKeySequence("V"), self, self._view_in_app)
+        QShortcut(QKeySequence("Space"), self, self._skip)
+        QShortcut(QKeySequence("Right"), self, self._skip)
+        QShortcut(QKeySequence("Left"), self, self._prev)
+
+        self._load_current()
+
+    def _load_current(self):
+        """Load the current photo for review."""
+        if self.current_index >= len(self.items):
+            self._finish()
+            return
+
+        item = self.items[self.current_index]
+        self.progress_label.setText(f"{self.current_index + 1} / {len(self.items)}")
+        self.progress_bar.setValue(self.current_index)
+
+        # Load image
+        file_path = item.get('file_path', '')
+        if os.path.exists(file_path):
+            pixmap = QPixmap(file_path)
+            scaled = pixmap.scaled(
+                self.image_label.width() - 20,
+                self.image_label.height() - 20,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.image_label.setPixmap(scaled)
+        else:
+            self.image_label.setText("Image not found")
+
+        # Update labels
+        old_label = item.get('existing_label', 'Unknown')
+        ai_label = item.get('ai_suggestion', 'Unknown')
+        confidence = item.get('ai_confidence', 0)
+
+        self.old_label.setText(f"<b>{old_label}</b>")
+        self.ai_label.setText(f"<b>{ai_label}</b> ({confidence:.0%})")
+
+    def _accept_ai(self):
+        """Accept the AI suggestion - replace old label with AI label."""
+        if self.current_index >= len(self.items):
+            return
+        item = self.items[self.current_index]
+        photo_id = item['photo_id']
+        ai_species = item['ai_suggestion']
+
+        # Update database - clear old tags, add AI suggestion
+        cursor = self.db.conn.cursor()
+        cursor.execute("DELETE FROM tags WHERE photo_id = ?", (photo_id,))
+        cursor.execute("INSERT INTO tags (photo_id, tag_name) VALUES (?, ?)", (photo_id, ai_species))
+        # Clear suggestion since it's now confirmed
+        cursor.execute("UPDATE photos SET suggested_tag = NULL, suggested_confidence = NULL WHERE id = ?", (photo_id,))
+        self.db.conn.commit()
+
+        self._remove_and_next()
+
+    def _keep_old(self):
+        """Keep the old label - just clear the AI suggestion."""
+        if self.current_index >= len(self.items):
+            return
+        item = self.items[self.current_index]
+        photo_id = item['photo_id']
+
+        # Just clear the suggestion - keep existing label
+        cursor = self.db.conn.cursor()
+        cursor.execute("UPDATE photos SET suggested_tag = NULL, suggested_confidence = NULL WHERE id = ?", (photo_id,))
+        self.db.conn.commit()
+
+        self._remove_and_next()
+
+    def _clear_label(self):
+        """Clear both labels - user will manually label."""
+        if self.current_index >= len(self.items):
+            return
+        item = self.items[self.current_index]
+        photo_id = item['photo_id']
+
+        # Clear everything
+        cursor = self.db.conn.cursor()
+        cursor.execute("DELETE FROM tags WHERE photo_id = ?", (photo_id,))
+        cursor.execute("UPDATE photos SET suggested_tag = NULL, suggested_confidence = NULL WHERE id = ?", (photo_id,))
+        self.db.conn.commit()
+
+        self._remove_and_next()
+
+    def _view_in_app(self):
+        """Emit signal to view this photo in the main app."""
+        if self.current_index >= len(self.items):
+            return
+        item = self.items[self.current_index]
+        self.photo_selected.emit(item['photo_id'])
+
+    def _skip(self):
+        """Skip to next without making changes."""
+        self.current_index += 1
+        self._load_current()
+
+    def _prev(self):
+        """Go back to previous photo."""
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._load_current()
+
+    def _remove_and_next(self):
+        """Remove current item from queue and move to next."""
+        if self.current_index < len(self.items):
+            del self.items[self.current_index]
+            self._save_queue()
+        # Don't increment index since we removed current item
+        self._load_current()
+
+    def _save_queue(self):
+        """Save updated queue to file."""
+        import json
+        with open(self.queue_file, 'w') as f:
+            json.dump(self.items, f, indent=2)
+
+    def _finish(self):
+        """Called when all items are reviewed."""
+        QMessageBox.information(self, "Complete", "All photos in this queue have been reviewed!")
+        # Remove empty queue file
+        if os.path.exists(self.queue_file) and not self.items:
+            os.remove(self.queue_file)
+        self.accept()
 
 
 class TrainerWindow(QMainWindow):
@@ -1415,11 +1809,11 @@ class TrainerWindow(QMainWindow):
         self.site_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.site_filter_combo.view().setMinimumWidth(200)
         self.site_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
-        # Species filter
-        self.species_filter_combo = QComboBox()
-        self.species_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        # Species filter (multi-select)
+        self.species_filter_combo = CheckableComboBox()
+        self.species_filter_combo.setMinimumWidth(120)
         self.species_filter_combo.view().setMinimumWidth(200)
-        self.species_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
+        self.species_filter_combo.selectionChanged.connect(self._populate_photo_list)
         # Sex filter
         self.sex_filter_combo = QComboBox()
         self.sex_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -1642,11 +2036,13 @@ class TrainerWindow(QMainWindow):
         clear_ai_action.triggered.connect(self.clear_all_ai_data)
         ai_action = self.tools_menu.addAction("Suggest Tags (AI)...")
         ai_action.triggered.connect(self.run_ai_suggestions)
-        rerun_ai_action = self.tools_menu.addAction("Re-run AI on Current Photo")
-        rerun_ai_action.triggered.connect(self.rerun_ai_current_photo)
+        rerun_ai_action = self.tools_menu.addAction("Re-run AI on Selection...")
+        rerun_ai_action.triggered.connect(self.rerun_ai_on_selection)
         self.tools_menu.addSeparator()
         sex_suggest_action = self.tools_menu.addAction("Suggest Buck/Doe (AI) on Deer Photos...")
         sex_suggest_action.triggered.connect(self.run_sex_suggestions_on_deer)
+        verification_action = self.tools_menu.addAction("Detect Verification Photos...")
+        verification_action.triggered.connect(self.detect_verification_photos)
 
         # === REVIEW QUEUES (grouped together) ===
         self.tools_menu.addSeparator()
@@ -1661,6 +2057,13 @@ class TrainerWindow(QMainWindow):
 
         site_review_action = self.tools_menu.addAction("Review Site Suggestions...")
         site_review_action.triggered.connect(self.review_site_suggestions)
+
+        self.claude_review_action = self.tools_menu.addAction("Claude Review Queue...")
+        self.claude_review_action.triggered.connect(self.review_claude_queue)
+        self._update_claude_queue_menu()
+
+        mislabel_action = self.tools_menu.addAction("Find Potential Mislabels...")
+        mislabel_action.triggered.connect(self.find_potential_mislabels)
 
         # Check for special one-time queue
         self._check_special_queue_menu()
@@ -2084,6 +2487,10 @@ class TrainerWindow(QMainWindow):
                 if self._prompt_cloud_push():
                     self._do_cloud_push_silent()
 
+        # Close database cleanly (clears crash flag)
+        if hasattr(self, 'db') and self.db:
+            self.db.close()
+
         event.accept()
         QApplication.instance().quit()
 
@@ -2493,6 +2900,7 @@ class TrainerWindow(QMainWindow):
         if real_species:
             tags = [t for t in tags if t not in ("Empty", "Unknown")]
         # If Empty is in tags, it should be the ONLY tag (clear everything else)
+        # Verification is treated like other suggestions - not exclusive
         if "Empty" in tags:
             tags = ["Empty"]
         self.db.update_photo_tags(pid, tags)
@@ -3261,10 +3669,14 @@ class TrainerWindow(QMainWindow):
         return boxes
 
     def _get_subject_box_indices(self) -> list:
-        """Get indices of subject boxes in current_boxes."""
+        """Get indices of subject boxes in current_boxes, sorted by same priority as _get_subject_boxes."""
         if not hasattr(self, "current_boxes") or not self.current_boxes:
             return []
-        return [i for i, b in enumerate(self.current_boxes) if not self._is_head_box(b)]
+        # Get indices with their boxes for sorting
+        indexed_boxes = [(i, b) for i, b in enumerate(self.current_boxes) if not self._is_head_box(b)]
+        # Sort by same priority as _get_subject_boxes
+        indexed_boxes.sort(key=lambda x: self._box_sort_priority(x[1]))
+        return [i for i, b in indexed_boxes]
 
     def _tab_index_to_box_index(self, tab_idx: int) -> int:
         """Convert tab index to actual box index in current_boxes."""
@@ -4563,10 +4975,13 @@ class TrainerWindow(QMainWindow):
         """Fill the species filter combo with counts (contextual to other filters)."""
         if not hasattr(self, "species_filter_combo"):
             return
-        current = self.species_filter_combo.currentData()
-        self.species_filter_combo.blockSignals(True)
+        # Save current selections
+        current_selections = self.species_filter_combo.get_checked_data() if hasattr(self.species_filter_combo, 'get_checked_data') else []
+        self.species_filter_combo._updating = True
         self.species_filter_combo.clear()
-        self.species_filter_combo.addItem("All Species", "")
+        # Add "All Species" as first item (always checked when all are selected)
+        self.species_filter_combo.add_item("All Species", "", checked=True)
+        self.species_filter_combo.set_all_text("All Species")
         try:
             # Count photos by species within current filter context
             context_photos = self._get_context_filtered_photos(exclude_filter='species')
@@ -4580,16 +4995,18 @@ class TrainerWindow(QMainWindow):
                 for sp in species_tags:
                     species_counts[sp] = species_counts.get(sp, 0) + 1
             if unlabeled_count > 0:
-                self.species_filter_combo.addItem(f"Unlabeled ({unlabeled_count})", "__unlabeled__")
+                self.species_filter_combo.add_item(f"Unlabeled ({unlabeled_count})", "__unlabeled__", checked=True)
             # Add only species with photos in current context
             for sp in sorted(species_counts.keys()):
-                self.species_filter_combo.addItem(f"{sp} ({species_counts[sp]})", sp)
+                self.species_filter_combo.add_item(f"{sp} ({species_counts[sp]})", sp, checked=True)
         except Exception:
-            self.species_filter_combo.addItem("Unlabeled", "__unlabeled__")
-            self.species_filter_combo.addItem("Deer", "Deer")
-        idx = self.species_filter_combo.findData(current)
-        self.species_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
-        self.species_filter_combo.blockSignals(False)
+            self.species_filter_combo.add_item("Unlabeled", "__unlabeled__", checked=True)
+            self.species_filter_combo.add_item("Deer", "Deer", checked=True)
+        # Restore previous selections if any were deselected
+        if current_selections:
+            self.species_filter_combo.set_checked_data(current_selections)
+        self.species_filter_combo._updating = False
+        self.species_filter_combo._update_display()
 
     def _populate_sex_filter_options(self):
         """Fill the sex filter combo with counts (contextual to other filters)."""
@@ -4786,20 +5203,40 @@ class TrainerWindow(QMainWindow):
                 result = [(idx, p) for idx, p in result if p.get("favorite") and not p.get("archived")]
             # "all" shows everything, no filter needed
 
-        # Apply species filter
+        # Apply species filter (multi-select)
         if hasattr(self, "species_filter_combo"):
-            species_flt = self.species_filter_combo.currentData()
-            if species_flt:
-                filtered = []
-                for idx, p in result:
-                    tags = set(self.db.get_tags(p["id"]))
-                    species_tags = tags & VALID_SPECIES
-                    if species_flt == "__unlabeled__":
-                        if not species_tags:
+            # Check if it's a multi-select combo
+            if hasattr(self.species_filter_combo, 'get_checked_data'):
+                selected_species = self.species_filter_combo.get_checked_data()
+                # Get total number of options (excluding "All")
+                total_options = self.species_filter_combo._model.rowCount() - 1 if hasattr(self.species_filter_combo, '_model') else 0
+                # Only filter if not all selected
+                if selected_species and len(selected_species) < total_options:
+                    filtered = []
+                    selected_set = set(selected_species)
+                    for idx, p in result:
+                        tags = set(self.db.get_tags(p["id"]))
+                        species_tags = tags & VALID_SPECIES
+                        # Check if "__unlabeled__" is selected
+                        if "__unlabeled__" in selected_set and not species_tags:
                             filtered.append((idx, p))
-                    elif species_flt in species_tags:
-                        filtered.append((idx, p))
-                result = filtered
+                        elif species_tags & selected_set:
+                            filtered.append((idx, p))
+                    result = filtered
+            else:
+                # Fallback for regular combo
+                species_flt = self.species_filter_combo.currentData()
+                if species_flt:
+                    filtered = []
+                    for idx, p in result:
+                        tags = set(self.db.get_tags(p["id"]))
+                        species_tags = tags & VALID_SPECIES
+                        if species_flt == "__unlabeled__":
+                            if not species_tags:
+                                filtered.append((idx, p))
+                        elif species_flt in species_tags:
+                            filtered.append((idx, p))
+                    result = filtered
 
         # Apply sex filter
         if hasattr(self, "sex_filter_combo"):
@@ -4947,20 +5384,35 @@ class TrainerWindow(QMainWindow):
             elif archive_flt == "archived":
                 result = [p for p in result if p.get("archived")]
 
-        # Apply species filter
+        # Apply species filter (multi-select)
         if exclude_filter != 'species' and hasattr(self, "species_filter_combo"):
-            species_flt = self.species_filter_combo.currentData()
-            if species_flt:
-                filtered = []
-                for p in result:
-                    tags = set(self.db.get_tags(p["id"]))
-                    species_tags = tags & VALID_SPECIES
-                    if species_flt == "__unlabeled__":
-                        if not species_tags:
+            if hasattr(self.species_filter_combo, 'get_checked_data'):
+                selected_species = self.species_filter_combo.get_checked_data()
+                total_options = self.species_filter_combo._model.rowCount() - 1 if hasattr(self.species_filter_combo, '_model') else 0
+                if selected_species and len(selected_species) < total_options:
+                    filtered = []
+                    selected_set = set(selected_species)
+                    for p in result:
+                        tags = set(self.db.get_tags(p["id"]))
+                        species_tags = tags & VALID_SPECIES
+                        if "__unlabeled__" in selected_set and not species_tags:
                             filtered.append(p)
-                    elif species_flt in species_tags:
-                        filtered.append(p)
-                result = filtered
+                        elif species_tags & selected_set:
+                            filtered.append(p)
+                    result = filtered
+            else:
+                species_flt = self.species_filter_combo.currentData()
+                if species_flt:
+                    filtered = []
+                    for p in result:
+                        tags = set(self.db.get_tags(p["id"]))
+                        species_tags = tags & VALID_SPECIES
+                        if species_flt == "__unlabeled__":
+                            if not species_tags:
+                                filtered.append(p)
+                        elif species_flt in species_tags:
+                            filtered.append(p)
+                    result = filtered
 
         # Apply sex filter
         if exclude_filter != 'sex' and hasattr(self, "sex_filter_combo"):
@@ -5610,7 +6062,8 @@ class TrainerWindow(QMainWindow):
                 self.load_photo()
                 return
 
-    def _import_files(self, files: List[Path], skip_hash: bool = True, collection: str = "", progress_callback=None) -> int:
+    def _import_files(self, files: List[Path], skip_hash: bool = True, collection: str = "",
+                      progress_callback=None, site_mappings: dict = None) -> int:
         """Copy files into the library, add to DB, and build thumbnails.
 
         Args:
@@ -5619,7 +6072,10 @@ class TrainerWindow(QMainWindow):
             collection: Collection/farm name to assign to imported photos
             progress_callback: Optional callable(current, total, filename) for progress updates.
                                If it returns False, import is cancelled.
+            site_mappings: Optional dict mapping camera IDs to site names
         """
+        if site_mappings is None:
+            site_mappings = {}
         if self._known_hashes is None:
             self._known_hashes = self._load_known_hashes()
         imported = 0
@@ -5632,40 +6088,76 @@ class TrainerWindow(QMainWindow):
                 if hasattr(self, '_import_cancelled') and self._import_cancelled:
                     break
 
-            file_hash = self._hash_file(file_path) if skip_hash else None
-            if skip_hash and file_hash and file_hash in self._known_hashes:
+            # Compute file hash BEFORE importing to check for duplicates
+            file_hash = self._hash_file(file_path)
+
+            # If hash calculation failed, skip the file to prevent duplicates
+            if not file_hash:
+                logger.warning(f"Skipping {file_path.name}: could not compute file hash")
                 continue
+
+            # Skip if hash already exists (prevents importing duplicate photos)
+            if file_hash in self._known_hashes:
+                continue
+            # Also check database (catches duplicates across sessions)
+            if self.db.photo_exists_by_hash(file_hash):
+                self._known_hashes.add(file_hash)
+                continue
+
             try:
                 dest_path, original_name, date_taken, camera_model = import_photo(str(file_path))
             except Exception as exc:
                 logger.error(f"Import failed for {file_path}: {exc}")
                 continue
             if self.db.get_photo_id(dest_path):
-                # Already imported.
+                # Already imported by file path.
                 continue
+
+            # Extract camera ID from CuddeLink EXIF (before thumbnail creation in case file moves)
+            camera_id = extract_cuddelink_camera_id(str(file_path))
+            # Map camera ID to site name (use mapping if provided, else use raw camera ID)
+            camera_location = site_mappings.get(camera_id, camera_id) if camera_id else None
+
             thumb_path = create_thumbnail(dest_path)
             try:
-                self.db.add_photo(dest_path, original_name, date_taken or "", camera_model or "", thumb_path, collection=collection)
-                if skip_hash and file_hash:
+                # Pass file_hash to add_photo to store it immediately and enable duplicate detection
+                photo_id = self.db.add_photo(
+                    dest_path, original_name, date_taken or "", camera_model or "",
+                    thumb_path, collection=collection, file_hash=file_hash
+                )
+
+                # If add_photo returned None, it was a duplicate (shouldn't happen due to earlier check, but safety net)
+                if photo_id is None:
+                    if file_hash:
+                        self._known_hashes.add(file_hash)
+                    continue
+
+                # Set camera location if extracted from CuddeLink EXIF
+                if camera_location and photo_id:
+                    self.db.update_photo_attributes(photo_id, camera_location=camera_location)
+
+                # Auto-detect verification photos (small file size < 15 KB)
+                # These are camera test shots, not real photos - mark before AI runs
+                if photo_id:
+                    try:
+                        file_size_kb = os.path.getsize(file_path) / 1024
+                        if file_size_kb < 15:
+                            self.db.set_suggested_tag(photo_id, "Verification", 0.99)
+                    except:
+                        pass
+
+                if file_hash:
                     self._known_hashes.add(file_hash)
                 imported += 1
 
-                # Queue for R2 upload
-                if hasattr(self, 'r2_manager'):
-                    photo_id = self.db.get_photo_id(dest_path)
-                    if photo_id:
-                        # Compute hash if not already done
-                        upload_hash = file_hash or self._hash_file(Path(dest_path))
-                        if upload_hash:
-                            # Update hash in database
-                            self.db.update_photo_hash(photo_id, upload_hash)
-                            # Queue for R2 upload
-                            self.r2_manager.queue_photo(
-                                photo_id=photo_id,
-                                file_hash=upload_hash,
-                                file_path=Path(dest_path),
-                                thumbnail_path=Path(thumb_path) if thumb_path else None
-                            )
+                # Queue for R2 upload (hash is already stored in database)
+                if hasattr(self, 'r2_manager') and file_hash:
+                    self.r2_manager.queue_photo(
+                        photo_id=photo_id,
+                        file_hash=file_hash,
+                        file_path=Path(dest_path),
+                        thumbnail_path=Path(thumb_path) if thumb_path else None
+                    )
             except Exception as exc:
                 logger.error(f"DB insert failed for {dest_path}: {exc}")
 
@@ -6662,7 +7154,155 @@ class TrainerWindow(QMainWindow):
                 QMessageBox.information(self, "CuddeLink", f"All {skipped} photo(s) already imported.")
                 return
 
-            imported = self._import_files(new_files, skip_hash=True, collection=selected_collection)
+            # Scan for unique camera IDs and show mapping dialog
+            camera_id_counts = {}
+            for f in new_files:
+                cam_id = extract_cuddelink_camera_id(str(f))
+                if cam_id:
+                    camera_id_counts[cam_id] = camera_id_counts.get(cam_id, 0) + 1
+
+            # Show site mapping dialog if we found camera IDs
+            site_mappings = {}  # camera_id -> site_name
+            if camera_id_counts:
+                # Load saved mappings from previous downloads
+                import json
+                saved_mappings = {}
+                saved_str = settings.value("cuddelink_site_mappings", "")
+                if saved_str:
+                    try:
+                        saved_mappings = json.loads(saved_str)
+                    except:
+                        pass
+
+                # Check if all cameras have saved mappings
+                all_mapped = all(cam_id in saved_mappings for cam_id in camera_id_counts)
+
+                if all_mapped:
+                    # Show quick confirmation with option to change
+                    summary = "Photos will be assigned to these sites:\n\n"
+                    for cam_id, count in sorted(camera_id_counts.items()):
+                        site = saved_mappings.get(cam_id, cam_id)
+                        summary += f"  • {cam_id} → {site} ({count} photos)\n"
+                    summary += "\nClick 'Import' to proceed or 'Change...' to modify."
+
+                    confirm_dialog = QMessageBox(self)
+                    confirm_dialog.setWindowTitle("Confirm Site Assignments")
+                    confirm_dialog.setText(summary)
+                    confirm_dialog.setIcon(QMessageBox.Icon.Question)
+                    import_btn = confirm_dialog.addButton("Import", QMessageBox.ButtonRole.AcceptRole)
+                    change_btn = confirm_dialog.addButton("Change...", QMessageBox.ButtonRole.ActionRole)
+                    cancel_btn_confirm = confirm_dialog.addButton(QMessageBox.StandardButton.Cancel)
+
+                    confirm_dialog.exec()
+                    clicked = confirm_dialog.clickedButton()
+
+                    if clicked == cancel_btn_confirm:
+                        temp_dir = dest / ".cuddelink_tmp"
+                        if temp_dir.exists():
+                            try:
+                                shutil.rmtree(temp_dir)
+                            except:
+                                pass
+                        return
+                    elif clicked == import_btn:
+                        # Use saved mappings directly
+                        for cam_id in camera_id_counts:
+                            site_mappings[cam_id] = saved_mappings.get(cam_id, cam_id)
+                        # Skip to import
+                        imported = self._import_files(new_files, skip_hash=True, collection=selected_collection,
+                                                     site_mappings=site_mappings)
+                        temp_dir = dest / ".cuddelink_tmp"
+                        if temp_dir.exists():
+                            try:
+                                shutil.rmtree(temp_dir)
+                            except:
+                                pass
+                        msg = f"Imported {imported} new photo(s)."
+                        if skipped > 0:
+                            msg += f"\nSkipped {skipped} duplicate(s)."
+                        QMessageBox.information(self, "CuddeLink", msg)
+                        if imported:
+                            settings.setValue("cuddelink_last_download", end_date)
+                            self.photos = self._sorted_photos(self.db.get_all_photos())
+                            self._populate_collection_filter_options()
+                            self._populate_photo_list()
+                        return
+                    # Otherwise fall through to show edit dialog
+
+                map_dialog = QDialog(self)
+                map_dialog.setWindowTitle("Camera Site Mapping")
+                map_dialog.setMinimumWidth(450)
+                map_layout = QVBoxLayout(map_dialog)
+
+                map_layout.addWidget(QLabel(
+                    f"Found {len(camera_id_counts)} camera(s) in {len(new_files)} photos.\n"
+                    "Site names are remembered from previous downloads.\n"
+                    "Change if camera was moved to a new location:"))
+
+                # Get existing sites for suggestions
+                existing_sites = sorted(set(
+                    p.get('camera_location', '').strip()
+                    for p in self.db.get_all_photos()
+                    if p.get('camera_location', '').strip()
+                ))
+
+                # Create editable rows for each camera ID
+                site_edits = {}
+                scroll = QScrollArea()
+                scroll.setWidgetResizable(True)
+                scroll_widget = QWidget()
+                scroll_layout = QFormLayout(scroll_widget)
+
+                for cam_id, count in sorted(camera_id_counts.items()):
+                    combo = QComboBox()
+                    combo.setEditable(True)
+                    combo.addItems(existing_sites)
+                    # Use saved mapping if available, otherwise use camera ID
+                    default_site = saved_mappings.get(cam_id, cam_id)
+                    combo.setCurrentText(default_site)
+                    combo.setMinimumWidth(200)
+                    site_edits[cam_id] = combo
+                    scroll_layout.addRow(f"{cam_id} ({count} photos):", combo)
+
+                scroll.setWidget(scroll_widget)
+                scroll.setMaximumHeight(300)
+                map_layout.addWidget(scroll)
+
+                # Buttons
+                btn_layout = QHBoxLayout()
+                ok_btn = QPushButton("Import")
+                ok_btn.setDefault(True)
+                cancel_btn = QPushButton("Cancel")
+                ok_btn.clicked.connect(map_dialog.accept)
+                cancel_btn.clicked.connect(map_dialog.reject)
+                btn_layout.addWidget(ok_btn)
+                btn_layout.addWidget(cancel_btn)
+                map_layout.addLayout(btn_layout)
+
+                if map_dialog.exec() != QDialog.DialogCode.Accepted:
+                    # Clean up temp files
+                    temp_dir = dest / ".cuddelink_tmp"
+                    if temp_dir.exists():
+                        try:
+                            shutil.rmtree(temp_dir)
+                        except Exception:
+                            pass
+                    return
+
+                # Collect mappings
+                for cam_id, combo in site_edits.items():
+                    site_name = combo.currentText().strip()
+                    if site_name:
+                        site_mappings[cam_id] = site_name
+
+                # Save mappings for future downloads (merge with existing)
+                import json
+                all_mappings = saved_mappings.copy()
+                all_mappings.update(site_mappings)
+                settings.setValue("cuddelink_site_mappings", json.dumps(all_mappings))
+
+            imported = self._import_files(new_files, skip_hash=True, collection=selected_collection,
+                                         site_mappings=site_mappings)
             # Clean up extracted files
             temp_dir = dest / ".cuddelink_tmp"
             if temp_dir.exists():
@@ -6693,12 +7333,155 @@ class TrainerWindow(QMainWindow):
                     self.index = newest_idx
                     self.load_photo()
 
+            # Check for missing verification photos
+            self._check_missing_verifications(new_files, start_date, end_date, settings)
+
         self._cudde_worker = DownloadWorker(dest, email, password, start_date, end_date)
         self._cudde_worker.status.connect(on_status)
         self._cudde_worker.progress.connect(on_progress)
         self._cudde_worker.finished.connect(on_download_complete)
         self._cudde_worker.start()
         self._cudde_dialog.show()
+
+    def _check_missing_verifications(self, downloaded_files, start_date: str, end_date: str, settings):
+        """Check for cameras missing verification photos and alert user.
+
+        Only alerts for cameras that:
+        1. Had a verification photo since the previous download (minus 1 day buffer)
+        2. Did NOT have a verification in the current download
+
+        This ensures we alert at least once when a camera goes down, but
+        avoids alerting for cameras that were already offline before the last download.
+
+        Includes time buffer: if downloading today's photos before noon, don't alert
+        about missing verifications (gives time for 9 AM photos to upload).
+        """
+        import json
+        import os
+        from datetime import datetime, timedelta
+
+        MAX_SIZE_KB = 15  # Verification photos are typically 6-7 KB
+        VERIFICATION_ALERT_HOUR = 12  # Don't alert until after noon
+
+        # Check if we should skip alerting due to time buffer
+        # If download includes today and it's before noon, skip the alert
+        # (verification photos are taken at 9 AM, give time to upload)
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        skip_alert_for_time = (end_date == today_str and now.hour < VERIFICATION_ALERT_HOUR)
+
+        # Load camera tracking data: {mac_address: {last_verification: date, site_name: str, snoozed: bool}}
+        camera_data_str = settings.value("cuddelink_camera_tracking", "{}")
+        try:
+            camera_data = json.loads(camera_data_str)
+        except:
+            camera_data = {}
+
+        # Get the previous download date (before this one was saved)
+        # We use the start_date of current download as reference since last_download hasn't been updated yet
+        prev_download_str = settings.value("cuddelink_last_download", "")
+
+        # Scan downloaded files for verification photos and cameras
+        cameras_in_download = {}  # mac -> {has_verification: bool, site_name: str}
+        for f in downloaded_files:
+            mac = extract_cuddelink_mac_address(str(f))
+            cam_id = extract_cuddelink_camera_id(str(f))
+            if not mac:
+                continue
+
+            if mac not in cameras_in_download:
+                cameras_in_download[mac] = {"has_verification": False, "site_name": cam_id or mac}
+
+            # Check if this is a verification photo (small file)
+            try:
+                size_kb = os.path.getsize(f) / 1024
+                if size_kb < MAX_SIZE_KB:
+                    cameras_in_download[mac]["has_verification"] = True
+            except:
+                pass
+
+        # Update camera tracking with new verifications
+        today = datetime.now().strftime("%Y-%m-%d")
+        for mac, info in cameras_in_download.items():
+            if mac not in camera_data:
+                camera_data[mac] = {"last_verification": None, "site_name": info["site_name"], "snoozed": False}
+
+            camera_data[mac]["site_name"] = info["site_name"]  # Update site name
+
+            if info["has_verification"]:
+                camera_data[mac]["last_verification"] = today
+                camera_data[mac]["snoozed"] = False  # Camera is back, reset snooze
+
+        # Determine cutoff date - one day before previous download
+        # This ensures we catch cameras that went down after the last download
+        if prev_download_str:
+            try:
+                prev_download = datetime.strptime(prev_download_str, "%Y-%m-%d")
+                cutoff_date = (prev_download - timedelta(days=1)).strftime("%Y-%m-%d")
+            except:
+                cutoff_date = start_date  # Fallback to start of current download
+        else:
+            # First download ever - no previous reference, use start date
+            cutoff_date = start_date
+
+        # Check for missing verifications from recently-active cameras
+        missing_cameras = []
+
+        for mac, data in camera_data.items():
+            # Skip if snoozed (user dismissed alert)
+            if data.get("snoozed"):
+                continue
+
+            # Skip cameras that never had a verification
+            last_verif = data.get("last_verification")
+            if not last_verif:
+                continue
+
+            # Was this camera active since the last download?
+            # (had verification on or after cutoff date)
+            if last_verif < cutoff_date:
+                continue  # Camera was already offline before last download
+
+            # Did this camera have a verification in this download?
+            if mac in cameras_in_download and cameras_in_download[mac]["has_verification"]:
+                continue  # All good
+
+            # Camera was active since last download but missing verification now
+            missing_cameras.append({
+                "mac": mac,
+                "site_name": data.get("site_name", mac),
+                "last_verification": last_verif
+            })
+
+        # Save updated tracking data
+        settings.setValue("cuddelink_camera_tracking", json.dumps(camera_data))
+
+        # Show alert if any cameras are missing verifications
+        # But skip if it's before noon and download includes today (give time for 9 AM verification to upload)
+        if missing_cameras and not skip_alert_for_time:
+            msg = "The following camera(s) may be down or disconnected:\n\n"
+            for cam in missing_cameras:
+                msg += f"  • {cam['site_name']} (last verification: {cam['last_verification']})\n"
+            msg += "\nThese cameras had recent verifications but didn't send one today."
+        elif missing_cameras and skip_alert_for_time:
+            # Still before noon - don't alert yet, verifications may still be uploading
+            return
+
+            alert = QMessageBox(self)
+            alert.setWindowTitle("Camera Status Alert")
+            alert.setText(msg)
+            alert.setIcon(QMessageBox.Icon.Warning)
+            ok_btn = alert.addButton(QMessageBox.StandardButton.Ok)
+            snooze_btn = alert.addButton("Don't remind until back online", QMessageBox.ButtonRole.ActionRole)
+
+            alert.exec()
+
+            if alert.clickedButton() == snooze_btn:
+                # Snooze alerts for these cameras
+                for cam in missing_cameras:
+                    if cam["mac"] in camera_data:
+                        camera_data[cam["mac"]]["snoozed"] = True
+                settings.setValue("cuddelink_camera_tracking", json.dumps(camera_data))
 
     # ─────────────────────────────────────────────────────────────────────
     # User Setup (Username & Hunting Club)
@@ -7217,6 +8000,8 @@ class TrainerWindow(QMainWindow):
         Shows a dialog to let user choose:
         - Which photos to process (without suggestions vs all unlabeled)
         - Which AI steps to run (detect boxes, species ID, deer heads, buck/doe)
+
+        Runs on main thread with progress dialog for reliable UI feedback.
         """
         # Show options dialog
         dialog = AIOptionsDialog(self)
@@ -7243,6 +8028,7 @@ class TrainerWindow(QMainWindow):
             return
 
         # Filter photos based on scope
+        # Always skip photos suggested as "Verification" - these are test photos
         if options["scope"] == "no_suggestions":
             # Only photos without any AI suggestions
             target_photos = [p for p in self.photos
@@ -7250,7 +8036,10 @@ class TrainerWindow(QMainWindow):
                            and not p.get("suggested_tag")]
         else:
             # All unlabeled photos (including those with existing suggestions)
-            target_photos = [p for p in self.photos if not self._photo_has_human_species(p)]
+            # But skip Verification photos
+            target_photos = [p for p in self.photos
+                           if not self._photo_has_human_species(p)
+                           and p.get("suggested_tag") != "Verification"]
             # Clear existing suggestions for these photos before re-running
             for p in target_photos:
                 pid = p.get("id")
@@ -7262,152 +8051,191 @@ class TrainerWindow(QMainWindow):
 
         total = len(target_photos)
 
+        # Debug: log to file
+        import tempfile
+        debug_log = Path(tempfile.gettempdir()) / "ai_debug.log"
+        with open(debug_log, "w") as f:
+            f.write(f"Target photos count: {total}\n")
+            f.write(f"Options: {options}\n")
+
         if total == 0:
             QMessageBox.information(self, "AI Suggestions",
                 "No photos to process based on selected scope.")
             return
 
-        # Get detector for auto-detection if needed
-        detector, names = None, None
-        if options["detect_boxes"] or options["deer_head_boxes"]:
-            detector, names = self._get_detector_for_suggestions()
-
-        detect_count = 0
-        species_count = 0
-        head_count = 0
-        sex_count = 0
+        # Check if already processing
+        if self.ai_processing:
+            QMessageBox.information(self, "AI Processing", "AI processing is already running.")
+            return
 
         # Create progress dialog
-        progress = QProgressDialog("Running AI suggestions...", "Cancel", 0, total, self)
-        progress.setWindowTitle("AI Suggestions")
+        progress = QProgressDialog("Loading AI model...", "Cancel", 0, total, self)
+        progress.setWindowTitle("AI Processing")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
+        progress.setValue(0)
         progress.show()
+        QApplication.processEvents()
 
-        was_cancelled = False
+        # Load detector if needed
+        detector, names = None, None
+        if options["detect_boxes"] or options["deer_head_boxes"]:
+            try:
+                detector, names = self._get_detector_for_suggestions()
+            except Exception as e:
+                progress.close()
+                QMessageBox.warning(self, "AI Error", f"Failed to load detector: {e}")
+                return
+
+        # Set up queue mode for review after processing
+        self.queue_mode = True
+        self.queue_type = "ai_processing"
+        self.queue_photo_ids = []
+        self.queue_data = {}
+        self.queue_reviewed = set()
+        if self.photos and self.index < len(self.photos):
+            self.queue_pre_filter_index = self.index
+
+        self.ai_processing = True
+        counts = {"detect": 0, "species": 0, "heads": 0, "sex": 0}
+
+        # Process each photo on main thread with progress updates
+        cancelled = False
         for i, p in enumerate(target_photos):
-            # Update progress
-            progress.setValue(i)
-            status_parts = []
-            if options["detect_boxes"]:
-                status_parts.append(f"Boxes: {detect_count}")
-            if options["species_id"]:
-                status_parts.append(f"Species: {species_count}")
-            if options["deer_head_boxes"]:
-                status_parts.append(f"Heads: {head_count}")
-            if options["buck_doe"]:
-                status_parts.append(f"Buck/Doe: {sex_count}")
-            progress.setLabelText(f"Processing photo {i + 1} of {total}...\n" + " | ".join(status_parts))
-            QApplication.processEvents()
+            # Log to debug file
+            with open(debug_log, "a") as f:
+                f.write(f"Loop iteration {i}: photo {p.get('id')} - {p.get('original_name', 'unknown')}\n")
+                f.write(f"  wasCanceled: {progress.wasCanceled()}\n")
 
+            # Check cancel status but don't let stray events trigger it
             if progress.wasCanceled():
-                was_cancelled = True
+                with open(debug_log, "a") as f:
+                    f.write(f"CANCELLED at photo {i + 1}\n")
+                cancelled = True
                 break
 
-            # Step 1: Detect subject boxes (MegaDetector)
-            if options["detect_boxes"]:
-                if self._ensure_detection_boxes(p, detector=detector, names=names):
-                    detect_count += 1
+            progress.setValue(i)
+            progress.setLabelText(f"Processing photo {i + 1} of {total}...")
+            # Process events to update UI, but limit to avoid picking up stray cancel clicks
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
-            # Step 2: Species ID - classify EACH box individually
-            label = None
-            conf = None
-            photo_species = []  # Collect all species found in this photo
-            if options["species_id"]:
-                boxes = self.db.get_boxes(p["id"]) if p.get("id") else []
+            try:
+                pid = p.get("id")
+                crop = None
 
-                if not boxes:
-                    # No detections at all - suggest Empty
-                    label, conf = "Empty", 0.95
-                    self.db.set_suggested_tag(p["id"], label, conf)
-                    species_count += 1
-                else:
-                    # Classify each box individually
-                    for box in boxes:
-                        box_id = box.get("id")
-                        box_label = box.get("label", "")
-                        box_species = None
-                        box_conf = None
+                # Step 1: Detect subject boxes (MegaDetector)
+                if options["detect_boxes"] and detector:
+                    if self._ensure_detection_boxes(p, detector, names):
+                        counts["detect"] += 1
 
-                        if box_label == "ai_person":
-                            box_species, box_conf = "Person", 0.95
-                        elif box_label == "ai_vehicle":
-                            box_species, box_conf = "Vehicle", 0.95
-                        elif box_label in ("ai_animal", "ai_subject", "subject"):
-                            # Crop this specific box and classify
-                            crop_path = self._crop_box(p, box)
-                            if crop_path:
-                                res = self.suggester.predict(str(crop_path))
-                                if res:
-                                    box_species, box_conf = res
-                                    # If classifier returns invalid species, use Unknown
-                                    if box_species in ("Empty", "Other", "Person", "Vehicle"):
-                                        box_species = "Unknown"
-                                        box_conf = 0.5
-                                try:
-                                    Path(crop_path).unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                # Step 2: Species ID
+                if options["species_id"]:
+                    boxes = self.db.get_boxes(pid) if pid else []
+                    has_person = any(b.get("label") == "ai_person" for b in boxes)
+                    has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
+                    has_animal = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
 
-                        # Store species on the box
-                        if box_species and box_id:
-                            self.db.set_box_species(box_id, box_species, box_conf)
-                            photo_species.append((box_species, box_conf))
+                    label = None
+                    conf = None
 
-                    # Set photo-level suggestion from box species
-                    if photo_species:
-                        # Use the most common species, or highest confidence if tie
-                        from collections import Counter
-                        species_counts = Counter(s for s, c in photo_species)
-                        most_common = species_counts.most_common(1)[0][0]
-                        best_conf = max(c for s, c in photo_species if s == most_common)
-                        self.db.set_suggested_tag(p["id"], most_common, best_conf)
-                        species_count += 1
-                        label = most_common  # For deer check below
+                    if has_person:
+                        label, conf = "Person", 0.95
+                    elif has_vehicle:
+                        label, conf = "Vehicle", 0.95
+                    elif has_animal:
+                        crop = self._best_crop_for_photo(p)
+                        path = str(crop) if crop else p.get("file_path")
+                        res = self.suggester.predict(path) if self.suggester else None
+                        if res:
+                            label, conf = res
+                            if label in ("Empty", "Other"):
+                                label = "Unknown"
+                                conf = 0.5
+                    else:
+                        label, conf = "Empty", 0.95
 
-            # For deer head boxes and buck/doe, check if this is a Deer
-            is_deer = False
-            if label == "Deer":
-                is_deer = True
-            elif not options["species_id"]:
-                # If species ID not run, check existing tags/suggestions
-                tags = set(t.lower() for t in self.db.get_tags(p["id"]))
-                is_deer = "deer" in tags or (p.get("suggested_tag") or "").lower() == "deer"
+                    if label and pid:
+                        self.db.set_suggested_tag(pid, label, conf)
+                        counts["species"] += 1
 
-            # Step 3: Detect deer head boxes
-            if options["deer_head_boxes"] and is_deer:
-                if self._add_deer_head_boxes(p, detector=detector, names=names):
-                    head_count += 1
+                        # Add to queue for review
+                        if pid not in self.queue_photo_ids:
+                            self.queue_photo_ids.append(pid)
+                            self.queue_data[pid] = {
+                                "species": label,
+                                "conf": conf,
+                                "sex": None,
+                                "sex_conf": 0
+                            }
 
-            # Step 4: Buck vs Doe ID (per-box on deer boxes)
-            if options["buck_doe"] and self.suggester.buckdoe_ready:
-                # Run per-box sex prediction on all deer boxes in this photo
-                box_sex_count = self._predict_sex_for_deer_boxes(p)
-                sex_count += box_sex_count
+                        # Step 3 & 4: If Deer, handle head detection and buck/doe
+                        if label == "Deer":
+                            if options["deer_head_boxes"] and detector:
+                                self._add_deer_head_boxes(p, detector, names)
+                                counts["heads"] += 1
+
+                            if options["buck_doe"] and self.suggester and self.suggester.buckdoe_ready:
+                                head_crop = self._best_head_crop_for_photo(p)
+                                if head_crop:
+                                    sex_res = self.suggester.predict_sex(str(head_crop))
+                                    if sex_res:
+                                        sex_label, sex_conf = sex_res
+                                        self.db.set_suggested_sex(pid, sex_label, sex_conf)
+                                        counts["sex"] += 1
+                                        # Update queue data
+                                        if pid in self.queue_data:
+                                            self.queue_data[pid]["sex"] = sex_label
+                                            self.queue_data[pid]["sex_conf"] = sex_conf
+                                    try:
+                                        Path(head_crop).unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+
+                # Clean up crop
+                if crop:
+                    try:
+                        Path(crop).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.warning(f"AI processing failed for photo {p.get('id')}: {e}")
+                with open(debug_log, "a") as f:
+                    f.write(f"EXCEPTION at photo {i + 1}: {e}\n")
+
+            # Log completion of this iteration
+            with open(debug_log, "a") as f:
+                f.write(f"Completed iteration {i}\n")
+
+        with open(debug_log, "a") as f:
+            f.write(f"Loop finished. Processed {i + 1 if 'i' in dir() else 0} photos. Cancelled: {cancelled}\n")
 
         progress.setValue(total)
         progress.close()
+        self.ai_processing = False
 
-        # Build result message
-        msg_parts = []
-        if options["detect_boxes"]:
-            msg_parts.append(f"Detected boxes on {detect_count} photo(s)")
-        if options["species_id"]:
-            msg_parts.append(f"Suggested species for {species_count} photo(s)")
-        if options["deer_head_boxes"]:
-            msg_parts.append(f"Added deer head boxes on {head_count} photo(s)")
-        if options["buck_doe"]:
-            msg_parts.append(f"Suggested buck/doe for {sex_count} deer photo(s)")
-
-        msg = "\n".join(msg_parts) if msg_parts else "No processing done."
-        if was_cancelled:
-            msg = "Cancelled.\n" + msg
-
-        QMessageBox.information(self, "AI Suggestions", msg)
-        # Reload photos from database to get updated suggested_tag values
+        # Reload photos from database to get updated suggestions
         self.photos = self._sorted_photos(self.db.get_all_photos())
-        self._populate_species_dropdown()
-        self._populate_photo_list()
+
+        # Show results
+        if self.queue_photo_ids:
+            self.queue_title_label.setText(f"Species Review ({len(self.queue_photo_ids)})")
+            self.queue_suggestion_label.setText(f"AI complete: {counts['species']} species, {counts['sex']} buck/doe")
+            self.queue_progress_bar.hide()
+            self.queue_panel.show()
+            self._populate_photo_list()
+            self._update_queue_ui()
+            QMessageBox.information(self, "AI Complete",
+                f"Processed {total} photos.\n"
+                f"Species identified: {counts['species']}\n"
+                f"Buck/doe identified: {counts['sex']}\n\n"
+                f"Ready for review.")
+        else:
+            self.queue_mode = False
+            self.queue_panel.hide()
+            self._populate_photo_list()  # Still refresh the list
+            QMessageBox.information(self, "AI Complete",
+                f"Processed {total} photos but no species suggestions were made.")
 
     def run_ai_suggestions_all(self):
         """Run AI suggestions on all photos in DB (uses background thread).
@@ -7430,12 +8258,16 @@ class TrainerWindow(QMainWindow):
             return
 
         # Find photos with deer boxes that need sex prediction
+        # Skip photos suggested as "Verification" - these are test photos
         all_photos = self.db.get_all_photos()
         photos_to_process = []
 
         for p in all_photos:
             pid = p.get("id")
             if not pid:
+                continue
+            # Skip verification photos
+            if p.get("suggested_tag") == "Verification":
                 continue
             boxes = self.db.get_boxes(pid)
             # Check if any deer box lacks sex prediction
@@ -7543,6 +8375,85 @@ class TrainerWindow(QMainWindow):
                     self._special_queue_actions.append(action)
             except Exception:
                 pass
+
+        # Check for Tightwad House comparison queue
+        tightwad_file = os.path.expanduser("~/.trailcam/tightwad_review_queue.json")
+        if os.path.exists(tightwad_file):
+            try:
+                with open(tightwad_file, 'r') as f:
+                    items = json.load(f)
+                if items:
+                    action = self.tools_menu.addAction(f"★ Tightwad Comparison ({len(items)} photos)")
+                    action.triggered.connect(lambda: self._run_tightwad_comparison_queue(tightwad_file))
+                    self._special_queue_actions = getattr(self, '_special_queue_actions', [])
+                    self._special_queue_actions.append(action)
+            except Exception:
+                pass
+
+    def _run_tightwad_comparison_queue(self, queue_file: str):
+        """Run the Tightwad House comparison review queue."""
+        import json
+
+        if not os.path.exists(queue_file):
+            QMessageBox.information(self, "Comparison Queue", "Queue file not found.")
+            return
+
+        with open(queue_file, 'r') as f:
+            items = json.load(f)
+
+        if not items:
+            QMessageBox.information(self, "Comparison Queue", "No photos in queue.")
+            os.remove(queue_file)
+            return
+
+        # Create comparison review dialog
+        dlg = TightwadComparisonDialog(self, items, self.db, queue_file)
+        dlg.photo_selected.connect(self._jump_to_photo)
+        dlg.exec()
+
+        # Refresh menu after dialog closes
+        self._check_special_queue_menu()
+
+    def _jump_to_photo(self, photo_id: int):
+        """Jump to a specific photo by ID."""
+        # First, ensure we can find the photo (may need to reset filters)
+        found = False
+        for i, p in enumerate(self.photos):
+            if p.get("id") == photo_id:
+                self.index = i
+                found = True
+                break
+
+        if not found:
+            # Photo not in current filter - try loading with all photos
+            self.collection_filter_combo.blockSignals(True)
+            self.collection_filter_combo.setCurrentText("All Collections")
+            self.collection_filter_combo.blockSignals(False)
+            self.archive_filter_combo.blockSignals(True)
+            self.archive_filter_combo.setCurrentText("All Photos")
+            self.archive_filter_combo.blockSignals(False)
+            if hasattr(self.species_filter_combo, 'select_all'):
+                self.species_filter_combo.select_all()
+            else:
+                self.species_filter_combo.blockSignals(True)
+                self.species_filter_combo.setCurrentText("All Species")
+                self.species_filter_combo.blockSignals(False)
+            self._populate_photo_list()
+
+            for i, p in enumerate(self.photos):
+                if p.get("id") == photo_id:
+                    self.index = i
+                    found = True
+                    break
+
+        if found:
+            self.load_photo()
+            # Update list selection
+            for row in range(self.photo_list_widget.count()):
+                item = self.photo_list_widget.item(row)
+                if item and item.data(Qt.ItemDataRole.UserRole) == self.index:
+                    self.photo_list_widget.setCurrentItem(item)
+                    break
 
     def _run_special_queue(self, queue_name: str, queue_file: str):
         """Run a special review queue."""
@@ -8041,8 +8952,10 @@ class TrainerWindow(QMainWindow):
             QMessageBox.information(self, "AI Model Not Available", "AI model not loaded.")
             return
 
-        # Get unlabeled photos
-        unlabeled_photos = [p for p in self.photos if not self._photo_has_human_species(p)]
+        # Get unlabeled photos (skip Verification photos)
+        unlabeled_photos = [p for p in self.photos
+                          if not self._photo_has_human_species(p)
+                          and p.get("suggested_tag") != "Verification"]
         if not unlabeled_photos:
             QMessageBox.information(self, "AI Suggestions", "All photos in current view already have species labels.")
             return
@@ -8114,9 +9027,8 @@ class TrainerWindow(QMainWindow):
                     "sex_conf": result.get("sex_conf", 0)
                 }
 
-            # Throttled list refresh - only update every 10 photos to avoid UI freeze
-            if self.queue_mode and len(self.queue_photo_ids) % 10 == 0:
-                self._populate_photo_list()
+            # DON'T call _populate_photo_list() during processing - it's too expensive
+            # and causes UI freeze. The list will be refreshed once at the end in _on_ai_finished
 
             # Update suggestion label (lightweight, always do this)
             remaining = len(self.queue_photo_ids) - len(self.queue_reviewed)
@@ -8130,11 +9042,20 @@ class TrainerWindow(QMainWindow):
                         self.load_photo()
                         break
 
-    def _on_ai_finished(self, species_count: int, sex_count: int):
+    def _on_ai_finished(self, counts):
         """Handle AI processing completion."""
         self.ai_processing = False
         self.ai_worker = None
         self.queue_progress_bar.hide()
+
+        # Handle both old (int, int) and new (dict) formats for backwards compatibility
+        if isinstance(counts, dict):
+            species_count = counts.get("species", 0)
+            sex_count = counts.get("sex", 0)
+        else:
+            # Old format: species_count, sex_count as positional
+            species_count = counts
+            sex_count = 0
 
         if self.queue_photo_ids:
             self.queue_title_label.setText(f"Species Review ({len(self.queue_photo_ids)})")
@@ -8150,6 +9071,41 @@ class TrainerWindow(QMainWindow):
                 f"Suggested buck/doe for {sex_count} deer photo(s).\n\n"
                 "No photos require review."
             )
+
+    def _on_ai_finished_with_options(self, counts: dict):
+        """Handle AI processing completion with options-aware message."""
+        self.ai_processing = False
+        self.ai_worker = None
+        self.queue_progress_bar.hide()
+
+        # Get options that were used
+        options = getattr(self, '_ai_options', {})
+
+        # Build result message based on what was requested
+        msg_parts = []
+        if options.get("detect_boxes"):
+            msg_parts.append(f"Detected boxes on {counts.get('detect', 0)} photo(s)")
+        if options.get("species_id"):
+            msg_parts.append(f"Suggested species for {counts.get('species', 0)} photo(s)")
+        if options.get("deer_head_boxes"):
+            msg_parts.append(f"Added deer head boxes on {counts.get('heads', 0)} photo(s)")
+        if options.get("buck_doe"):
+            msg_parts.append(f"Suggested buck/doe for {counts.get('sex', 0)} deer photo(s)")
+
+        msg = "\n".join(msg_parts) if msg_parts else "Processing complete."
+
+        # Reload photos from database to get updated values
+        self.photos = self._sorted_photos(self.db.get_all_photos())
+        self._populate_species_dropdown()
+        self._populate_photo_list()
+
+        if self.queue_photo_ids:
+            self.queue_title_label.setText(f"Review ({len(self.queue_photo_ids)})")
+            self.queue_suggestion_label.setText(msg)
+            self._update_queue_ui()
+        else:
+            self._exit_queue_mode()
+            QMessageBox.information(self, "AI Suggestions Complete", msg)
 
     def _on_ai_error(self, message: str):
         """Handle AI processing error."""
@@ -9891,9 +10847,12 @@ class TrainerWindow(QMainWindow):
                 self.collection_filter_combo.blockSignals(True)
                 self.collection_filter_combo.setCurrentIndex(0)  # "All Collections"
                 self.collection_filter_combo.blockSignals(False)
-                self.species_filter_combo.blockSignals(True)
-                self.species_filter_combo.setCurrentIndex(0)  # "All Species"
-                self.species_filter_combo.blockSignals(False)
+                if hasattr(self.species_filter_combo, 'select_all'):
+                    self.species_filter_combo.select_all()
+                else:
+                    self.species_filter_combo.blockSignals(True)
+                    self.species_filter_combo.setCurrentIndex(0)  # "All Species"
+                    self.species_filter_combo.blockSignals(False)
                 self.archive_filter_combo.blockSignals(True)
                 self.archive_filter_combo.setCurrentIndex(3)  # "All Photos" (index 3)
                 self.archive_filter_combo.blockSignals(False)
@@ -10140,6 +11099,123 @@ class TrainerWindow(QMainWindow):
         result_msg = "\n".join(results) if results else "AI processing complete"
         self.statusBar().showMessage(result_msg, 5000)
         QMessageBox.information(self, "Re-run AI", result_msg)
+
+    def rerun_ai_on_selection(self):
+        """Re-run AI on selected photos (or current photo if none selected)."""
+        # Get selected photos
+        selected_items = self.photo_list_widget.selectedItems()
+
+        if not selected_items:
+            # No selection - use current photo
+            if not self.photos or self.index >= len(self.photos):
+                QMessageBox.information(self, "Re-run AI", "No photo selected.")
+                return
+            selected_photos = [self.photos[self.index]]
+        else:
+            # Get photos from selection
+            selected_photos = []
+            for item in selected_items:
+                idx = item.data(Qt.ItemDataRole.UserRole)
+                if idx is not None and 0 <= idx < len(self.photos):
+                    selected_photos.append(self.photos[idx])
+
+        if not selected_photos:
+            QMessageBox.information(self, "Re-run AI", "No photos selected.")
+            return
+
+        # Confirm if multiple
+        if len(selected_photos) > 1:
+            reply = QMessageBox.question(
+                self, "Re-run AI",
+                f"Run AI detection and classification on {len(selected_photos)} selected photos?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Progress dialog for multiple photos
+        progress = None
+        if len(selected_photos) > 1:
+            progress = QProgressDialog("Running AI on selected photos...", "Cancel", 0, len(selected_photos), self)
+            progress.setWindowTitle("Re-run AI")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.show()
+
+        processed = 0
+        detected_count = 0
+        cancelled = False
+
+        for i, photo in enumerate(selected_photos):
+            if progress:
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+                progress.setValue(i)
+                progress.setLabelText(f"Processing {i+1}/{len(selected_photos)}...")
+                QCoreApplication.processEvents()
+
+            pid = photo.get("id")
+            path = photo.get("file_path")
+
+            if not path or not os.path.exists(path):
+                continue
+
+            # Clear existing AI suggestions
+            try:
+                self.db.set_suggested_tag(pid, None, None)
+            except:
+                pass
+
+            # Run MegaDetector
+            try:
+                new_boxes = self._detect_boxes_megadetector(path, conf_thresh=0.2)
+                if new_boxes:
+                    # Save boxes to database
+                    for box in new_boxes:
+                        self.db.add_box(pid, box["label"], box["x1"], box["y1"], box["x2"], box["y2"],
+                                       box.get("confidence", 0))
+                    detected_count += len(new_boxes)
+
+                    # Run species classifier
+                    if hasattr(self, "ai_suggester") and self.ai_suggester:
+                        import PIL.Image as PILImage
+                        img = PILImage.open(path).convert("RGB")
+                        w, h = img.size
+
+                        for box in new_boxes:
+                            if str(box.get("label", "")).startswith("ai_animal"):
+                                x1 = int(box["x1"] * w)
+                                y1 = int(box["y1"] * h)
+                                x2 = int(box["x2"] * w)
+                                y2 = int(box["y2"] * h)
+                                crop = img.crop((x1, y1, x2, y2))
+                                label, conf = self.ai_suggester.predict(crop)
+                                if label:
+                                    self.db.set_suggested_tag(pid, label, conf)
+                                    break  # Use first detection for suggestion
+                else:
+                    # No detections - suggest Empty
+                    self.db.set_suggested_tag(pid, "Empty", 1.0)
+
+                processed += 1
+            except Exception as e:
+                print(f"[AI] Error processing {path}: {e}")
+
+        if progress:
+            progress.close()
+
+        # Refresh UI
+        self.photos = self._sorted_photos(self.db.get_all_photos())
+        self._populate_photo_list()
+        self.load_photo()
+
+        # Show results
+        if cancelled:
+            msg = f"Cancelled. Processed {processed} of {len(selected_photos)} photos."
+        else:
+            msg = f"Processed {processed} photo(s).\nDetected {detected_count} subject(s)."
+        QMessageBox.information(self, "Re-run AI", msg)
 
     def run_ai_boxes_all(self):
         """Run detector across all photos in the database."""
@@ -10866,9 +11942,11 @@ class TrainerWindow(QMainWindow):
         btns = QHBoxLayout()
         open_btn = QPushButton("Open Selection")
         compare_btn = QPushButton("Compare Selection")
+        change_id_btn = QPushButton("Change ID...")
         close = QPushButton("Close")
         btns.addWidget(open_btn)
         btns.addWidget(compare_btn)
+        btns.addWidget(change_id_btn)
         btns.addStretch()
         btns.addWidget(close)
         layout.addLayout(btns)
@@ -10913,8 +11991,109 @@ class TrainerWindow(QMainWindow):
             cdlg = CompareWindow(photo_ids=photo_ids[:4], db=self.db, parent=self)
             cdlg.exec()
 
+        def change_deer_id():
+            # Get available seasons for this deer
+            seasons = [s.get("season_year") for s in summaries if s.get("season_year")]
+
+            # Create change ID dialog
+            change_dlg = QDialog(dlg)
+            change_dlg.setWindowTitle(f"Change Deer ID: {deer_id}")
+            change_dlg.setMinimumWidth(400)
+            clayout = QVBoxLayout(change_dlg)
+
+            clayout.addWidget(QLabel(f"Current ID: <b>{deer_id}</b>"))
+
+            clayout.addWidget(QLabel("New ID:"))
+            new_id_edit = QLineEdit()
+            new_id_edit.setPlaceholderText("Enter new deer ID...")
+            clayout.addWidget(new_id_edit)
+
+            clayout.addSpacing(10)
+            clayout.addWidget(QLabel("Apply to:"))
+
+            scope_group = QButtonGroup(change_dlg)
+            all_radio = QRadioButton(f"All photos with this deer ID")
+            all_radio.setChecked(True)
+            scope_group.addButton(all_radio)
+            clayout.addWidget(all_radio)
+
+            season_radio = QRadioButton("Only selected seasons:")
+            scope_group.addButton(season_radio)
+            clayout.addWidget(season_radio)
+
+            # Season checkboxes
+            season_checks = {}
+            season_widget = QWidget()
+            season_layout = QVBoxLayout(season_widget)
+            season_layout.setContentsMargins(20, 0, 0, 0)
+            for sy in sorted(seasons, reverse=True):
+                label = self.db.format_season_label(sy)
+                cb = QCheckBox(label)
+                cb.setChecked(True)
+                season_checks[sy] = cb
+                season_layout.addWidget(cb)
+            clayout.addWidget(season_widget)
+            season_widget.setEnabled(False)
+
+            def toggle_seasons(checked):
+                season_widget.setEnabled(season_radio.isChecked())
+
+            season_radio.toggled.connect(toggle_seasons)
+            all_radio.toggled.connect(toggle_seasons)
+
+            clayout.addSpacing(10)
+
+            cbtn_layout = QHBoxLayout()
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(change_dlg.reject)
+            apply_btn = QPushButton("Apply Change")
+            apply_btn.clicked.connect(change_dlg.accept)
+            cbtn_layout.addStretch()
+            cbtn_layout.addWidget(cancel_btn)
+            cbtn_layout.addWidget(apply_btn)
+            clayout.addLayout(cbtn_layout)
+
+            if change_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            new_id = new_id_edit.text().strip()
+            if not new_id:
+                QMessageBox.warning(dlg, "Change ID", "Please enter a new deer ID.")
+                return
+
+            if new_id == deer_id:
+                QMessageBox.warning(dlg, "Change ID", "New ID is the same as the current ID.")
+                return
+
+            # Confirm
+            if all_radio.isChecked():
+                msg = f"Change deer ID from '{deer_id}' to '{new_id}' for ALL photos?"
+                selected_seasons = None
+            else:
+                selected_seasons = [sy for sy, cb in season_checks.items() if cb.isChecked()]
+                if not selected_seasons:
+                    QMessageBox.warning(dlg, "Change ID", "Please select at least one season.")
+                    return
+                season_labels = [self.db.format_season_label(sy) for sy in selected_seasons]
+                msg = f"Change deer ID from '{deer_id}' to '{new_id}' for seasons:\n{', '.join(season_labels)}?"
+
+            if QMessageBox.question(dlg, "Confirm Change", msg,
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                                    ) != QMessageBox.StandardButton.Yes:
+                return
+
+            # Apply the change
+            affected = self.db.rename_deer_id(deer_id, new_id, selected_seasons)
+            QMessageBox.information(dlg, "Change ID", f"Changed {affected} photo(s) from '{deer_id}' to '{new_id}'.")
+
+            # Refresh UI
+            self._populate_deer_id_dropdown()
+            self.deer_id_edit.setCurrentText(new_id)
+            dlg.accept()  # Close profile dialog
+
         open_btn.clicked.connect(open_selected)
         compare_btn.clicked.connect(compare_selected)
+        change_id_btn.clicked.connect(change_deer_id)
         close.clicked.connect(dlg.accept)
         dlg.resize(700, 600)
         dlg.exec()
@@ -11225,6 +12404,321 @@ class TrainerWindow(QMainWindow):
         self._populate_photo_list()
 
     # ─────────────────────────────────────────────────────────────────────
+    # Mislabel Detection
+    # ─────────────────────────────────────────────────────────────────────
+
+    def find_potential_mislabels(self):
+        """Find photos where AI strongly disagrees with human label."""
+        if not self.suggester or not self.suggester.ready:
+            QMessageBox.warning(self, "AI Not Available", "Species AI model is not loaded.")
+            return
+
+        # Get all labeled photos
+        species_set = self._species_set()
+        all_photos = self.db.get_all_photos()
+        labeled_photos = []
+        for p in all_photos:
+            tags = set(self.db.get_tags(p["id"]))
+            species_tags = [t for t in tags if t in species_set and t not in ("Empty", "Unknown", "Verification")]
+            if species_tags:
+                labeled_photos.append((p, species_tags))
+
+        if not labeled_photos:
+            QMessageBox.information(self, "Mislabel Check", "No labeled photos to check.")
+            return
+
+        # Progress dialog
+        progress = QProgressDialog("Checking for potential mislabels...", "Cancel", 0, len(labeled_photos), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        disagreements = []
+        MIN_CONFIDENCE = 0.70  # Only flag if AI is at least 70% confident
+
+        for i, (photo, human_labels) in enumerate(labeled_photos):
+            if progress.wasCanceled():
+                break
+            progress.setValue(i)
+            QApplication.processEvents()
+
+            file_path = photo.get("file_path")
+            if not file_path or not os.path.exists(file_path):
+                continue
+
+            try:
+                result = self.suggester.predict(file_path)
+                if not result:
+                    continue
+                ai_label, ai_conf = result
+
+                # Check if AI disagrees with human labels
+                if ai_label and ai_label not in human_labels and ai_conf >= MIN_CONFIDENCE:
+                    disagreements.append({
+                        "photo": photo,
+                        "human_labels": human_labels,
+                        "ai_label": ai_label,
+                        "ai_confidence": ai_conf
+                    })
+            except Exception as e:
+                logger.warning(f"Error checking {file_path}: {e}")
+                continue
+
+        progress.setValue(len(labeled_photos))
+
+        if not disagreements:
+            QMessageBox.information(self, "Mislabel Check",
+                f"Checked {len(labeled_photos)} labeled photos.\n\n"
+                "No potential mislabels found - AI agrees with all labels!")
+            return
+
+        # Sort by current label (group similar mislabels together)
+        disagreements.sort(key=lambda x: (x["human_labels"][0] if x["human_labels"] else "", -x["ai_confidence"]))
+
+        # Create review dialog
+        self._show_mislabel_review_dialog(disagreements)
+
+    def _show_mislabel_review_dialog(self, disagreements: list):
+        """Show dialog to review potential mislabels."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Potential Mislabels ({len(disagreements)})")
+        dlg.resize(1400, 900)
+        layout = QVBoxLayout(dlg)
+
+        # Instructions
+        info = QLabel(
+            "Photos where AI strongly disagrees with the current label. "
+            "Review each and keep, change, or clear the label."
+        )
+        info.setStyleSheet("color: #aaa; margin-bottom: 10px;")
+        layout.addWidget(info)
+
+        # Main content
+        content_layout = QHBoxLayout()
+
+        # Left: filter and list
+        left_panel = QVBoxLayout()
+
+        # Filter by current label
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter by label:"))
+        label_filter = QComboBox()
+        label_filter.addItem("All")
+        # Get unique labels
+        unique_labels = sorted(set(item["human_labels"][0] for item in disagreements if item["human_labels"]))
+        for lbl in unique_labels:
+            count = sum(1 for item in disagreements if item["human_labels"] and item["human_labels"][0] == lbl)
+            label_filter.addItem(f"{lbl} ({count})")
+        label_filter.setMinimumWidth(180)
+        filter_row.addWidget(label_filter)
+        filter_row.addStretch()
+        left_panel.addLayout(filter_row)
+
+        left_panel.addWidget(QLabel("Potential mislabels (sorted by current label):"))
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        list_widget.setMinimumWidth(380)
+
+        all_items = disagreements[:]
+        reviewed_set = set()
+
+        def _populate_list():
+            list_widget.clear()
+            filter_text = label_filter.currentText()
+            filter_label = filter_text.split(" (")[0] if " (" in filter_text else filter_text
+
+            for item in all_items:
+                human = item["human_labels"][0] if item["human_labels"] else ""
+                if filter_label != "All" and human != filter_label:
+                    continue
+
+                pid = item["photo"]["id"]
+                ai_pct = int(item["ai_confidence"] * 100)
+                human_str = ", ".join(item["human_labels"])
+                ai = item["ai_label"]
+                fname = os.path.basename(item["photo"].get("file_path", ""))
+
+                if pid in reviewed_set:
+                    display = f"✓ {fname}"
+                    li = QListWidgetItem(display)
+                    li.setBackground(QColor(144, 238, 144))
+                else:
+                    display = f"[{human_str}] → AI: {ai} ({ai_pct}%) - {fname}"
+                    li = QListWidgetItem(display)
+
+                li.setData(Qt.ItemDataRole.UserRole, item)
+                list_widget.addItem(li)
+
+            remaining = len([item for item in all_items if item["photo"]["id"] not in reviewed_set])
+            dlg.setWindowTitle(f"Potential Mislabels ({remaining} remaining)")
+
+        _populate_list()
+        label_filter.currentIndexChanged.connect(lambda: _populate_list())
+        left_panel.addWidget(list_widget, 1)
+        content_layout.addLayout(left_panel)
+
+        # Right: full-size photo preview
+        right_panel = QVBoxLayout()
+        preview_label = QLabel("Select a photo to preview")
+        preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_label.setMinimumSize(800, 600)
+        preview_label.setStyleSheet("background: #222; border: 1px solid #444;")
+        right_panel.addWidget(preview_label, 1)
+
+        # Info labels
+        info_layout = QHBoxLayout()
+        current_label_display = QLabel("Current label: —")
+        current_label_display.setStyleSheet("font-size: 16px; font-weight: bold;")
+        ai_label_display = QLabel("AI suggests: —")
+        ai_label_display.setStyleSheet("font-size: 16px; color: #ff9966;")
+        info_layout.addWidget(current_label_display)
+        info_layout.addStretch()
+        info_layout.addWidget(ai_label_display)
+        right_panel.addLayout(info_layout)
+
+        content_layout.addLayout(right_panel, 1)
+        layout.addLayout(content_layout)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        keep_btn = QPushButton("Keep Current Label (K)")
+        keep_btn.setStyleSheet("background: #446; padding: 10px 20px; font-size: 14px;")
+        change_btn = QPushButton("Change to AI Suggestion (A)")
+        change_btn.setStyleSheet("background: #664; padding: 10px 20px; font-size: 14px;")
+        clear_btn = QPushButton("Clear Label (C)")
+        clear_btn.setStyleSheet("background: #644; padding: 10px 20px; font-size: 14px;")
+        skip_btn = QPushButton("Skip (S)")
+        skip_btn.setStyleSheet("padding: 10px 20px; font-size: 14px;")
+        btn_layout.addWidget(keep_btn)
+        btn_layout.addWidget(change_btn)
+        btn_layout.addWidget(clear_btn)
+        btn_layout.addWidget(skip_btn)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("padding: 10px 20px; font-size: 14px;")
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        def _update_preview():
+            item = list_widget.currentItem()
+            if not item:
+                preview_label.clear()
+                preview_label.setText("Select a photo")
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            photo = data["photo"]
+
+            # Load FULL SIZE image (not thumbnail)
+            path = photo.get("file_path")
+            if path and os.path.exists(path):
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    # Scale to fit preview area while maintaining aspect ratio
+                    scaled = pixmap.scaled(preview_label.width() - 10, preview_label.height() - 10,
+                                          Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation)
+                    preview_label.setPixmap(scaled)
+            else:
+                preview_label.setText("Image not found")
+
+            # Update info
+            human = ", ".join(data["human_labels"])
+            ai = data["ai_label"]
+            ai_pct = int(data["ai_confidence"] * 100)
+            current_label_display.setText(f"Current label: {human}")
+            ai_label_display.setText(f"AI suggests: {ai} ({ai_pct}% confident)")
+
+        list_widget.currentRowChanged.connect(lambda: _update_preview())
+
+        def _next_unreviewed():
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if data["photo"]["id"] not in reviewed_set:
+                    list_widget.setCurrentRow(i)
+                    return
+            # All done
+            remaining = len(all_items) - len(reviewed_set)
+            if remaining == 0:
+                QMessageBox.information(dlg, "Complete", "All potential mislabels reviewed!")
+
+        def _keep_current():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            pid = data["photo"]["id"]
+            reviewed_set.add(pid)
+            _populate_list()
+            _next_unreviewed()
+
+        def _change_to_ai():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            pid = data["photo"]["id"]
+            ai_suggestion = data["ai_label"]
+
+            # Update tags: remove old species, add AI suggestion
+            current_tags = self.db.get_tags(pid)
+            species_set = self._species_set()
+            new_tags = [t for t in current_tags if t not in species_set]
+            new_tags.append(ai_suggestion)
+            self.db.update_photo_tags(pid, new_tags)
+
+            reviewed_set.add(pid)
+            _populate_list()
+            _next_unreviewed()
+
+        def _clear_label():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            pid = data["photo"]["id"]
+
+            # Remove all species tags, leaving only non-species tags
+            current_tags = self.db.get_tags(pid)
+            species_set = self._species_set()
+            new_tags = [t for t in current_tags if t not in species_set]
+            self.db.update_photo_tags(pid, new_tags)
+
+            reviewed_set.add(pid)
+            _populate_list()
+            _next_unreviewed()
+
+        def _skip():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            current_row = list_widget.currentRow()
+            if current_row < list_widget.count() - 1:
+                list_widget.setCurrentRow(current_row + 1)
+
+        keep_btn.clicked.connect(_keep_current)
+        change_btn.clicked.connect(_change_to_ai)
+        clear_btn.clicked.connect(_clear_label)
+        skip_btn.clicked.connect(_skip)
+        close_btn.clicked.connect(dlg.accept)
+
+        # Keyboard shortcuts
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        QShortcut(QKeySequence("K"), dlg).activated.connect(_keep_current)
+        QShortcut(QKeySequence("A"), dlg).activated.connect(_change_to_ai)
+        QShortcut(QKeySequence("C"), dlg).activated.connect(_clear_label)
+        QShortcut(QKeySequence("S"), dlg).activated.connect(_skip)
+
+        # Select first
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+            _update_preview()
+
+        dlg.exec()
+
+        # Refresh main UI
+        self._populate_photo_list()
+
+    # ─────────────────────────────────────────────────────────────────────
     # Claude Review Queue
     # ─────────────────────────────────────────────────────────────────────
 
@@ -11297,6 +12791,7 @@ class TrainerWindow(QMainWindow):
                 thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 thumb_label.setStyleSheet("background-color: #333; border: 2px solid #555;")
                 check = QCheckBox()
+                check.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent keyboard toggling
                 cell_layout.addWidget(thumb_label)
                 cell_layout.addWidget(check, alignment=Qt.AlignmentFlag.AlignCenter)
                 grid_layout.addWidget(cell, row, col)
@@ -11352,13 +12847,17 @@ class TrainerWindow(QMainWindow):
                     tw["check"].setChecked(False)
                     tw["check"].setVisible(True)
                     tw["label"].setVisible(True)
-                    path = item.get("file_path", "")
-                    if path and os.path.exists(path):
-                        px = QPixmap(path)
-                        if not px.isNull():
-                            tw["label"].setPixmap(px.scaled(THUMB_SIZE, THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
-                        else:
-                            tw["label"].setText("Error")
+                    # Use pre-generated thumbnail for speed (much smaller files)
+                    thumb_path = item.get("thumbnail_path", "")
+                    file_path = item.get("file_path", "")
+                    px = None
+                    if thumb_path and os.path.exists(thumb_path):
+                        px = QPixmap(thumb_path)
+                    elif file_path and os.path.exists(file_path):
+                        # Fallback to full image if no thumbnail
+                        px = QPixmap(file_path)
+                    if px and not px.isNull():
+                        tw["label"].setPixmap(px.scaled(THUMB_SIZE, THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
                     else:
                         tw["label"].setText("N/A")
                 else:
@@ -11496,33 +12995,172 @@ class TrainerWindow(QMainWindow):
             self.deer_id_edit.setCurrentText(current)
         self.deer_id_edit.blockSignals(False)
 
+    # ========== Verification Photo Detection ==========
+
+    def detect_verification_photos(self):
+        """Detect verification/test photos based on small file size and no text overlay."""
+        import os
+
+        # Get all photos without species tags
+        all_photos = self.db.get_all_photos()
+        untagged = []
+        for p in all_photos:
+            tags = self.db.get_tags(p['id'])
+            if not tags:  # No species tags
+                untagged.append(p)
+
+        if not untagged:
+            QMessageBox.information(self, "Verification Detection",
+                "No untagged photos found.")
+            return
+
+        # Confirmation dialog
+        reply = QMessageBox.question(self, "Verification Detection",
+            f"This will scan {len(untagged)} untagged photos for verification images.\n\n"
+            "Verification photos are identified by:\n"
+            "• Very small file size (< 15 KB)\n"
+            "• No camera text overlay\n\n"
+            "Photos detected as verification will get 'Verification' suggested.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Progress dialog
+        progress = QProgressDialog("Detecting verification photos...", "Cancel", 0, len(untagged), self)
+        progress.setWindowTitle("Verification Detection")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QCoreApplication.processEvents()
+
+        # Detection criteria
+        MAX_SIZE_KB = 15  # Verification photos are typically 6-7 KB
+
+        detected = 0
+        checked = 0
+
+        for i, photo in enumerate(untagged):
+            if progress.wasCanceled():
+                break
+
+            progress.setValue(i + 1)
+            progress.setLabelText(f"Checking {i+1}/{len(untagged)}... Found: {detected}")
+            QCoreApplication.processEvents()
+
+            path = photo.get('file_path')
+            if not path or not os.path.exists(path):
+                continue
+
+            checked += 1
+
+            # Check file size
+            try:
+                size_kb = os.path.getsize(path) / 1024
+            except:
+                continue
+
+            if size_kb >= MAX_SIZE_KB:
+                continue  # Too large to be verification
+
+            # Small file - likely verification photo
+            # Set AI suggestion to "Verification"
+            self.db.set_suggested_tag(photo['id'], "Verification", 0.95)
+            detected += 1
+
+        progress.close()
+
+        # Results
+        QMessageBox.information(self, "Verification Detection",
+            f"Detection complete!\n\n"
+            f"Checked: {checked} photos\n"
+            f"Verification photos found: {detected}\n\n"
+            "Use 'Review Species Suggestions' to review and confirm.")
+
+        # Refresh
+        self.photos = self._sorted_photos(self.db.get_all_photos())
+        self._populate_photo_list()
+
     # ========== Site Clustering ==========
 
     def run_site_clustering(self):
-        """Auto-detect camera sites using hybrid OCR + visual approach."""
+        """Auto-detect camera sites using OCR text overlay detection."""
         try:
-            from site_identifier import SiteIdentifier
+            from site_detector import SiteDetector, OCR_AVAILABLE
         except ImportError as e:
-            QMessageBox.warning(self, "Site Detection", f"Failed to load site identifier: {e}")
+            QMessageBox.warning(self, "Site Detection", f"Failed to load site detector: {e}")
             return
 
-        # Get photo counts
+        # Show collection selection dialog
         all_photos = self.db.get_all_photos()
+        collections = sorted(set(p.get('collection') for p in all_photos if p.get('collection')))
+
+        # Create selection dialog
+        select_dlg = QDialog(self)
+        select_dlg.setWindowTitle("Auto-Detect Sites")
+        select_dlg.setMinimumWidth(400)
+        layout = QVBoxLayout(select_dlg)
+
+        layout.addWidget(QLabel("Select collection to detect sites within:"))
+        layout.addWidget(QLabel("(Sites will only be matched to locations found in this collection)"))
+
+        collection_combo = QComboBox()
+        collection_combo.addItem("All Collections", None)
+        for coll in collections:
+            # Count photos in collection
+            count = len([p for p in all_photos if p.get('collection') == coll])
+            collection_combo.addItem(f"{coll} ({count} photos)", coll)
+
+        # Default to current filter if set
+        if hasattr(self, "collection_filter_combo"):
+            current = self.collection_filter_combo.currentData()
+            if current:
+                idx = collection_combo.findData(current)
+                if idx >= 0:
+                    collection_combo.setCurrentIndex(idx)
+
+        layout.addWidget(collection_combo)
+        layout.addSpacing(10)
+
+        btn_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(select_dlg.reject)
+        ok_btn = QPushButton("Continue")
+        ok_btn.clicked.connect(select_dlg.accept)
+        ok_btn.setDefault(True)
+        btn_layout.addStretch()
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(ok_btn)
+        layout.addLayout(btn_layout)
+
+        if select_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_collection = collection_combo.currentData()
+
+        # Filter by selected collection
+        if selected_collection:
+            all_photos = [p for p in all_photos if p.get('collection') == selected_collection]
+            collection_msg = f" in collection '{selected_collection}'"
+        else:
+            collection_msg = ""
+
         labeled = [p for p in all_photos if (p.get('camera_location') or '').strip()]
         unlabeled = [p for p in all_photos if not (p.get('camera_location') or '').strip()]
 
         if not labeled:
             QMessageBox.warning(self, "Site Detection",
-                "No labeled photos found.\n\n"
+                f"No labeled photos found{collection_msg}.\n\n"
                 "Please label some photos with camera locations first\n"
                 "(use the 'Camera Location' field in the photo info panel).")
             return
 
-        # Get unique locations
+        # Get unique locations from the filtered photos
         locations = set(p['camera_location'].strip() for p in labeled)
 
         info_msg = (
-            f"Ready to auto-detect sites for {len(unlabeled)} unlabeled photos.\n\n"
+            f"Ready to auto-detect sites for {len(unlabeled)} unlabeled photos{collection_msg}.\n\n"
             f"Using {len(labeled)} labeled photos from {len(locations)} sites as reference:\n"
             f"  {', '.join(sorted(locations))}\n\n"
             "Detection methods:\n"
@@ -11557,31 +13195,33 @@ class TrainerWindow(QMainWindow):
             QCoreApplication.processEvents()
 
         try:
-            # Create identifier
-            progress.setLabelText("Loading detection models...")
+            # Create detector
+            progress.setLabelText("Loading OCR detection...")
             QCoreApplication.processEvents()
 
-            identifier = SiteIdentifier(self.db)
-            if not identifier.ready:
+            if not OCR_AVAILABLE:
                 progress.close()
                 QMessageBox.warning(self, "Site Detection",
-                    "Site detection not available.\n"
-                    "Install pytesseract (OCR) and/or PyTorch (visual).")
+                    "OCR not available.\n"
+                    "Install pytesseract for site detection.")
                 return
 
-            # Build reference embeddings from labeled photos
-            progress.setLabelText("Building site references from labeled photos...")
-            QCoreApplication.processEvents()
-            identifier.build_site_references(labeled, samples_per_site=20)
+            detector = SiteDetector()
+            if not detector.ready:
+                progress.close()
+                QMessageBox.warning(self, "Site Detection",
+                    "OCR detector not ready.")
+                return
 
             # Process unlabeled photos
             ocr_count = 0
-            semantic_count = 0
             failed_count = 0
             by_site = {}
 
+            progress.setMaximum(len(unlabeled))
             for i, photo in enumerate(unlabeled):
-                if cancelled:
+                if progress.wasCanceled():
+                    cancelled = True
                     break
 
                 path = photo.get('file_path')
@@ -11589,10 +13229,15 @@ class TrainerWindow(QMainWindow):
                     failed_count += 1
                     continue
 
-                result = identifier.identify_site(path)
+                # Update progress every photo to keep UI responsive
+                progress.setValue(i + 1)
+                progress.setLabelText(f"Processing {i+1}/{len(unlabeled)}... Detected: {ocr_count}")
+                QCoreApplication.processEvents()
+
+                result = detector.detect_site(path)
 
                 if result:
-                    site_name, confidence, method = result
+                    site_name, confidence = result
 
                     # Save suggestion to database
                     site = self.db.get_site_by_name(site_name)
@@ -11603,17 +13248,9 @@ class TrainerWindow(QMainWindow):
                         self.db.set_photo_site_suggestion(photo['id'], site_id, confidence)
 
                     by_site[site_name] = by_site.get(site_name, 0) + 1
-
-                    if method == "ocr":
-                        ocr_count += 1
-                    else:
-                        semantic_count += 1
+                    ocr_count += 1
                 else:
                     failed_count += 1
-
-                if (i + 1) % 10 == 0:
-                    progress_cb(i + 1, len(unlabeled),
-                        f"OCR: {ocr_count}, Visual: {semantic_count}, Undetected: {failed_count}")
 
             progress.close()
 
@@ -11622,10 +13259,8 @@ class TrainerWindow(QMainWindow):
                 return
 
             # Show results
-            total_detected = ocr_count + semantic_count
             msg = (f"Site detection complete!\n\n"
-                   f"Detected via OCR (text overlay): {ocr_count}\n"
-                   f"Detected via visual matching: {semantic_count}\n"
+                   f"Detected via OCR: {ocr_count}\n"
                    f"Could not detect: {failed_count}\n\n")
 
             if by_site:
@@ -11911,9 +13546,15 @@ class TrainerWindow(QMainWindow):
                         break
 
                     if file_path.suffix.lower() in photo_extensions:
-                        # Check if already in database
+                        # Check if already in database by path
                         existing = self.db.get_photo_by_path(str(file_path))
                         if existing:
+                            skipped_count += 1
+                            continue
+
+                        # Compute hash and check for duplicate content
+                        file_hash = self._hash_file(file_path)
+                        if file_hash and self.db.photo_exists_by_hash(file_hash):
                             skipped_count += 1
                             continue
 
@@ -11927,7 +13568,8 @@ class TrainerWindow(QMainWindow):
                                 original_name=file_path.name,
                                 date_taken=date_taken.isoformat() if date_taken else None,
                                 camera_model=None,
-                                thumbnail_path=None
+                                thumbnail_path=None,
+                                file_hash=file_hash
                             )
                             if photo_id:
                                 added_count += 1

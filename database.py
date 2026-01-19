@@ -30,12 +30,106 @@ class TrailCamDatabase:
             db_path = str(db_dir / "trailcam.db")
 
         self.db_path = db_path
+        self.db_dir = Path(db_path).parent
         self._lock = threading.RLock()  # Reentrant lock for thread safety
+
+        # Check for crash on previous run and repair if needed
+        self._check_and_repair_after_crash()
+
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # Enable WAL mode for better concurrent access and performance
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init_database()
+
+        # Set crash flag - will be removed on clean exit
+        self._set_crash_flag()
+
+    def _get_crash_flag_path(self) -> Path:
+        """Get path to crash detection flag file."""
+        return self.db_dir / ".running"
+
+    def _set_crash_flag(self):
+        """Set flag indicating app is running (for crash detection)."""
+        try:
+            flag_path = self._get_crash_flag_path()
+            flag_path.write_text(f"pid:{os.getpid()}\nstarted:{datetime.now().isoformat()}")
+        except Exception as e:
+            logger.warning(f"Could not set crash flag: {e}")
+
+    def _clear_crash_flag(self):
+        """Clear crash flag on clean exit."""
+        try:
+            flag_path = self._get_crash_flag_path()
+            if flag_path.exists():
+                flag_path.unlink()
+        except Exception as e:
+            logger.warning(f"Could not clear crash flag: {e}")
+
+    def _check_and_repair_after_crash(self):
+        """Check if previous session crashed and repair database if needed."""
+        flag_path = self._get_crash_flag_path()
+
+        if not flag_path.exists():
+            return  # Clean shutdown last time
+
+        logger.warning("Detected unclean shutdown - checking database integrity...")
+        print("Detected previous crash - checking database integrity...")
+
+        try:
+            # Connect temporarily to check and repair
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            cursor = conn.cursor()
+
+            # Checkpoint WAL to ensure all data is written
+            cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+            # Check integrity
+            cursor.execute("PRAGMA integrity_check")
+            result = cursor.fetchone()[0]
+
+            if result != "ok":
+                logger.warning(f"Database integrity issues found: {result[:100]}...")
+                print("Database integrity issues found - attempting repair...")
+
+                # Try to repair by rebuilding indexes
+                cursor.execute("REINDEX")
+                conn.commit()
+
+                # Check again
+                cursor.execute("PRAGMA integrity_check")
+                result2 = cursor.fetchone()[0]
+
+                if result2 == "ok":
+                    logger.info("Database repaired successfully")
+                    print("Database repaired successfully!")
+                else:
+                    logger.error(f"Database repair incomplete: {result2[:100]}...")
+                    print("WARNING: Some database issues remain. Consider restoring from backup.")
+            else:
+                logger.info("Database integrity OK after crash recovery")
+                print("Database integrity verified - OK")
+
+            conn.close()
+
+            # Clear the old crash flag (we'll set a new one after init)
+            flag_path.unlink()
+
+        except Exception as e:
+            logger.error(f"Error during crash recovery check: {e}")
+            print(f"Error checking database: {e}")
+
+    def close(self):
+        """Close database connection cleanly."""
+        try:
+            # Checkpoint WAL before closing
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.conn.close()
+            # Clear crash flag on clean exit
+            self._clear_crash_flag()
+            logger.info("Database closed cleanly")
+        except Exception as e:
+            logger.error(f"Error closing database: {e}")
 
     def _execute_with_lock(self, func):
         """Execute a database operation with thread safety."""
@@ -505,22 +599,30 @@ class TrailCamDatabase:
                   favorite: int = 0, notes: str = "", season_year: Optional[int] = None,
                   camera_location: str = "", key_characteristics: str = "",
                   suggested_tag: str = "", suggested_confidence: Optional[float] = None,
-                  collection: str = "") -> int:
+                  collection: str = "", file_hash: str = None) -> Optional[int]:
         """Add a photo to the database.
 
+        Args:
+            file_hash: MD5 hash of the file. If provided and a photo with same hash exists,
+                      the insert will be skipped and None returned.
+
         Returns:
-            Photo ID
+            Photo ID, or None if photo already exists (duplicate hash)
         """
+        # Check for duplicate by file_hash (prevents importing same photo twice)
+        if file_hash and self.photo_exists_by_hash(file_hash):
+            return None
+
         if season_year is None:
             season_year = self.compute_season_year(date_taken)
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO photos
-                (file_path, original_name, date_taken, camera_model, import_date, thumbnail_path, favorite, notes, season_year, camera_location, key_characteristics, suggested_tag, suggested_confidence, collection)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (file_path, original_name, date_taken, camera_model, import_date, thumbnail_path, favorite, notes, season_year, camera_location, key_characteristics, suggested_tag, suggested_confidence, collection, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (file_path, original_name, date_taken, camera_model,
-                  datetime.now().isoformat(), thumbnail_path, favorite, notes, season_year, camera_location, key_characteristics, suggested_tag, suggested_confidence, collection))
+                  datetime.now().isoformat(), thumbnail_path, favorite, notes, season_year, camera_location, key_characteristics, suggested_tag, suggested_confidence, collection, file_hash))
             photo_id = cursor.lastrowid
             self.conn.commit()
             return photo_id
@@ -547,6 +649,26 @@ class TrailCamDatabase:
         cursor = self.conn.cursor()
         cursor.execute("SELECT 1 FROM photos WHERE original_name = ? LIMIT 1", (original_name,))
         return cursor.fetchone() is not None
+
+    def photo_exists_by_hash(self, file_hash: str) -> bool:
+        """Check if a photo with this file_hash already exists.
+
+        This prevents importing duplicate photos even if they have different filenames.
+        """
+        if not file_hash:
+            return False
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT 1 FROM photos WHERE file_hash = ? LIMIT 1", (file_hash,))
+        return cursor.fetchone() is not None
+
+    def get_photo_by_hash(self, file_hash: str) -> Optional[Dict]:
+        """Get photo by its file hash."""
+        if not file_hash:
+            return None
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM photos WHERE file_hash = ?", (file_hash,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
     
     def get_photo_path(self, photo_id: int) -> Optional[str]:
         """Get file path for a photo ID."""
@@ -594,9 +716,11 @@ class TrailCamDatabase:
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("DELETE FROM tags WHERE photo_id = ?", (photo_id,))
+            # Deduplicate tags to avoid UNIQUE constraint violation
+            unique_tags = list(dict.fromkeys(tags))  # Preserves order
             cursor.executemany(
                 "INSERT INTO tags (photo_id, tag_name) VALUES (?, ?)",
-                [(photo_id, tag) for tag in tags]
+                [(photo_id, tag) for tag in unique_tags]
             )
             self.conn.commit()
     
@@ -987,6 +1111,65 @@ class TrailCamDatabase:
         self.conn.commit()
         return affected
 
+    def rename_deer_id(self, old_id: str, new_id: str, season_years: List[int] = None) -> int:
+        """Rename a deer ID, optionally only for specific seasons.
+
+        Args:
+            old_id: Current deer ID
+            new_id: New deer ID
+            season_years: If provided, only rename for photos in these seasons.
+                         If None, rename all photos with this deer ID.
+
+        Returns:
+            Number of photos affected
+        """
+        if not old_id or not new_id or old_id == new_id:
+            return 0
+
+        cursor = self.conn.cursor()
+        affected = 0
+
+        if season_years:
+            # Get photo IDs for the specified seasons
+            placeholders = ','.join('?' * len(season_years))
+            cursor.execute(f"""
+                SELECT DISTINCT dm.photo_id FROM deer_metadata dm
+                JOIN photos p ON dm.photo_id = p.id
+                WHERE dm.deer_id = ? AND p.season_year IN ({placeholders})
+            """, [old_id] + season_years)
+            photo_ids = [row[0] for row in cursor.fetchall()]
+
+            if photo_ids:
+                placeholders = ','.join('?' * len(photo_ids))
+                cursor.execute(f"""
+                    UPDATE deer_metadata SET deer_id = ?
+                    WHERE deer_id = ? AND photo_id IN ({placeholders})
+                """, [new_id, old_id] + photo_ids)
+                affected = cursor.rowcount
+
+                # Update additional deer too
+                cursor.execute(f"""
+                    UPDATE deer_additional SET deer_id = ?
+                    WHERE deer_id = ? AND photo_id IN ({placeholders})
+                """, [new_id, old_id] + photo_ids)
+
+            # Update buck_profile_seasons for specified seasons
+            for sy in season_years:
+                cursor.execute("""
+                    UPDATE OR IGNORE buck_profile_seasons SET deer_id = ?
+                    WHERE deer_id = ? AND season_year = ?
+                """, (new_id, old_id, sy))
+                cursor.execute("""
+                    DELETE FROM buck_profile_seasons
+                    WHERE deer_id = ? AND season_year = ?
+                """, (old_id, sy))
+        else:
+            # Rename all - use merge logic
+            affected = self.merge_deer_ids(old_id, new_id)
+
+        self.conn.commit()
+        return affected
+
     def set_additional_deer(self, photo_id: int, deer_entries: List[Dict[str, Optional[Union[str, int, bool]]]]):
         """Replace additional deer list with provided entries."""
         cursor = self.conn.cursor()
@@ -1062,19 +1245,21 @@ class TrailCamDatabase:
     
     def set_suggested_tag(self, photo_id: int, tag: str, confidence: Optional[float]):
         """Store AI-suggested tag and confidence."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE photos SET suggested_tag = ?, suggested_confidence = ? WHERE id = ?
-        """, (tag, confidence, photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE photos SET suggested_tag = ?, suggested_confidence = ? WHERE id = ?
+            """, (tag, confidence, photo_id))
+            self.conn.commit()
 
     def set_suggested_sex(self, photo_id: int, sex: str, confidence: Optional[float]):
         """Store AI-suggested sex (buck/doe) and confidence."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE photos SET suggested_sex = ?, suggested_sex_confidence = ? WHERE id = ?
-        """, (sex, confidence, photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE photos SET suggested_sex = ?, suggested_sex_confidence = ? WHERE id = ?
+            """, (sex, confidence, photo_id))
+            self.conn.commit()
 
     def log_ai_rejection(self, photo_id: int, suggestion_type: str, ai_suggested: str,
                          correct_label: Optional[str] = None, model_version: Optional[str] = None):
@@ -1206,84 +1391,100 @@ class TrailCamDatabase:
     # Annotation boxes
     def set_boxes(self, photo_id: int, boxes: List[Dict[str, float]]):
         """Replace boxes for a photo. Boxes use relative coords 0-1 and optional per-box data."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
-        to_insert = []
-        for b in boxes:
-            conf = b.get("confidence")
-            species = b.get("species", "")
-            species_conf = b.get("species_conf")
-            sex = b.get("sex", "")
-            sex_conf = b.get("sex_conf")
-            to_insert.append((
-                photo_id,
-                b.get("label", ""),
-                float(b["x1"]),
-                float(b["y1"]),
-                float(b["x2"]),
-                float(b["y2"]),
-                float(conf) if conf is not None else None,
-                species if species else None,
-                float(species_conf) if species_conf is not None else None,
-                sex if sex else None,
-                float(sex_conf) if sex_conf is not None else None
-            ))
-        if to_insert:
-            cursor.executemany(
-                "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf, sex, sex_conf) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                to_insert,
-            )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
+
+            # Deduplicate boxes by (label, rounded coordinates)
+            seen = set()
+            unique_boxes = []
+            for b in boxes:
+                key = (b.get("label", ""),
+                       round(float(b["x1"]), 2), round(float(b["y1"]), 2),
+                       round(float(b["x2"]), 2), round(float(b["y2"]), 2))
+                if key not in seen:
+                    seen.add(key)
+                    unique_boxes.append(b)
+
+            to_insert = []
+            for b in unique_boxes:
+                conf = b.get("confidence")
+                species = b.get("species", "")
+                species_conf = b.get("species_conf")
+                sex = b.get("sex", "")
+                sex_conf = b.get("sex_conf")
+                to_insert.append((
+                    photo_id,
+                    b.get("label", ""),
+                    float(b["x1"]),
+                    float(b["y1"]),
+                    float(b["x2"]),
+                    float(b["y2"]),
+                    float(conf) if conf is not None else None,
+                    species if species else None,
+                    float(species_conf) if species_conf is not None else None,
+                    sex if sex else None,
+                    float(sex_conf) if sex_conf is not None else None
+                ))
+            if to_insert:
+                cursor.executemany(
+                    "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf, sex, sex_conf) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    to_insert,
+                )
+            self.conn.commit()
 
     def get_boxes(self, photo_id: int) -> List[Dict[str, float]]:
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf,
-                   head_x1, head_y1, head_x2, head_y2, head_notes, sex, sex_conf
-            FROM annotation_boxes WHERE photo_id = ?
-        """, (photo_id,))
-        out = []
-        for row in cursor.fetchall():
-            box = {"id": row[0], "label": row[1], "x1": row[2], "y1": row[3], "x2": row[4], "y2": row[5]}
-            if row[6] is not None:
-                box["confidence"] = row[6]
-            if row[7] is not None:
-                box["species"] = row[7]
-            if row[8] is not None:
-                box["species_conf"] = row[8]
-            # Head direction line
-            if row[9] is not None and row[10] is not None:
-                box["head_x1"] = row[9]
-                box["head_y1"] = row[10]
-                box["head_x2"] = row[11]
-                box["head_y2"] = row[12]
-            if row[13]:
-                box["head_notes"] = row[13]
-            # Per-box sex (buck/doe)
-            if row[14]:
-                box["sex"] = row[14]
-            if row[15] is not None:
-                box["sex_conf"] = row[15]
-            out.append(box)
-        return out
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf,
+                       head_x1, head_y1, head_x2, head_y2, head_notes, sex, sex_conf
+                FROM annotation_boxes WHERE photo_id = ?
+            """, (photo_id,))
+            out = []
+            for row in cursor.fetchall():
+                box = {"id": row[0], "label": row[1], "x1": row[2], "y1": row[3], "x2": row[4], "y2": row[5]}
+                if row[6] is not None:
+                    box["confidence"] = row[6]
+                if row[7] is not None:
+                    box["species"] = row[7]
+                if row[8] is not None:
+                    box["species_conf"] = row[8]
+                # Head direction line
+                if row[9] is not None and row[10] is not None:
+                    box["head_x1"] = row[9]
+                    box["head_y1"] = row[10]
+                    box["head_x2"] = row[11]
+                    box["head_y2"] = row[12]
+                if row[13]:
+                    box["head_notes"] = row[13]
+                # Per-box sex (buck/doe)
+                if row[14]:
+                    box["sex"] = row[14]
+                if row[15] is not None:
+                    box["sex_conf"] = row[15]
+                out.append(box)
+            return out
 
     def set_box_species(self, box_id: int, species: str, confidence: float = None):
         """Set species classification for a specific box."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE annotation_boxes SET species = ?, species_conf = ? WHERE id = ?",
-            (species, confidence, box_id)
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE annotation_boxes SET species = ?, species_conf = ? WHERE id = ?",
+                (species, confidence, box_id)
+            )
+            self.conn.commit()
 
     def set_box_sex(self, box_id: int, sex: str, confidence: float = None):
         """Set sex (buck/doe) classification for a specific box."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE annotation_boxes SET sex = ?, sex_conf = ? WHERE id = ?",
-            (sex, confidence, box_id)
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE annotation_boxes SET sex = ?, sex_conf = ? WHERE id = ?",
+                (sex, confidence, box_id)
+            )
+            self.conn.commit()
 
     def set_box_head_line(self, box_id: int, x1: float, y1: float, x2: float, y2: float, notes: str = None):
         """Set head direction line for a specific box.
@@ -1340,9 +1541,10 @@ class TrailCamDatabase:
 
     def has_detection_boxes(self, photo_id: int) -> bool:
         """Check if photo has any detection boxes (AI or human-labeled)."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
-        return cursor.fetchone()[0] > 0
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
+            return cursor.fetchone()[0] > 0
 
     def get_seasons(self) -> List[int]:
         """Return distinct antler season years present in the library, newest first."""
@@ -1545,9 +1747,9 @@ class TrailCamDatabase:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
     
-    def get_all_photos(self) -> List[Dict]:
-        """Get all photos."""
-        return self.search_photos()
+    def get_all_photos(self, include_archived: bool = True) -> List[Dict]:
+        """Get all photos (including archived by default for UI filtering)."""
+        return self.search_photos(include_archived=include_archived)
 
     def get_distinct_collections(self) -> List[str]:
         """Get all distinct collection names from the database."""
@@ -1861,24 +2063,42 @@ class TrailCamDatabase:
             Number of hashes calculated
         """
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, file_path FROM photos WHERE file_hash IS NULL")
+        cursor.execute("SELECT id, file_path, original_name FROM photos WHERE file_hash IS NULL")
         rows = cursor.fetchall()
 
         count = 0
+        duplicates = []
         total = len(rows)
         for i, row in enumerate(rows):
             if progress_callback:
                 progress_callback(i, total)
 
+            photo_id = row[0]
             file_path = row[1]
+            original_name = row[2] if len(row) > 2 else "unknown"
+
             if file_path and os.path.exists(file_path):
                 file_hash = self._calculate_file_hash(file_path)
                 if file_hash:
+                    # Check if this hash already exists (would be a duplicate)
+                    cursor.execute("SELECT id FROM photos WHERE file_hash = ?", (file_hash,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        # This is a duplicate - log it but don't crash
+                        duplicates.append((photo_id, original_name, existing[0]))
+                        logger.warning(f"Duplicate photo detected: ID {photo_id} ({original_name}) "
+                                       f"has same hash as ID {existing[0]}")
+                        continue
+
                     cursor.execute("UPDATE photos SET file_hash = ? WHERE id = ?",
-                                   (file_hash, row[0]))
+                                   (file_hash, photo_id))
                     count += 1
 
         self.conn.commit()
+
+        if duplicates:
+            logger.warning(f"Found {len(duplicates)} duplicate photos that need manual cleanup")
+
         return count
 
     def get_hash_stats(self) -> Dict[str, int]:
@@ -1946,8 +2166,10 @@ class TrailCamDatabase:
             print(msg)
 
         # Ensure all required columns exist before syncing (handles old databases)
-        self._ensure_deer_columns()
-        self._ensure_sync_tracking()
+        # These write to DB so need the lock
+        with self._lock:
+            self._ensure_deer_columns()
+            self._ensure_sync_tracking()
 
         # Get last sync time for incremental push
         last_sync = None if force_full else self.get_last_sync_time('push')
@@ -1958,284 +2180,295 @@ class TrailCamDatabase:
         hash_stats = self.get_hash_stats()
         if hash_stats["missing"] > 0:
             print(f"Calculating file hashes for {hash_stats['missing']} photos...")
-            self.calculate_missing_hashes()
+            with self._lock:
+                self.calculate_missing_hashes()
 
         from datetime import datetime
         counts = {"photos": 0, "tags": 0, "deer_metadata": 0, "deer_additional": 0,
                   "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0}
 
-        cursor = self.conn.cursor()
-        now = datetime.utcnow().isoformat()
-        BATCH_SIZE = 500  # Supabase handles batches well
+        # Use a separate read-only connection for sync queries to avoid blocking main thread
+        # This prevents "cannot commit transaction - SQL statements in progress" errors
+        sync_conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        sync_conn.row_factory = sqlite3.Row
 
-        # Build WHERE clause for incremental sync
-        # Normalize last_sync to match SQLite datetime format (space instead of T)
-        def since_clause(table_alias=""):
-            if last_sync is None:
-                return ""
-            # SQLite datetime uses space, Python ISO uses T - normalize for comparison
-            normalized_sync = last_sync.replace('T', ' ')
-            prefix = f"{table_alias}." if table_alias else ""
-            return f" AND {prefix}updated_at > '{normalized_sync}'"
-
-        def batch_upsert(table_name, data_list, on_conflict):
-            """Upsert data in batches."""
-            for i in range(0, len(data_list), BATCH_SIZE):
-                batch = data_list[i:i + BATCH_SIZE]
-                if batch:
-                    supabase_client.table(table_name).upsert(batch, on_conflict=on_conflict).execute()
-
-        # Push photos_sync (photo identifiers and basic metadata)
-        report(1, "Syncing photos...")
-        query = "SELECT * FROM photos WHERE 1=1" + since_clause()
-        cursor.execute(query)
-        photos_data = []
-        for row in cursor.fetchall():
-            photo = dict(row)
-            photo_key = self._make_photo_key(photo)
-            photos_data.append({
-                "photo_key": photo_key,
-                "file_hash": photo.get("file_hash"),  # For cross-computer matching
-                "original_name": photo.get("original_name"),
-                "date_taken": photo.get("date_taken"),
-                "camera_model": photo.get("camera_model"),
-                "camera_location": photo.get("camera_location"),
-                "season_year": photo.get("season_year"),
-                "favorite": bool(photo.get("favorite")),
-                "notes": photo.get("notes"),
-                "collection": photo.get("collection"),  # Club/collection name
-                "r2_photo_id": str(photo.get("id")),  # Local photo ID for R2 URL mapping
-                "archived": bool(photo.get("archived")),  # Hide from mobile by default
-                "updated_at": now
-            })
-        batch_upsert("photos_sync", photos_data, "photo_key")
-        counts["photos"] = len(photos_data)
-
-        # Push tags
-        report(2, "Syncing tags...")
-        cursor.execute(f"""
-            SELECT t.tag_name, t.updated_at, p.original_name, p.date_taken, p.camera_model, p.file_hash
-            FROM tags t
-            JOIN photos p ON t.photo_id = p.id
-            WHERE 1=1 {since_clause('t')}
-        """)
-        tags_data = []
-        for row in cursor.fetchall():
-            photo_key = f"{row['original_name']}|{row['date_taken']}|{row['camera_model']}"
-            tags_data.append({
-                "photo_key": photo_key,
-                "file_hash": row["file_hash"],
-                "tag_name": row["tag_name"],
-                "updated_at": now
-            })
-        batch_upsert("tags", tags_data, "photo_key,tag_name")
-        counts["tags"] = len(tags_data)
-
-        # Delete tags from Supabase that were deleted locally
-        # Get ALL local tags (not just recent) to compare
-        cursor.execute("""
-            SELECT t.tag_name, p.file_hash
-            FROM tags t
-            JOIN photos p ON t.photo_id = p.id
-            WHERE p.file_hash IS NOT NULL
-        """)
-        local_tags = set()
-        for row in cursor.fetchall():
-            local_tags.add((row["file_hash"], row["tag_name"]))
-
-        # Get all tags from Supabase
         try:
-            result = supabase_client.table("tags").select("file_hash,tag_name").execute(fetch_all=True)
-            cloud_tags = set()
-            for row in result.data:
-                if row.get("file_hash"):
-                    cloud_tags.add((row["file_hash"], row["tag_name"]))
+            cursor = sync_conn.cursor()
+            now = datetime.utcnow().isoformat()
+            BATCH_SIZE = 500  # Supabase handles batches well
 
-            # Find tags in cloud but not local (deleted locally)
-            deleted_tags = cloud_tags - local_tags
-            if deleted_tags:
-                logger.info(f"Deleting {len(deleted_tags)} tags from Supabase that were deleted locally")
-                for file_hash, tag_name in deleted_tags:
-                    try:
-                        supabase_client.table("tags").delete().eq("file_hash", file_hash).eq("tag_name", tag_name).execute()
-                    except Exception as e:
-                        logger.warning(f"Failed to delete tag {tag_name} for {file_hash}: {e}")
-                counts["tags_deleted"] = len(deleted_tags)
-        except Exception as e:
-            logger.warning(f"Could not sync tag deletions: {e}")
+            # Build WHERE clause for incremental sync
+            # Normalize last_sync to match SQLite datetime format (space instead of T)
+            def since_clause(table_alias=""):
+                if last_sync is None:
+                    return ""
+                # SQLite datetime uses space, Python ISO uses T - normalize for comparison
+                normalized_sync = last_sync.replace('T', ' ')
+                prefix = f"{table_alias}." if table_alias else ""
+                return f" AND {prefix}updated_at > '{normalized_sync}'"
 
-        # Push deer_metadata
-        report(3, "Syncing deer metadata...")
-        cursor.execute(f"""
-            SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
-            FROM deer_metadata d
-            JOIN photos p ON d.photo_id = p.id
-            WHERE 1=1 {since_clause('d')}
-        """)
-        deer_meta_data = []
-        for row in cursor.fetchall():
-            d = dict(row)
-            photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
-            deer_meta_data.append({
-                "photo_key": photo_key,
-                "file_hash": d.get("file_hash"),
-                "deer_id": d.get("deer_id"),
-                "age_class": d.get("age_class"),
-                "left_points_min": d.get("left_points_min"),
-                "left_points_max": d.get("left_points_max"),
-                "right_points_min": d.get("right_points_min"),
-                "right_points_max": d.get("right_points_max"),
-                "left_points_uncertain": bool(d.get("left_points_uncertain")),
-                "right_points_uncertain": bool(d.get("right_points_uncertain")),
-                "left_ab_points_min": d.get("left_ab_points_min"),
-                "left_ab_points_max": d.get("left_ab_points_max"),
-                "right_ab_points_min": d.get("right_ab_points_min"),
-                "right_ab_points_max": d.get("right_ab_points_max"),
-                "abnormal_points_min": d.get("abnormal_points_min"),
-                "abnormal_points_max": d.get("abnormal_points_max"),
-                "broken_antler_side": d.get("broken_antler_side"),
-                "broken_antler_note": d.get("broken_antler_note"),
-                "updated_at": now
-            })
-        batch_upsert("deer_metadata", deer_meta_data, "photo_key")
-        counts["deer_metadata"] = len(deer_meta_data)
+            def batch_upsert(table_name, data_list, on_conflict):
+                """Upsert data in batches."""
+                for i in range(0, len(data_list), BATCH_SIZE):
+                    batch = data_list[i:i + BATCH_SIZE]
+                    if batch:
+                        supabase_client.table(table_name).upsert(batch, on_conflict=on_conflict).execute()
 
-        # Push deer_additional
-        report(4, "Syncing additional deer...")
-        cursor.execute(f"""
-            SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
-            FROM deer_additional d
-            JOIN photos p ON d.photo_id = p.id
-            WHERE 1=1 {since_clause('d')}
-        """)
-        deer_add_data = []
-        for row in cursor.fetchall():
-            d = dict(row)
-            photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
-            deer_add_data.append({
-                "photo_key": photo_key,
-                "file_hash": d.get("file_hash"),
-                "deer_id": d.get("deer_id"),
-                "age_class": d.get("age_class"),
-                "left_points_min": d.get("left_points_min"),
-                "left_points_max": d.get("left_points_max"),
-                "right_points_min": d.get("right_points_min"),
-                "right_points_max": d.get("right_points_max"),
-                "left_points_uncertain": bool(d.get("left_points_uncertain")),
-                "right_points_uncertain": bool(d.get("right_points_uncertain")),
-                "left_ab_points_min": d.get("left_ab_points_min"),
-                "left_ab_points_max": d.get("left_ab_points_max"),
-                "right_ab_points_min": d.get("right_ab_points_min"),
-                "right_ab_points_max": d.get("right_ab_points_max"),
-                "abnormal_points_min": d.get("abnormal_points_min"),
-                "abnormal_points_max": d.get("abnormal_points_max"),
-                "broken_antler_side": d.get("broken_antler_side"),
-                "broken_antler_note": d.get("broken_antler_note"),
-                "updated_at": now
-            })
-        batch_upsert("deer_additional", deer_add_data, "photo_key,deer_id")
-        counts["deer_additional"] = len(deer_add_data)
+            # Push photos_sync (photo identifiers and basic metadata)
+            report(1, "Syncing photos...")
+            query = "SELECT * FROM photos WHERE 1=1" + since_clause()
+            cursor.execute(query)
+            photos_data = []
+            for row in cursor.fetchall():
+                photo = dict(row)
+                photo_key = self._make_photo_key(photo)
+                photos_data.append({
+                    "photo_key": photo_key,
+                    "file_hash": photo.get("file_hash"),  # For cross-computer matching
+                    "original_name": photo.get("original_name"),
+                    "date_taken": photo.get("date_taken"),
+                    "camera_model": photo.get("camera_model"),
+                    "camera_location": photo.get("camera_location"),
+                    "season_year": photo.get("season_year"),
+                    "favorite": bool(photo.get("favorite")),
+                    "notes": photo.get("notes"),
+                    "collection": photo.get("collection"),  # Club/collection name
+                    "r2_photo_id": str(photo.get("id")),  # Local photo ID for R2 URL mapping
+                    "archived": bool(photo.get("archived")),  # Hide from mobile by default
+                    "updated_at": now
+                })
+            batch_upsert("photos_sync", photos_data, "photo_key")
+            counts["photos"] = len(photos_data)
 
-        # Push buck_profiles
-        report(5, "Syncing buck profiles...")
-        cursor.execute(f"SELECT * FROM buck_profiles WHERE 1=1 {since_clause()}")
-        profiles_data = []
-        for row in cursor.fetchall():
-            d = dict(row)
-            profiles_data.append({
-                "deer_id": d.get("deer_id"),
-                "display_name": d.get("display_name"),
-                "notes": d.get("notes"),
-                "updated_at": now
-            })
-        batch_upsert("buck_profiles", profiles_data, "deer_id")
-        counts["buck_profiles"] = len(profiles_data)
-
-        # Push buck_profile_seasons
-        report(6, "Syncing buck profile seasons...")
-        cursor.execute(f"SELECT * FROM buck_profile_seasons WHERE 1=1 {since_clause()}")
-        seasons_data = []
-        for row in cursor.fetchall():
-            d = dict(row)
-            seasons_data.append({
-                "deer_id": d.get("deer_id"),
-                "season_year": d.get("season_year"),
-                "camera_locations": d.get("camera_locations"),
-                "key_characteristics": d.get("key_characteristics"),
-                "left_points_min": d.get("left_points_min"),
-                "left_points_max": d.get("left_points_max"),
-                "right_points_min": d.get("right_points_min"),
-                "right_points_max": d.get("right_points_max"),
-                "left_ab_points_min": d.get("left_ab_points_min"),
-                "left_ab_points_max": d.get("left_ab_points_max"),
-                "right_ab_points_min": d.get("right_ab_points_min"),
-                "right_ab_points_max": d.get("right_ab_points_max"),
-                "abnormal_points_min": d.get("abnormal_points_min"),
-                "abnormal_points_max": d.get("abnormal_points_max"),
-                "updated_at": now
-            })
-        batch_upsert("buck_profile_seasons", seasons_data, "deer_id,season_year")
-        counts["buck_profile_seasons"] = len(seasons_data)
-
-        # Push annotation_boxes - but ONLY if we have a substantial local database
-        # This prevents accidentally wiping cloud boxes when pushing from an empty/new computer
-        report(7, "Syncing annotation boxes...")
-        cursor.execute("SELECT COUNT(*) FROM annotation_boxes")
-        local_box_count = cursor.fetchone()[0]
-
-        # Safety check: don't delete cloud boxes if local has very few
-        # (protects against pushing from empty/new database)
-        if local_box_count < 100:
-            print(f"  Skipping box sync - only {local_box_count} local boxes (need 100+ to sync)")
-            print("  This protects cloud data from being overwritten by an empty database.")
-            print("  Run 'Pull from Cloud' first if this is a new computer.")
-            counts["annotation_boxes"] = 0
-        else:
+            # Push tags
+            report(2, "Syncing tags...")
             cursor.execute(f"""
-                SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
-                FROM annotation_boxes b
-                JOIN photos p ON b.photo_id = p.id
-                WHERE 1=1 {since_clause('b')}
+                SELECT t.tag_name, t.updated_at, p.original_name, p.date_taken, p.camera_model, p.file_hash
+                FROM tags t
+                JOIN photos p ON t.photo_id = p.id
+                WHERE 1=1 {since_clause('t')}
             """)
-            boxes_data = []
+            tags_data = []
+            for row in cursor.fetchall():
+                photo_key = f"{row['original_name']}|{row['date_taken']}|{row['camera_model']}"
+                tags_data.append({
+                    "photo_key": photo_key,
+                    "file_hash": row["file_hash"],
+                    "tag_name": row["tag_name"],
+                    "updated_at": now
+                })
+            batch_upsert("tags", tags_data, "photo_key,tag_name")
+            counts["tags"] = len(tags_data)
+
+            # Delete tags from Supabase that were deleted locally
+            # Get ALL local tags (not just recent) to compare
+            cursor.execute("""
+                SELECT t.tag_name, p.file_hash
+                FROM tags t
+                JOIN photos p ON t.photo_id = p.id
+                WHERE p.file_hash IS NOT NULL
+            """)
+            local_tags = set()
+            for row in cursor.fetchall():
+                local_tags.add((row["file_hash"], row["tag_name"]))
+
+            # Get all tags from Supabase
+            try:
+                result = supabase_client.table("tags").select("file_hash,tag_name").execute(fetch_all=True)
+                cloud_tags = set()
+                for row in result.data:
+                    if row.get("file_hash"):
+                        cloud_tags.add((row["file_hash"], row["tag_name"]))
+
+                # Find tags in cloud but not local (deleted locally)
+                deleted_tags = cloud_tags - local_tags
+                if deleted_tags:
+                    logger.info(f"Deleting {len(deleted_tags)} tags from Supabase that were deleted locally")
+                    for file_hash, tag_name in deleted_tags:
+                        try:
+                            supabase_client.table("tags").delete().eq("file_hash", file_hash).eq("tag_name", tag_name).execute()
+                        except Exception as e:
+                            logger.warning(f"Failed to delete tag {tag_name} for {file_hash}: {e}")
+                    counts["tags_deleted"] = len(deleted_tags)
+            except Exception as e:
+                logger.warning(f"Could not sync tag deletions: {e}")
+
+            # Push deer_metadata
+            report(3, "Syncing deer metadata...")
+            cursor.execute(f"""
+                SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
+                FROM deer_metadata d
+                JOIN photos p ON d.photo_id = p.id
+                WHERE 1=1 {since_clause('d')}
+            """)
+            deer_meta_data = []
             for row in cursor.fetchall():
                 d = dict(row)
                 photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
-                boxes_data.append({
+                deer_meta_data.append({
                     "photo_key": photo_key,
                     "file_hash": d.get("file_hash"),
-                    "label": d.get("label"),
-                    "x1": d.get("x1"),
-                    "y1": d.get("y1"),
-                    "x2": d.get("x2"),
-                    "y2": d.get("y2"),
-                    "confidence": d.get("confidence"),
-                    "species": d.get("species"),
-                    "species_conf": d.get("species_conf"),
-                    "sex": d.get("sex"),
-                    "sex_conf": d.get("sex_conf"),
+                    "deer_id": d.get("deer_id"),
+                    "age_class": d.get("age_class"),
+                    "left_points_min": d.get("left_points_min"),
+                    "left_points_max": d.get("left_points_max"),
+                    "right_points_min": d.get("right_points_min"),
+                    "right_points_max": d.get("right_points_max"),
+                    "left_points_uncertain": bool(d.get("left_points_uncertain")),
+                    "right_points_uncertain": bool(d.get("right_points_uncertain")),
+                    "left_ab_points_min": d.get("left_ab_points_min"),
+                    "left_ab_points_max": d.get("left_ab_points_max"),
+                    "right_ab_points_min": d.get("right_ab_points_min"),
+                    "right_ab_points_max": d.get("right_ab_points_max"),
+                    "abnormal_points_min": d.get("abnormal_points_min"),
+                    "abnormal_points_max": d.get("abnormal_points_max"),
+                    "broken_antler_side": d.get("broken_antler_side"),
+                    "broken_antler_note": d.get("broken_antler_note"),
                     "updated_at": now
                 })
-            # For incremental sync, use upsert instead of delete+insert
-            if boxes_data:
-                if last_sync is None:
-                    # Full sync: delete all and re-insert
-                    supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
-                    for i in range(0, len(boxes_data), BATCH_SIZE):
-                        batch = boxes_data[i:i + BATCH_SIZE]
-                        if batch:
-                            supabase_client.table("annotation_boxes").insert(batch).execute()
-                else:
-                    # Incremental sync: upsert changed boxes
-                    batch_upsert("annotation_boxes", boxes_data, "photo_key,label,x1,y1")
-            counts["annotation_boxes"] = len(boxes_data)
+            batch_upsert("deer_metadata", deer_meta_data, "photo_key")
+            counts["deer_metadata"] = len(deer_meta_data)
 
-        report(7, "Sync complete!")
+            # Push deer_additional
+            report(4, "Syncing additional deer...")
+            cursor.execute(f"""
+                SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
+                FROM deer_additional d
+                JOIN photos p ON d.photo_id = p.id
+                WHERE 1=1 {since_clause('d')}
+            """)
+            deer_add_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
+                deer_add_data.append({
+                    "photo_key": photo_key,
+                    "file_hash": d.get("file_hash"),
+                    "deer_id": d.get("deer_id"),
+                    "age_class": d.get("age_class"),
+                    "left_points_min": d.get("left_points_min"),
+                    "left_points_max": d.get("left_points_max"),
+                    "right_points_min": d.get("right_points_min"),
+                    "right_points_max": d.get("right_points_max"),
+                    "left_points_uncertain": bool(d.get("left_points_uncertain")),
+                    "right_points_uncertain": bool(d.get("right_points_uncertain")),
+                    "left_ab_points_min": d.get("left_ab_points_min"),
+                    "left_ab_points_max": d.get("left_ab_points_max"),
+                    "right_ab_points_min": d.get("right_ab_points_min"),
+                    "right_ab_points_max": d.get("right_ab_points_max"),
+                    "abnormal_points_min": d.get("abnormal_points_min"),
+                    "abnormal_points_max": d.get("abnormal_points_max"),
+                    "broken_antler_side": d.get("broken_antler_side"),
+                    "broken_antler_note": d.get("broken_antler_note"),
+                    "updated_at": now
+                })
+            batch_upsert("deer_additional", deer_add_data, "photo_key,deer_id")
+            counts["deer_additional"] = len(deer_add_data)
 
-        # Update last sync time after successful push
-        self.set_last_sync_time('push', now)
+            # Push buck_profiles
+            report(5, "Syncing buck profiles...")
+            cursor.execute(f"SELECT * FROM buck_profiles WHERE 1=1 {since_clause()}")
+            profiles_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                profiles_data.append({
+                    "deer_id": d.get("deer_id"),
+                    "display_name": d.get("display_name"),
+                    "notes": d.get("notes"),
+                    "updated_at": now
+                })
+            batch_upsert("buck_profiles", profiles_data, "deer_id")
+            counts["buck_profiles"] = len(profiles_data)
 
-        return counts
+            # Push buck_profile_seasons
+            report(6, "Syncing buck profile seasons...")
+            cursor.execute(f"SELECT * FROM buck_profile_seasons WHERE 1=1 {since_clause()}")
+            seasons_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                seasons_data.append({
+                    "deer_id": d.get("deer_id"),
+                    "season_year": d.get("season_year"),
+                    "camera_locations": d.get("camera_locations"),
+                    "key_characteristics": d.get("key_characteristics"),
+                    "left_points_min": d.get("left_points_min"),
+                    "left_points_max": d.get("left_points_max"),
+                    "right_points_min": d.get("right_points_min"),
+                    "right_points_max": d.get("right_points_max"),
+                    "left_ab_points_min": d.get("left_ab_points_min"),
+                    "left_ab_points_max": d.get("left_ab_points_max"),
+                    "right_ab_points_min": d.get("right_ab_points_min"),
+                    "right_ab_points_max": d.get("right_ab_points_max"),
+                    "abnormal_points_min": d.get("abnormal_points_min"),
+                    "abnormal_points_max": d.get("abnormal_points_max"),
+                    "updated_at": now
+                })
+            batch_upsert("buck_profile_seasons", seasons_data, "deer_id,season_year")
+            counts["buck_profile_seasons"] = len(seasons_data)
+
+            # Push annotation_boxes - but ONLY if we have a substantial local database
+            # This prevents accidentally wiping cloud boxes when pushing from an empty/new computer
+            report(7, "Syncing annotation boxes...")
+            cursor.execute("SELECT COUNT(*) FROM annotation_boxes")
+            local_box_count = cursor.fetchone()[0]
+
+            # Safety check: don't delete cloud boxes if local has very few
+            # (protects against pushing from empty/new database)
+            if local_box_count < 100:
+                print(f"  Skipping box sync - only {local_box_count} local boxes (need 100+ to sync)")
+                print("  This protects cloud data from being overwritten by an empty database.")
+                print("  Run 'Pull from Cloud' first if this is a new computer.")
+                counts["annotation_boxes"] = 0
+            else:
+                cursor.execute(f"""
+                    SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
+                    FROM annotation_boxes b
+                    JOIN photos p ON b.photo_id = p.id
+                    WHERE 1=1 {since_clause('b')}
+                """)
+                boxes_data = []
+                for row in cursor.fetchall():
+                    d = dict(row)
+                    photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
+                    boxes_data.append({
+                        "photo_key": photo_key,
+                        "file_hash": d.get("file_hash"),
+                        "label": d.get("label"),
+                        "x1": d.get("x1"),
+                        "y1": d.get("y1"),
+                        "x2": d.get("x2"),
+                        "y2": d.get("y2"),
+                        "confidence": d.get("confidence"),
+                        "species": d.get("species"),
+                        "species_conf": d.get("species_conf"),
+                        "sex": d.get("sex"),
+                        "sex_conf": d.get("sex_conf"),
+                        "updated_at": now
+                    })
+                # For incremental sync, use upsert instead of delete+insert
+                if boxes_data:
+                    if last_sync is None:
+                        # Full sync: delete all and re-insert
+                        supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
+                        for i in range(0, len(boxes_data), BATCH_SIZE):
+                            batch = boxes_data[i:i + BATCH_SIZE]
+                            if batch:
+                                supabase_client.table("annotation_boxes").insert(batch).execute()
+                    else:
+                        # Incremental sync: upsert changed boxes
+                        batch_upsert("annotation_boxes", boxes_data, "photo_key,label,x1,y1")
+                counts["annotation_boxes"] = len(boxes_data)
+
+            report(7, "Sync complete!")
+
+            # Update last sync time after successful push
+            with self._lock:
+                self.set_last_sync_time('push', now)
+
+            return counts
+        finally:
+            # Always close the dedicated sync connection
+            sync_conn.close()
 
     def pull_from_supabase(self, supabase_client, progress_callback=None) -> Dict[str, int]:
         """Pull data from Supabase and update local database. Returns counts.
@@ -2246,7 +2479,7 @@ class TrailCamDatabase:
         """
         def report(step, msg):
             if progress_callback:
-                progress_callback(step, 7, msg)
+                progress_callback(step, 8, msg)
             print(msg)
 
         # Ensure all required columns exist before syncing (handles old databases)
@@ -2360,7 +2593,47 @@ class TrailCamDatabase:
                       row.get("abnormal_points_min"), row.get("abnormal_points_max")))
                 counts["buck_profile_seasons"] += 1
 
-        report(7, "Sync complete!")
+        # Pull annotation_boxes (fetch_all to bypass 1000 row limit)
+        report(7, "Pulling annotation boxes...")
+        result = supabase_client.table("annotation_boxes").select("*").execute(fetch_all=True)
+        for row in result.data:
+            photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
+            if photo:
+                # Check if this box already exists (by photo_id + label + coordinates)
+                cursor.execute("""
+                    SELECT id FROM annotation_boxes
+                    WHERE photo_id = ? AND label = ? AND x1 = ? AND y1 = ? AND x2 = ? AND y2 = ?
+                """, (photo["id"], row.get("label"), row.get("x1"), row.get("y1"), row.get("x2"), row.get("y2")))
+                existing = cursor.fetchone()
+
+                if existing:
+                    # Update existing box
+                    cursor.execute("""
+                        UPDATE annotation_boxes SET
+                            confidence = ?, species = ?, species_conf = ?,
+                            sex = ?, sex_conf = ?,
+                            head_x1 = ?, head_y1 = ?, head_x2 = ?, head_y2 = ?, head_notes = ?
+                        WHERE id = ?
+                    """, (row.get("confidence"), row.get("species"), row.get("species_conf"),
+                          row.get("sex"), row.get("sex_conf"),
+                          row.get("head_x1"), row.get("head_y1"), row.get("head_x2"), row.get("head_y2"),
+                          row.get("head_notes"), existing[0]))
+                else:
+                    # Insert new box
+                    cursor.execute("""
+                        INSERT INTO annotation_boxes
+                        (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf,
+                         sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (photo["id"], row.get("label"), row.get("x1"), row.get("y1"),
+                          row.get("x2"), row.get("y2"), row.get("confidence"),
+                          row.get("species"), row.get("species_conf"),
+                          row.get("sex"), row.get("sex_conf"),
+                          row.get("head_x1"), row.get("head_y1"), row.get("head_x2"), row.get("head_y2"),
+                          row.get("head_notes")))
+                counts["annotation_boxes"] += 1
+
+        report(8, "Sync complete!")
         self.conn.commit()
         return counts
 
