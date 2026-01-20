@@ -13,6 +13,7 @@ Environment variables required:
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from pathlib import Path
 import boto3
 import requests
 from botocore.config import Config
+from PIL import Image
 
 # CuddeLink URLs
 BASE_URL = "https://camp.cuddeback.com"
@@ -209,10 +211,40 @@ def check_photo_exists(supabase_url: str, supabase_key: str, file_hash: str) -> 
     return False
 
 
+def create_thumbnail(image_path: Path, max_size: int = 400) -> bytes:
+    """Create a thumbnail from an image. Returns JPEG bytes."""
+    with Image.open(image_path) as img:
+        # Convert to RGB if necessary (handles RGBA, etc.)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+
+        # Calculate new size maintaining aspect ratio
+        ratio = min(max_size / img.width, max_size / img.height)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+
+        # Resize with high quality
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+        # Save to bytes
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=75, optimize=True)
+        return buffer.getvalue()
+
+
 def upload_to_r2(s3_client, bucket: str, file_path: Path, r2_key: str) -> bool:
     """Upload file to R2."""
     try:
         s3_client.upload_file(str(file_path), bucket, r2_key)
+        return True
+    except Exception as e:
+        print(f"[R2] Upload failed: {e}")
+        return False
+
+
+def upload_bytes_to_r2(s3_client, bucket: str, data: bytes, r2_key: str) -> bool:
+    """Upload bytes to R2."""
+    try:
+        s3_client.put_object(Bucket=bucket, Key=r2_key, Body=data, ContentType='image/jpeg')
         return True
     except Exception as e:
         print(f"[R2] Upload failed: {e}")
@@ -234,7 +266,6 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, date_
         "file_hash": file_hash,
         "photo_key": photo_key,
         "date_taken": date_taken,
-        "source": "github_action",
         "updated_at": datetime.utcnow().isoformat(),
     }
 
@@ -286,9 +317,18 @@ def process_day(session: requests.Session, day_str: str, s3_client, config: dict
                 skipped += 1
                 continue
 
-            # Upload to R2
+            # Upload full image to R2
             r2_key = f"photos/{file_hash}.jpg"
             if upload_to_r2(s3_client, config["r2_bucket"], img_path, r2_key):
+                # Generate and upload thumbnail
+                try:
+                    thumb_data = create_thumbnail(img_path)
+                    thumb_key = f"thumbnails/{file_hash}_thumb.jpg"
+                    upload_bytes_to_r2(s3_client, config["r2_bucket"], thumb_data, thumb_key)
+                    print(f"  Uploaded: {img_path.name} + thumbnail")
+                except Exception as e:
+                    print(f"  Uploaded: {img_path.name} (thumbnail failed: {e})")
+
                 # Save metadata
                 save_to_supabase(
                     config["supabase_url"],
@@ -297,7 +337,6 @@ def process_day(session: requests.Session, day_str: str, s3_client, config: dict
                     day_str,
                     img_path.name,
                 )
-                print(f"  Uploaded: {img_path.name}")
                 uploaded += 1
             else:
                 print(f"  Failed: {img_path.name}")

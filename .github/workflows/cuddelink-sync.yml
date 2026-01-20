@@ -34,7 +34,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests boto3
+          pip install requests boto3 Pillow
 
       - name: Run CuddeLink to R2 sync
         env:
