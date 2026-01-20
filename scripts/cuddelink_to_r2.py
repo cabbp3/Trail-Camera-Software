@@ -231,6 +231,26 @@ def create_thumbnail(image_path: Path, max_size: int = 400) -> bytes:
         return buffer.getvalue()
 
 
+def parse_cuddelink_datetime(filename: str, fallback_date: str) -> str:
+    """Parse datetime from CuddeLink filename.
+
+    Filename format: 2026-01-20T16_01_52.430510-8.jpeg
+    Returns ISO datetime string like: 2026-01-20T16:01:52
+    """
+    # Try to extract datetime from filename
+    # Pattern: YYYY-MM-DDTHH_MM_SS.microseconds-sequence.ext
+    match = re.match(r'(\d{4}-\d{2}-\d{2})T(\d{2})_(\d{2})_(\d{2})', filename)
+    if match:
+        date_part = match.group(1)
+        hour = match.group(2)
+        minute = match.group(3)
+        second = match.group(4)
+        return f"{date_part}T{hour}:{minute}:{second}"
+
+    # Fallback to just the date
+    return fallback_date
+
+
 def upload_to_r2(s3_client, bucket: str, file_path: Path, r2_key: str) -> bool:
     """Upload file to R2."""
     try:
@@ -251,7 +271,7 @@ def upload_bytes_to_r2(s3_client, bucket: str, data: bytes, r2_key: str) -> bool
         return False
 
 
-def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, date_taken: str, filename: str) -> bool:
+def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datetime_taken: str, filename: str) -> bool:
     """Save photo metadata to Supabase."""
     headers = {
         "apikey": supabase_key,
@@ -260,12 +280,15 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, date_
         "Prefer": "resolution=merge-duplicates",
     }
 
-    photo_key = f"{date_taken.replace('-', '/')}/{filename}"
+    # Extract just the date part for the photo_key path
+    date_part = datetime_taken.split("T")[0]
+    photo_key = f"{date_part.replace('-', '/')}/{filename}"
 
     data = {
         "file_hash": file_hash,
         "photo_key": photo_key,
-        "date_taken": date_taken,
+        "date_taken": datetime_taken,
+        "original_name": filename,
         "updated_at": datetime.utcnow().isoformat(),
     }
 
@@ -329,12 +352,15 @@ def process_day(session: requests.Session, day_str: str, s3_client, config: dict
                 except Exception as e:
                     print(f"  Uploaded: {img_path.name} (thumbnail failed: {e})")
 
+                # Parse datetime from filename
+                datetime_taken = parse_cuddelink_datetime(img_path.name, day_str)
+
                 # Save metadata
                 save_to_supabase(
                     config["supabase_url"],
                     config["supabase_key"],
                     file_hash,
-                    day_str,
+                    datetime_taken,
                     img_path.name,
                 )
                 uploaded += 1
