@@ -1,0 +1,50 @@
+name: CuddeLink to R2 Sync
+
+on:
+  schedule:
+    # Times in UTC (Central Standard Time = UTC-6)
+    # 6:15 AM CST = 12:15 UTC
+    - cron: '15 12 * * *'
+    # 11:15 AM CST = 17:15 UTC
+    - cron: '15 17 * * *'
+    # 8:15 PM CST = 02:15 UTC (next day)
+    - cron: '15 2 * * *'
+
+  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      days_back:
+        description: 'Days to look back'
+        required: false
+        default: '1'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests boto3
+
+      - name: Run CuddeLink to R2 sync
+        env:
+          CUDDELINK_EMAIL: ${{ secrets.CUDDELINK_EMAIL }}
+          CUDDELINK_PASSWORD: ${{ secrets.CUDDELINK_PASSWORD }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python scripts/cuddelink_to_r2.py --days-back ${{ github.event.inputs.days_back || '1' }}
