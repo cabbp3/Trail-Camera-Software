@@ -21,6 +21,12 @@
 
 Comprehensive audit across desktop and mobile apps. Items below are prioritized for future work.
 
+### HIGHEST Priority - Feature
+
+| Issue | Location | Effort |
+|-------|----------|--------|
+| Desktop auto-pull from cloud | `training/label_tool.py`, `supabase_rest.py`, `r2_storage.py` | On app open: query Supabase for photos not in local DB, prompt user to download, show progress bar while pulling thumbnails/photos from R2. ~1 day. |
+
 ### HIGH Priority - Architecture
 
 | Issue | Location | Effort |
