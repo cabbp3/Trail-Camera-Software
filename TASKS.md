@@ -13,7 +13,7 @@
 
 | ID | Task | Status | Started |
 |----|------|--------|---------|
-| (none) | | | |
+| M4X9 | Mobile app refactoring - split supabase_service.dart | In Progress | Jan 20 |
 
 ---
 
@@ -97,9 +97,9 @@ Comprehensive audit across desktop and mobile apps. Items below are prioritized 
 
 ### HIGHEST Priority - Feature
 
-| Issue | Location | Effort |
+| Issue | Location | Status |
 |-------|----------|--------|
-| Desktop auto-pull from cloud | `training/label_tool.py`, `supabase_rest.py`, `r2_storage.py` | On app open: query Supabase for photos not in local DB, prompt user to download, show progress bar while pulling thumbnails/photos from R2. ~1 day. |
+| ~~Desktop auto-pull from cloud~~ | `training/label_tool.py`, `supabase_rest.py`, `r2_storage.py`, `database.py` | **DONE** - [K7P2] Implemented Jan 20 |
 
 ### HIGH Priority - Architecture
 
@@ -139,6 +139,8 @@ Comprehensive audit across desktop and mobile apps. Items below are prioritized 
 
 ## Recently Completed
 
+- (Jan 20) [K7P2] Desktop auto-pull from cloud - checks for new photos in Supabase on startup, prompts user to download thumbnails from R2 with progress bar, menu option under Tools > Cloud Sync
+- (Jan 20) [C3H0] Fixed annotation_boxes sync in database.py
 - (Jan 20) Comprehensive code audit across desktop and mobile apps - no changes made, findings documented above
 - (Jan 19) Implemented auto-sync to Supabase with offline queueing - created `sync_manager.py` with 30-second debounce timer, persistent offline queue at `~/.trailcam/pending_sync.json`, close warning for pending changes
 - (Jan 18) Fixed `pull_from_supabase()` to include annotation_boxes - was missing entirely, now syncs box coordinates, species, sex, and head annotations
