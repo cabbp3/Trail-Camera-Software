@@ -232,20 +232,26 @@ def create_thumbnail(image_path: Path, max_size: int = 400) -> bytes:
 
 
 def parse_cuddelink_datetime(filename: str, fallback_date: str) -> str:
-    """Parse datetime from CuddeLink filename.
+    """Parse datetime from CuddeLink filename and convert UTC to Central time.
 
-    Filename format: 2026-01-20T16_01_52.430510-8.jpeg
-    Returns ISO datetime string like: 2026-01-20T16:01:52
+    Filename format: 2026-01-20T16_01_52.430510-8.jpeg (timestamps are UTC)
+    Returns ISO datetime string in Central time like: 2026-01-20T10:01:52
     """
     # Try to extract datetime from filename
     # Pattern: YYYY-MM-DDTHH_MM_SS.microseconds-sequence.ext
     match = re.match(r'(\d{4}-\d{2}-\d{2})T(\d{2})_(\d{2})_(\d{2})', filename)
     if match:
         date_part = match.group(1)
-        hour = match.group(2)
+        hour = int(match.group(2))
         minute = match.group(3)
         second = match.group(4)
-        return f"{date_part}T{hour}:{minute}:{second}"
+
+        # Convert UTC to Central time (UTC-6)
+        # Parse the full datetime, subtract 6 hours
+        utc_dt = datetime.fromisoformat(f"{date_part}T{hour:02d}:{minute}:{second}")
+        central_dt = utc_dt - timedelta(hours=6)
+
+        return central_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     # Fallback to just the date
     return fallback_date
