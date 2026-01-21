@@ -27,7 +27,7 @@ Key capabilities:
 - **macOS** standalone build working
 - **Windows** standalone build working (v1.0.5 on GitHub)
 - **Android** mobile app in closed testing on Google Play
-- **Supabase cloud sync** working via REST API
+- **Supabase cloud sync** working via REST API with **auto-sync** (30-sec debounce, offline queueing)
 - **Cloudflare R2** photo storage working
 - **Species model:** 12 classes, 97.0% accuracy (v3.0)
 - **Buck/doe model:** 84% accuracy (needs more Doe data)
@@ -157,3 +157,24 @@ python main.py
 cd /Users/brookebratcher/Desktop/trailcam_mobile
 /Users/brookebratcher/develop/flutter/bin/flutter build apk --release
 ```
+
+---
+
+## Mobile App TODO
+
+### Offline Mode
+- Cache photos locally for viewing without internet
+- Download photos on demand or in bulk
+- Sync labels/changes when back online
+
+### Upload Photos from Phone
+- Allow taking photos with phone camera or selecting from gallery
+- Upload directly to R2 with metadata
+- Useful for photos not from trail cameras (scouting, food plots, etc.)
+
+### Desktop Auto-Sync from Cloud
+- Merge "Pull labels" and "Pull photos" into single auto-sync on app open
+- Use timestamps to detect what changed (only sync new/modified records)
+- Pull new photo records from Supabase that don't exist locally
+- Download thumbnails from R2 for cloud-only photos
+- Should be fast/silent if nothing changed

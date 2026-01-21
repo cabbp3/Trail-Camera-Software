@@ -231,11 +231,45 @@ def create_thumbnail(image_path: Path, max_size: int = 400) -> bytes:
         return buffer.getvalue()
 
 
-def parse_cuddelink_datetime(filename: str, fallback_date: str) -> str:
-    """Parse datetime from CuddeLink filename and convert UTC to Central time.
+def get_exif_datetime(image_path: Path):
+    """Read DateTimeOriginal from EXIF data.
 
-    Filename format: 2026-01-20T16_01_52.430510-8.jpeg (timestamps are UTC)
-    Returns ISO datetime string in Central time like: 2026-01-20T10:01:52
+    Returns ISO datetime string like: 2026-01-20T19:06:54
+    Returns None if no EXIF timestamp found.
+    """
+    try:
+        from PIL.ExifTags import TAGS
+
+        with Image.open(image_path) as img:
+            exif_data = img._getexif()
+
+            if not exif_data:
+                return None
+
+            # Look for DateTimeOriginal (preferred) or DateTime
+            for tag_id, value in exif_data.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if tag == 'DateTimeOriginal' and value:
+                    # Format: "2026:01:20 19:06:54" -> "2026-01-20T19:06:54"
+                    return value.replace(':', '-', 2).replace(' ', 'T')
+
+            # Fallback to DateTime
+            for tag_id, value in exif_data.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if tag == 'DateTime' and value:
+                    return value.replace(':', '-', 2).replace(' ', 'T')
+
+    except Exception as e:
+        print(f"[EXIF] Failed to read timestamp: {e}")
+
+    return None
+
+
+def parse_cuddelink_datetime(filename: str, fallback_date: str) -> str:
+    """Parse datetime from CuddeLink filename (DEPRECATED - use ocr_timestamp_from_image).
+
+    This is kept as a fallback but the filename timestamp is when CuddeLink
+    processed the photo, NOT when the trail camera captured it.
     """
     # Try to extract datetime from filename
     # Pattern: YYYY-MM-DDTHH_MM_SS.microseconds-sequence.ext
@@ -247,7 +281,7 @@ def parse_cuddelink_datetime(filename: str, fallback_date: str) -> str:
         second = match.group(4)
 
         # Convert UTC to Central time (UTC-6)
-        # Parse the full datetime, subtract 6 hours
+        # Note: This is approximate since filename is upload time, not capture time
         utc_dt = datetime.fromisoformat(f"{date_part}T{hour:02d}:{minute}:{second}")
         central_dt = utc_dt - timedelta(hours=6)
 
@@ -358,8 +392,13 @@ def process_day(session: requests.Session, day_str: str, s3_client, config: dict
                 except Exception as e:
                     print(f"  Uploaded: {img_path.name} (thumbnail failed: {e})")
 
-                # Parse datetime from filename
-                datetime_taken = parse_cuddelink_datetime(img_path.name, day_str)
+                # Get datetime from EXIF (preferred) or filename (fallback)
+                datetime_taken = get_exif_datetime(img_path)
+                if datetime_taken:
+                    print(f"    EXIF timestamp: {datetime_taken}")
+                else:
+                    datetime_taken = parse_cuddelink_datetime(img_path.name, day_str)
+                    print(f"    Filename timestamp (fallback): {datetime_taken}")
 
                 # Save metadata
                 save_to_supabase(

@@ -65,23 +65,63 @@ class MegaDetectorV5:
         if MEGADETECTOR_AVAILABLE:
             self._load_model(model_path)
     
-    def _load_model(self, model_path: Optional[str] = None):
-        """Load MegaDetector model"""
-        if model_path is None:
-            # Default path - user should download from:
-            # https://github.com/microsoft/CameraTraps/releases
-            model_path = Path.home() / '.trailcam' / 'md_v5a.0.0.pt'
-        
-        model_path = Path(model_path)
-        if not model_path.exists():
-            print(f"MegaDetector model not found at {model_path}")
-            print("Download from: https://github.com/microsoft/CameraTraps/releases")
-            print(f"Place at: {Path.home() / '.trailcam' / 'md_v5a.0.0.pt'}")
-            return
-        
+    # MegaDetector v5a download URL
+    MODEL_URL = "https://github.com/microsoft/CameraTraps/releases/download/v5.0/md_v5a.0.0.pt"
+    MODEL_SIZE_MB = 281  # Approximate size for progress display
+
+    def _download_model(self, model_path: Path) -> bool:
+        """Download MegaDetector model from GitHub releases"""
+        print(f"Downloading MegaDetector v5a model ({self.MODEL_SIZE_MB} MB)...")
+        print(f"From: {self.MODEL_URL}")
+
+        # Ensure directory exists
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+
         try:
-            self.model = torch.hub.load('ultralytics/yolov5', 'custom', 
-                                       path=str(model_path), force_reload=False)
+            response = requests.get(self.MODEL_URL, stream=True, timeout=30)
+            response.raise_for_status()
+
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+
+            with open(model_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            pct = (downloaded / total_size) * 100
+                            mb_done = downloaded / (1024 * 1024)
+                            mb_total = total_size / (1024 * 1024)
+                            print(f"\r  Downloaded {mb_done:.1f}/{mb_total:.1f} MB ({pct:.0f}%)", end="", flush=True)
+
+            print(f"\n  Model saved to {model_path}")
+            return True
+
+        except Exception as e:
+            print(f"\n  Error downloading model: {e}")
+            # Clean up partial download
+            if model_path.exists():
+                model_path.unlink()
+            return False
+
+    def _load_model(self, model_path: Optional[str] = None):
+        """Load MegaDetector model, downloading if necessary"""
+        if model_path is None:
+            model_path = Path.home() / '.trailcam' / 'md_v5a.0.0.pt'
+
+        self.model_path = Path(model_path)
+
+        # Auto-download if not present
+        if not self.model_path.exists():
+            print(f"MegaDetector model not found at {self.model_path}")
+            if not self._download_model(self.model_path):
+                print("Failed to download MegaDetector model.")
+                return
+
+        try:
+            self.model = torch.hub.load('ultralytics/yolov5', 'custom',
+                                       path=str(self.model_path), force_reload=False)
             self.model.to(self.device)
             self.model.conf = self.confidence_threshold
             print(f"MegaDetector loaded on {self.device}")

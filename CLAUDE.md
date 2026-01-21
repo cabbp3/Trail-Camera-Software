@@ -319,7 +319,39 @@ When the user is looking for something to run overnight or while away:
 
 ---
 
-## Recent Session (Jan 14, 2026)
+## Recent Session (Jan 19, 2026)
+
+### Auto-Sync to Supabase with Offline Queueing
+
+**Problem:** Manual sync via menu was tedious. Changes could be lost if user forgot to sync before closing.
+
+**Solution:** Automatic background sync with smart offline handling.
+
+**New File: `sync_manager.py`** (276 lines)
+- `SyncManager` class manages automatic cloud synchronization
+- `queue_change()` - Called whenever data changes, starts 30-second debounce timer
+- `_check_network()` - Tests connectivity before sync attempts
+- `status` property - Returns current sync state for UI display
+
+**Features:**
+1. **30-second debounce timer** - Batches rapid changes instead of syncing every keystroke
+2. **Offline queue persistence** - Changes saved to `~/.trailcam/pending_sync.json` when offline
+3. **Auto-retry on reconnect** - Queued changes sync automatically when network returns
+4. **Close warning dialog** - Warns user if closing app with pending offline changes
+
+**Integration Points:**
+- Modified `training/label_tool.py` `closeEvent()` to check for pending offline changes
+- SyncManager instantiated at app startup
+- All data-changing operations call `queue_change()`
+
+**Key Design Decisions:**
+- 30-second debounce balances responsiveness vs API load
+- Persistent JSON queue survives app crashes/restarts
+- Network check before each sync attempt to avoid hanging
+
+---
+
+## Previous Session (Jan 14, 2026)
 
 ### Buck/Doe Review Queue Improvements
 

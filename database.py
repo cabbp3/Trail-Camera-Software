@@ -712,7 +712,11 @@ class TrailCamDatabase:
                 pass
     
     def update_photo_tags(self, photo_id: int, tags: List[str]):
-        """Replace all tags for a photo with the provided list."""
+        """Replace all tags for a photo with the provided list.
+
+        If tags include 'Review' or 'Verification', automatically sets that
+        as the photo-level suggested_tag for visibility in filters/reports.
+        """
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute("DELETE FROM tags WHERE photo_id = ?", (photo_id,))
@@ -722,6 +726,16 @@ class TrailCamDatabase:
                 "INSERT INTO tags (photo_id, tag_name) VALUES (?, ?)",
                 [(photo_id, tag) for tag in unique_tags]
             )
+
+            # Auto-sync verification tags to photo level for visibility
+            review_tags = {'Review', 'Verification'}
+            found_review = next((t for t in unique_tags if t in review_tags), None)
+            if found_review:
+                cursor.execute("""
+                    UPDATE photos SET suggested_tag = ?, suggested_confidence = NULL
+                    WHERE id = ?
+                """, (found_review, photo_id))
+
             self.conn.commit()
     
     def get_photo_tags(self, photo_id: int) -> List[str]:
@@ -2214,6 +2228,12 @@ class TrailCamDatabase:
                     if batch:
                         supabase_client.table(table_name).upsert(batch, on_conflict=on_conflict).execute()
 
+            def normalize_datetime(dt_str):
+                """Normalize datetime string to ISO format with T separator."""
+                if dt_str and ' ' in dt_str and 'T' not in dt_str:
+                    return dt_str.replace(' ', 'T')
+                return dt_str
+
             # Push photos_sync (photo identifiers and basic metadata)
             report(1, "Syncing photos...")
             query = "SELECT * FROM photos WHERE 1=1" + since_clause()
@@ -2226,7 +2246,7 @@ class TrailCamDatabase:
                     "photo_key": photo_key,
                     "file_hash": photo.get("file_hash"),  # For cross-computer matching
                     "original_name": photo.get("original_name"),
-                    "date_taken": photo.get("date_taken"),
+                    "date_taken": normalize_datetime(photo.get("date_taken")),
                     "camera_model": photo.get("camera_model"),
                     "camera_location": photo.get("camera_location"),
                     "season_year": photo.get("season_year"),
@@ -2596,14 +2616,48 @@ class TrailCamDatabase:
         # Pull annotation_boxes (fetch_all to bypass 1000 row limit)
         report(7, "Pulling annotation boxes...")
         result = supabase_client.table("annotation_boxes").select("*").execute(fetch_all=True)
+
+        def safe_float(val):
+            """Safely convert value to float, handling bytes/blob corruption."""
+            if val is None:
+                return None
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, bytes):
+                # Try to decode as 4-byte or 8-byte float
+                import struct
+                try:
+                    if len(val) == 4:
+                        return struct.unpack('<f', val)[0]
+                    elif len(val) == 8:
+                        return struct.unpack('<d', val)[0]
+                except:
+                    pass
+                return None
+            try:
+                return float(val)
+            except:
+                return None
+
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
+                # Safely convert coordinates to floats (prevents blob corruption)
+                x1 = safe_float(row.get("x1"))
+                y1 = safe_float(row.get("y1"))
+                x2 = safe_float(row.get("x2"))
+                y2 = safe_float(row.get("y2"))
+
+                # Skip if any required coordinate is invalid
+                if None in (x1, y1, x2, y2):
+                    print(f"  Skipping box with invalid coordinates: {row.get('photo_key')}")
+                    continue
+
                 # Check if this box already exists (by photo_id + label + coordinates)
                 cursor.execute("""
                     SELECT id FROM annotation_boxes
                     WHERE photo_id = ? AND label = ? AND x1 = ? AND y1 = ? AND x2 = ? AND y2 = ?
-                """, (photo["id"], row.get("label"), row.get("x1"), row.get("y1"), row.get("x2"), row.get("y2")))
+                """, (photo["id"], row.get("label"), x1, y1, x2, y2))
                 existing = cursor.fetchone()
 
                 if existing:
@@ -2614,9 +2668,10 @@ class TrailCamDatabase:
                             sex = ?, sex_conf = ?,
                             head_x1 = ?, head_y1 = ?, head_x2 = ?, head_y2 = ?, head_notes = ?
                         WHERE id = ?
-                    """, (row.get("confidence"), row.get("species"), row.get("species_conf"),
-                          row.get("sex"), row.get("sex_conf"),
-                          row.get("head_x1"), row.get("head_y1"), row.get("head_x2"), row.get("head_y2"),
+                    """, (safe_float(row.get("confidence")), row.get("species"), safe_float(row.get("species_conf")),
+                          row.get("sex"), safe_float(row.get("sex_conf")),
+                          safe_float(row.get("head_x1")), safe_float(row.get("head_y1")),
+                          safe_float(row.get("head_x2")), safe_float(row.get("head_y2")),
                           row.get("head_notes"), existing[0]))
                 else:
                     # Insert new box
@@ -2625,11 +2680,12 @@ class TrailCamDatabase:
                         (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf,
                          sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (photo["id"], row.get("label"), row.get("x1"), row.get("y1"),
-                          row.get("x2"), row.get("y2"), row.get("confidence"),
-                          row.get("species"), row.get("species_conf"),
-                          row.get("sex"), row.get("sex_conf"),
-                          row.get("head_x1"), row.get("head_y1"), row.get("head_x2"), row.get("head_y2"),
+                    """, (photo["id"], row.get("label"), x1, y1, x2, y2,
+                          safe_float(row.get("confidence")),
+                          row.get("species"), safe_float(row.get("species_conf")),
+                          row.get("sex"), safe_float(row.get("sex_conf")),
+                          safe_float(row.get("head_x1")), safe_float(row.get("head_y1")),
+                          safe_float(row.get("head_x2")), safe_float(row.get("head_y2")),
                           row.get("head_notes")))
                 counts["annotation_boxes"] += 1
 

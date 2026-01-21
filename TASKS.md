@@ -19,6 +19,7 @@
 
 ## Recently Completed
 
+- (Jan 19) Implemented auto-sync to Supabase with offline queueing - created `sync_manager.py` with 30-second debounce timer, persistent offline queue at `~/.trailcam/pending_sync.json`, close warning for pending changes
 - (Jan 18) Fixed `pull_from_supabase()` to include annotation_boxes - was missing entirely, now syncs box coordinates, species, sex, and head annotations
 - (Jan 14) [W8KP] Fixed Properties button in buck/doe review queue - now correctly navigates to photo (even if archived) by resetting filters and refreshing photo list
 - (Jan 14) [Q3KJ] Added collection filter to buck/doe review queue - filter by collection when reviewing pending suggestions

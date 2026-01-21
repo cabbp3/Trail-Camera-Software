@@ -12,6 +12,7 @@ import tempfile
 import hashlib
 import subprocess
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -2065,6 +2066,19 @@ class TrainerWindow(QMainWindow):
         mislabel_action = self.tools_menu.addAction("Find Potential Mislabels...")
         mislabel_action.triggered.connect(self.find_potential_mislabels)
 
+        # Check for species mislabel review queue
+        mislabel_queue_file = os.path.expanduser("~/.trailcam/species_mislabel_review.json")
+        if os.path.exists(mislabel_queue_file):
+            try:
+                with open(mislabel_queue_file, 'r') as f:
+                    queue_data = json.load(f)
+                    count = queue_data.get('total', len(queue_data.get('items', [])))
+                if count > 0:
+                    mislabel_review_action = self.tools_menu.addAction(f"★ Review Mislabeled Species ({count})...")
+                    mislabel_review_action.triggered.connect(self.review_mislabeled_species)
+            except Exception:
+                pass
+
         # Check for special one-time queue
         self._check_special_queue_menu()
 
@@ -2469,6 +2483,16 @@ class TrainerWindow(QMainWindow):
     def closeEvent(self, event):
         """Save settings and optionally push to cloud before closing."""
         self._save_settings()
+
+        # Check for pending offline changes and warn user
+        if hasattr(self, 'sync_manager') and self.sync_manager._pending and self.sync_manager.status == 'offline':
+            QMessageBox.information(
+                self,
+                "Offline Changes Pending",
+                "Some label changes could not be synced to the cloud because the app was offline.\n\n"
+                "Your changes are saved locally and will sync automatically the next time "
+                "you open the app with an internet connection."
+            )
 
         # Check if we should push to cloud
         settings = QSettings("TrailCam", "Trainer")
@@ -5743,7 +5767,8 @@ class TrainerWindow(QMainWindow):
         pid = photo.get("id")
         if not pid:
             return
-        is_favorite = state == Qt.CheckState.Checked.value
+        # In PyQt6, stateChanged passes int: 0=unchecked, 2=checked
+        is_favorite = state == 2
         self.db.set_favorite(pid, is_favorite)
         photo["favorite"] = 1 if is_favorite else 0
 
@@ -10866,6 +10891,216 @@ class TrainerWindow(QMainWindow):
         if self.photos and 0 <= self.index < len(self.photos):
             self.load_photo()
 
+    def review_mislabeled_species(self):
+        """Review boxes that may be mislabeled (AI disagrees with current label)."""
+        queue_file = os.path.expanduser("~/.trailcam/species_mislabel_review.json")
+        if not os.path.exists(queue_file):
+            QMessageBox.information(self, "Review Queue", "No mislabel review queue found.")
+            return
+
+        with open(queue_file, 'r') as f:
+            queue_data = json.load(f)
+
+        items = queue_data.get('items', [])
+        if not items:
+            QMessageBox.information(self, "Review Queue", "No items in queue.")
+            os.remove(queue_file)
+            return
+
+        # Create review dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Review Mislabeled Species ({len(items)} items)")
+        dlg.resize(1100, 750)
+        layout = QVBoxLayout(dlg)
+
+        # Info label
+        info_label = QLabel(f"These boxes are labeled as 'Deer' but AI suggests a different species.\n"
+                           f"Accept to change the species, or Reject to keep as Deer.")
+        info_label.setStyleSheet("padding: 5px; background: #333; border-radius: 4px;")
+        layout.addWidget(info_label)
+
+        # Main content
+        content_layout = QHBoxLayout()
+
+        # Left: list
+        left_panel = QVBoxLayout()
+
+        # Filter by suggested species
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        species_filter = QComboBox()
+        unique_species = sorted(set(item['suggested_label'] for item in items))
+        species_filter.addItem("All")
+        for s in unique_species:
+            species_filter.addItem(s)
+        species_filter.setMaximumWidth(120)
+        filter_row.addWidget(species_filter)
+        filter_row.addStretch()
+        left_panel.addLayout(filter_row)
+
+        left_panel.addWidget(QLabel("Items to review:"))
+        list_widget = QListWidget()
+        list_widget.setMaximumWidth(300)
+
+        all_items = items[:]
+
+        def _populate_list():
+            list_widget.clear()
+            filter_val = species_filter.currentText()
+            for item in all_items:
+                if filter_val != "All" and item['suggested_label'] != filter_val:
+                    continue
+                conf_pct = int(item['confidence'] * 100)
+                text = f"Deer → {item['suggested_label']} ({conf_pct}%)"
+                li = QListWidgetItem(text)
+                li.setData(Qt.ItemDataRole.UserRole, item)
+                list_widget.addItem(li)
+            dlg.setWindowTitle(f"Review Mislabeled Species ({list_widget.count()} shown)")
+
+        species_filter.currentIndexChanged.connect(_populate_list)
+        _populate_list()
+
+        left_panel.addWidget(list_widget)
+        content_layout.addLayout(left_panel)
+
+        # Right: photo preview
+        right_panel = QVBoxLayout()
+        suggestion_label = QLabel("Select an item to preview")
+        suggestion_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 5px;")
+        right_panel.addWidget(suggestion_label)
+
+        # Graphics view for image
+        scene = QGraphicsScene()
+        view = QGraphicsView(scene)
+        view.setMinimumSize(700, 550)
+        view.setStyleSheet("background: #222; border: 1px solid #444;")
+        right_panel.addWidget(view, 1)
+        content_layout.addLayout(right_panel, 1)
+
+        layout.addLayout(content_layout, 1)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        accept_btn = QPushButton("Accept Suggestion (A)")
+        accept_btn.setStyleSheet("background: #264; padding: 8px 16px;")
+        reject_btn = QPushButton("Keep as Deer (K)")
+        reject_btn.setStyleSheet("background: #642; padding: 8px 16px;")
+        skip_btn = QPushButton("Skip (S)")
+        props_btn = QPushButton("Go to Photo (G)")
+        close_btn = QPushButton("Close")
+        btn_row.addWidget(accept_btn)
+        btn_row.addWidget(reject_btn)
+        btn_row.addWidget(skip_btn)
+        btn_row.addWidget(props_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        def _update_preview():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            suggestion_label.setText(f"Current: Deer → Suggested: {data['suggested_label']} ({int(data['confidence']*100)}%)")
+
+            file_path = data.get('file_path', '')
+            if os.path.exists(file_path):
+                pixmap = QPixmap(file_path)
+                if not pixmap.isNull():
+                    scene.clear()
+                    scene.addPixmap(pixmap)
+                    view.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+        def _accept():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            # Update the box species in database
+            self.db.conn.execute(
+                "UPDATE annotation_boxes SET species = ? WHERE id = ?",
+                (data['suggested_label'], data['box_id'])
+            )
+            self.db.conn.commit()
+            # Remove from list
+            all_items.remove(data)
+            _populate_list()
+            _save_queue()
+            # Select next
+            if list_widget.count() > 0:
+                list_widget.setCurrentRow(0)
+                _update_preview()
+
+        def _reject():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            # Just remove from review queue (keep as Deer)
+            all_items.remove(data)
+            _populate_list()
+            _save_queue()
+            if list_widget.count() > 0:
+                list_widget.setCurrentRow(0)
+                _update_preview()
+
+        def _skip():
+            row = list_widget.currentRow()
+            if row < list_widget.count() - 1:
+                list_widget.setCurrentRow(row + 1)
+            _update_preview()
+
+        def _go_to_photo():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            photo_id = data.get('photo_id')
+            if photo_id:
+                dlg.close()
+                self._navigate_to_photo(photo_id)
+
+        def _save_queue():
+            queue_data['items'] = all_items
+            queue_data['total'] = len(all_items)
+            if all_items:
+                with open(queue_file, 'w') as f:
+                    json.dump(queue_data, f, indent=2)
+            else:
+                if os.path.exists(queue_file):
+                    os.remove(queue_file)
+                QMessageBox.information(dlg, "Review Complete", "All items reviewed!")
+                dlg.close()
+
+        def _on_key(event):
+            key = event.key()
+            if key == Qt.Key.Key_A:
+                _accept()
+            elif key == Qt.Key.Key_K:
+                _reject()
+            elif key == Qt.Key.Key_S:
+                _skip()
+            elif key == Qt.Key.Key_G:
+                _go_to_photo()
+            else:
+                QDialog.keyPressEvent(dlg, event)
+
+        dlg.keyPressEvent = _on_key
+
+        list_widget.currentItemChanged.connect(_update_preview)
+        accept_btn.clicked.connect(_accept)
+        reject_btn.clicked.connect(_reject)
+        skip_btn.clicked.connect(_skip)
+        props_btn.clicked.connect(_go_to_photo)
+        close_btn.clicked.connect(dlg.close)
+
+        # Select first item
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+            _update_preview()
+
+        dlg.exec()
+
     def _gather_pending_sex_suggestions(self) -> list:
         """Return list of boxes with pending buck/doe suggestions (per-box, not per-photo).
 
@@ -12479,6 +12714,68 @@ class TrainerWindow(QMainWindow):
 
     def _show_mislabel_review_dialog(self, disagreements: list):
         """Show dialog to review potential mislabels."""
+        # Load previously reviewed photo IDs
+        reviewed_file = os.path.expanduser("~/.trailcam/mislabel_reviewed.json")
+        previously_reviewed = set()
+        try:
+            if os.path.exists(reviewed_file):
+                with open(reviewed_file, 'r') as f:
+                    data = json.load(f)
+                    previously_reviewed = set(data.get('photo_ids', []))
+                    print(f"[Mislabel] Loaded {len(previously_reviewed)} previously reviewed photos")
+        except Exception:
+            pass
+
+        # Filter out already-reviewed photos
+        original_count = len(disagreements)
+        disagreements = [d for d in disagreements if d['photo']['id'] not in previously_reviewed]
+        if original_count != len(disagreements):
+            print(f"[Mislabel] Filtered {original_count - len(disagreements)} already-reviewed photos")
+
+        if not disagreements:
+            QMessageBox.information(self, "Mislabel Check",
+                f"No new potential mislabels found.\n\n"
+                f"({len(previously_reviewed)} photos were previously reviewed)")
+            return
+
+        # Save queue to file for reference
+        queue_backup_file = os.path.expanduser("~/.trailcam/mislabel_review_backup.json")
+        try:
+            backup_data = {
+                'saved_at': datetime.now().isoformat(),
+                'total': len(disagreements),
+                'items': []
+            }
+            for item in disagreements:
+                backup_data['items'].append({
+                    'photo_id': item['photo']['id'],
+                    'file_path': item['photo'].get('file_path', ''),
+                    'human_labels': item['human_labels'],
+                    'ai_label': item['ai_label'],
+                    'ai_confidence': float(item['ai_confidence'])
+                })
+            with open(queue_backup_file, 'w') as f:
+                json.dump(backup_data, f, indent=2)
+            print(f"[Mislabel] Saved {len(disagreements)} items to {queue_backup_file}")
+        except Exception as e:
+            print(f"[Mislabel] ERROR saving backup: {e}")
+
+        # Track reviewed photos in this session
+        session_reviewed = set()
+
+        def _save_reviewed():
+            """Save all reviewed photo IDs to file."""
+            all_reviewed = previously_reviewed | session_reviewed
+            try:
+                with open(reviewed_file, 'w') as f:
+                    json.dump({
+                        'updated_at': datetime.now().isoformat(),
+                        'photo_ids': list(all_reviewed)
+                    }, f, indent=2)
+                print(f"[Mislabel] Saved {len(all_reviewed)} reviewed photos to {reviewed_file}")
+            except Exception as e:
+                print(f"[Mislabel] ERROR saving reviewed: {e}")
+
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Potential Mislabels ({len(disagreements)})")
         dlg.resize(1400, 900)
@@ -12519,7 +12816,6 @@ class TrainerWindow(QMainWindow):
         list_widget.setMinimumWidth(380)
 
         all_items = disagreements[:]
-        reviewed_set = set()
 
         def _populate_list():
             list_widget.clear()
@@ -12537,7 +12833,7 @@ class TrainerWindow(QMainWindow):
                 ai = item["ai_label"]
                 fname = os.path.basename(item["photo"].get("file_path", ""))
 
-                if pid in reviewed_set:
+                if pid in session_reviewed:
                     display = f"✓ {fname}"
                     li = QListWidgetItem(display)
                     li.setBackground(QColor(144, 238, 144))
@@ -12548,7 +12844,7 @@ class TrainerWindow(QMainWindow):
                 li.setData(Qt.ItemDataRole.UserRole, item)
                 list_widget.addItem(li)
 
-            remaining = len([item for item in all_items if item["photo"]["id"] not in reviewed_set])
+            remaining = len([item for item in all_items if item["photo"]["id"] not in session_reviewed])
             dlg.setWindowTitle(f"Potential Mislabels ({remaining} remaining)")
 
         _populate_list()
@@ -12616,6 +12912,44 @@ class TrainerWindow(QMainWindow):
                     scaled = pixmap.scaled(preview_label.width() - 10, preview_label.height() - 10,
                                           Qt.AspectRatioMode.KeepAspectRatio,
                                           Qt.TransformationMode.SmoothTransformation)
+                    # Draw annotation boxes on preview
+                    photo_id = photo.get("id")
+                    if photo_id:
+                        try:
+                            boxes = self.db.get_annotation_boxes(photo_id)
+                            if boxes:
+                                from PyQt6.QtGui import QPainter, QPen, QFont
+                                # Create a copy to paint on
+                                painted = QPixmap(scaled.size())
+                                painted.fill(Qt.GlobalColor.transparent)
+                                painter = QPainter(painted)
+                                painter.drawPixmap(0, 0, scaled)
+                                pen = QPen(Qt.GlobalColor.yellow)
+                                pen.setWidth(3)
+                                painter.setPen(pen)
+                                font = QFont()
+                                font.setPointSize(12)
+                                font.setBold(True)
+                                painter.setFont(font)
+                                # Calculate scale factors
+                                orig_w, orig_h = pixmap.width(), pixmap.height()
+                                scale_x = scaled.width() / orig_w if orig_w > 0 else 1
+                                scale_y = scaled.height() / orig_h if orig_h > 0 else 1
+                                for box in boxes:
+                                    x1 = int(box.get('x1', 0) * orig_w * scale_x)
+                                    y1 = int(box.get('y1', 0) * orig_h * scale_y)
+                                    x2 = int(box.get('x2', 0) * orig_w * scale_x)
+                                    y2 = int(box.get('y2', 0) * orig_h * scale_y)
+                                    painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+                                    species = box.get('species', '')
+                                    if species:
+                                        painter.drawText(x1 + 3, y1 + 16, species)
+                                painter.end()
+                                scaled = painted
+                        except Exception as e:
+                            print(f"[Mislabel] Failed to draw boxes: {e}")
+                            import traceback
+                            traceback.print_exc()
                     preview_label.setPixmap(scaled)
             else:
                 preview_label.setText("Image not found")
@@ -12633,7 +12967,7 @@ class TrainerWindow(QMainWindow):
             for i in range(list_widget.count()):
                 item = list_widget.item(i)
                 data = item.data(Qt.ItemDataRole.UserRole)
-                if data["photo"]["id"] not in reviewed_set:
+                if data["photo"]["id"] not in session_reviewed:
                     list_widget.setCurrentRow(i)
                     return
             # All done
@@ -12647,7 +12981,16 @@ class TrainerWindow(QMainWindow):
                 return
             data = item.data(Qt.ItemDataRole.UserRole)
             pid = data["photo"]["id"]
-            reviewed_set.add(pid)
+            session_reviewed.add(pid)
+            print(f"[Mislabel] Added {pid} to session_reviewed, now {len(session_reviewed)} items")
+            # Save immediately
+            all_reviewed = previously_reviewed | session_reviewed
+            try:
+                with open(reviewed_file, 'w') as f:
+                    json.dump({'updated_at': datetime.now().isoformat(), 'photo_ids': list(all_reviewed)}, f)
+                print(f"[Mislabel] Saved {len(all_reviewed)} to {reviewed_file}")
+            except Exception as e:
+                print(f"[Mislabel] SAVE ERROR: {e}")
             _populate_list()
             _next_unreviewed()
 
@@ -12666,7 +13009,15 @@ class TrainerWindow(QMainWindow):
             new_tags.append(ai_suggestion)
             self.db.update_photo_tags(pid, new_tags)
 
-            reviewed_set.add(pid)
+            session_reviewed.add(pid)
+            # Save immediately
+            all_reviewed = previously_reviewed | session_reviewed
+            try:
+                with open(reviewed_file, 'w') as f:
+                    json.dump({'updated_at': datetime.now().isoformat(), 'photo_ids': list(all_reviewed)}, f)
+                print(f"[Mislabel] Saved {len(all_reviewed)} to {reviewed_file}")
+            except Exception as e:
+                print(f"[Mislabel] SAVE ERROR: {e}")
             _populate_list()
             _next_unreviewed()
 
@@ -12683,7 +13034,15 @@ class TrainerWindow(QMainWindow):
             new_tags = [t for t in current_tags if t not in species_set]
             self.db.update_photo_tags(pid, new_tags)
 
-            reviewed_set.add(pid)
+            session_reviewed.add(pid)
+            # Save immediately
+            all_reviewed = previously_reviewed | session_reviewed
+            try:
+                with open(reviewed_file, 'w') as f:
+                    json.dump({'updated_at': datetime.now().isoformat(), 'photo_ids': list(all_reviewed)}, f)
+                print(f"[Mislabel] Saved {len(all_reviewed)} to {reviewed_file}")
+            except Exception as e:
+                print(f"[Mislabel] SAVE ERROR: {e}")
             _populate_list()
             _next_unreviewed()
 
@@ -12733,185 +13092,421 @@ class TrainerWindow(QMainWindow):
             self.claude_review_action.setText("Claude Review Queue...")
 
     def review_claude_queue(self):
-        """Review photos flagged by Claude - batch grid mode for quick tagging."""
+        """Review photos flagged by Claude - single photo view with zoomable preview."""
+        from PyQt6.QtWidgets import QGraphicsView
+
         queue = self.db.get_claude_review_queue()
         if not queue:
             QMessageBox.information(self, "Claude Review", "No photos in the Claude review queue.")
             return
 
+        # Enrich queue items with tags and file info
+        for item in queue:
+            photo_id = item.get("photo_id")
+            if photo_id:
+                item["_tags"] = self.db.get_tags(photo_id)
+            else:
+                item["_tags"] = []
+
+        # Create review dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Claude Review Queue ({len(queue)} photos)")
+        dlg.resize(1100, 750)
+        layout = QVBoxLayout(dlg)
+
+        # Main content: list on left, photo on right
+        content_layout = QHBoxLayout()
+
+        # Left side: list of items
+        left_panel = QVBoxLayout()
+
+        # Filter by reason
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        reason_filter = QComboBox()
         by_reason = {}
         for item in queue:
             reason = item.get("reason", "Unknown")
             if reason not in by_reason:
                 by_reason[reason] = []
             by_reason[reason].append(item)
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Claude Review Queue ({len(queue)} photos)")
-        dlg.resize(1200, 850)
-        layout = QVBoxLayout(dlg)
-
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("Reason:"))
-        reason_filter = QComboBox()
-        reason_filter.addItem(f"All ({len(queue)})")
+        reason_filter.addItem(f"All ({len(queue)})", "All")
         for reason, items in sorted(by_reason.items()):
-            reason_filter.addItem(f"{reason} ({len(items)})")
-        reason_filter.setMinimumWidth(250)
-        top_row.addWidget(reason_filter)
-        top_row.addStretch()
+            reason_filter.addItem(f"{reason} ({len(items)})", reason)
+        filter_row.addWidget(reason_filter)
+        filter_row.addStretch()
+        left_panel.addLayout(filter_row)
 
-        page_label = QLabel("Page 1 of 1")
-        prev_btn = QPushButton("Prev")
-        next_btn = QPushButton("Next")
-        top_row.addWidget(prev_btn)
-        top_row.addWidget(page_label)
-        top_row.addWidget(next_btn)
+        left_panel.addWidget(QLabel("Pending review:"))
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        list_widget.setMaximumWidth(320)
 
-        select_all_btn = QPushButton("Select All")
-        clear_sel_btn = QPushButton("Clear Sel")
-        top_row.addWidget(select_all_btn)
-        top_row.addWidget(clear_sel_btn)
-        layout.addLayout(top_row)
+        def _populate_list(filter_reason="All"):
+            list_widget.clear()
+            # Filter items first
+            filtered_items = []
+            for item in queue:
+                if filter_reason != "All" and item.get("reason") != filter_reason:
+                    continue
+                filtered_items.append(item)
+            # Sort by current label (tags)
+            filtered_items.sort(key=lambda x: ", ".join(x.get("_tags", [])) or "zzz")
+            # Add to list
+            for item in filtered_items:
+                tags = item.get("_tags", [])
+                tag_text = ", ".join(tags) if tags else "(no label)"
+                reason = item.get("reason", "")
+                name = os.path.basename(item.get("file_path", ""))[:20]
+                text = f"{tag_text} → {reason[:20]} - {name}"
+                li = QListWidgetItem(text)
+                li.setData(Qt.ItemDataRole.UserRole, item)
+                list_widget.addItem(li)
+            if list_widget.count() > 0:
+                list_widget.setCurrentRow(0)
 
-        GRID_COLS, GRID_ROWS, THUMB_SIZE = 4, 4, 200
-        grid_widget = QWidget()
-        grid_layout = QGridLayout(grid_widget)
-        grid_layout.setSpacing(5)
+        def _on_filter_changed():
+            filter_reason = reason_filter.currentData()
+            _populate_list(filter_reason)
+            _update_preview()
 
-        thumb_widgets = []
-        for row in range(GRID_ROWS):
-            for col in range(GRID_COLS):
-                cell = QWidget()
-                cell_layout = QVBoxLayout(cell)
-                cell_layout.setContentsMargins(2, 2, 2, 2)
-                cell_layout.setSpacing(2)
-                thumb_label = QLabel()
-                thumb_label.setFixedSize(THUMB_SIZE, THUMB_SIZE)
-                thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                thumb_label.setStyleSheet("background-color: #333; border: 2px solid #555;")
-                check = QCheckBox()
-                check.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Prevent keyboard toggling
-                cell_layout.addWidget(thumb_label)
-                cell_layout.addWidget(check, alignment=Qt.AlignmentFlag.AlignCenter)
-                grid_layout.addWidget(cell, row, col)
-                thumb_widgets.append({"label": thumb_label, "check": check, "item": None})
+        reason_filter.currentIndexChanged.connect(_on_filter_changed)
+        _populate_list("All")
 
-        scroll = QScrollArea()
-        scroll.setWidget(grid_widget)
-        scroll.setWidgetResizable(True)
-        layout.addWidget(scroll, 1)
+        left_panel.addWidget(list_widget)
+        content_layout.addLayout(left_panel)
 
-        tag_row = QHBoxLayout()
-        tag_row.addWidget(QLabel("Apply to selected:"))
-        for species in ["Deer", "Turkey", "Raccoon", "Squirrel", "Opossum", "Rabbit", "Empty"]:
-            btn = QPushButton(species)
-            btn.setMinimumWidth(70)
-            if species == "Empty":
-                btn.setStyleSheet("background-color: #888;")
-            elif species == "Deer":
-                btn.setStyleSheet("background-color: #8B4513; color: white;")
-            tag_row.addWidget(btn)
-            btn.clicked.connect(lambda checked, s=species: apply_tag(s))
-        tag_row.addStretch()
-        mark_reviewed_btn = QPushButton("Mark Reviewed")
-        mark_reviewed_btn.setStyleSheet("background-color: #66aa66;")
-        tag_row.addWidget(mark_reviewed_btn)
+        # Right side: photo preview with labels
+        right_panel = QVBoxLayout()
+
+        # Current label display (prominent)
+        current_label_display = QLabel("Current Label: —")
+        current_label_display.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffcc00; padding: 5px; background: #333;")
+        right_panel.addWidget(current_label_display)
+
+        # AI suggestion display
+        suggestion_label = QLabel("AI Suggests: —")
+        suggestion_label.setStyleSheet("font-size: 14px; color: #88ccff; padding: 5px;")
+        right_panel.addWidget(suggestion_label)
+
+        # Zoom controls
+        zoom_row = QHBoxLayout()
+        zoom_label = QLabel("Zoom:")
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedWidth(30)
+        zoom_out_btn = QPushButton("-")
+        zoom_out_btn.setFixedWidth(30)
+        zoom_fit_btn = QPushButton("Fit")
+        zoom_100_btn = QPushButton("100%")
+        zoom_row.addWidget(zoom_label)
+        zoom_row.addWidget(zoom_out_btn)
+        zoom_row.addWidget(zoom_in_btn)
+        zoom_row.addWidget(zoom_fit_btn)
+        zoom_row.addWidget(zoom_100_btn)
+        zoom_row.addStretch()
+        right_panel.addLayout(zoom_row)
+
+        # Graphics view for zoomable image
+        scene = QGraphicsScene()
+        view = QGraphicsView(scene)
+        view.setMinimumSize(700, 500)
+        view.setStyleSheet("background: #222; border: 1px solid #444;")
+        view.setDragMode(QGraphicsView.DragMode.NoDrag)
+        view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        view.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        right_panel.addWidget(view, 1)
+        content_layout.addLayout(right_panel, 1)
+
+        layout.addLayout(content_layout, 1)
+
+        # Species buttons row
+        species_container = QWidget()
+        species_layout = QVBoxLayout(species_container)
+        species_layout.setContentsMargins(0, 0, 0, 0)
+        species_layout.setSpacing(4)
+        species_btn_row = QHBoxLayout()
+
+        common_species = ["Deer", "Turkey", "Raccoon", "Squirrel", "Opossum", "Rabbit", "Empty", "Coyote", "Fox", "Person"]
+        for sp in common_species:
+            btn = QPushButton(sp)
+            btn.setStyleSheet("padding: 6px 12px;")
+            if sp == "Deer":
+                btn.setStyleSheet("padding: 6px 12px; background: #8B4513; color: white;")
+            elif sp == "Empty":
+                btn.setStyleSheet("padding: 6px 12px; background: #666;")
+            species_btn_row.addWidget(btn)
+            btn.clicked.connect(lambda checked, s=sp: _apply_species(s))
+
+        species_btn_row.addStretch()
+        species_layout.addLayout(species_btn_row)
+        layout.addWidget(species_container)
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        keep_btn = QPushButton("Keep Current Label (K)")
+        keep_btn.setStyleSheet("background: #4488cc; padding: 8px 16px; font-weight: bold;")
+        keep_btn.setToolTip("Current label is correct - mark as reviewed")
+        clear_btn = QPushButton("Clear Label (C)")
+        clear_btn.setStyleSheet("background: #cc6644; padding: 8px 16px;")
+        skip_btn = QPushButton("Skip (S)")
+        skip_btn.setStyleSheet("padding: 8px 16px;")
+        props_btn = QPushButton("Properties (P)")
+        props_btn.setStyleSheet("padding: 8px 16px;")
+        props_btn.setToolTip("Open this photo in the main window")
+        btn_row.addWidget(keep_btn)
+        btn_row.addWidget(clear_btn)
+        btn_row.addWidget(skip_btn)
+        btn_row.addWidget(props_btn)
+        btn_row.addStretch()
         close_btn = QPushButton("Close")
-        tag_row.addWidget(close_btn)
-        layout.addLayout(tag_row)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
 
-        current_items = []
-        current_page = [0]
-        ITEMS_PER_PAGE = GRID_COLS * GRID_ROWS
+        current_pixmap = [None]
+        min_scale = [0.1]
+        max_scale = 5.0
+        reviewed_items = set()
+        navigate_to_photo = [None]  # Store photo to navigate to after dialog closes
 
-        def get_filtered():
-            ft = reason_filter.currentText()
-            fr = ft.split(" (")[0] if " (" in ft else None
-            return queue[:] if fr == "All" else [i for i in queue if i.get("reason") == fr]
+        def _get_current_scale():
+            return view.transform().m11()
 
-        def load_page():
-            nonlocal current_items
-            current_items = get_filtered()
-            tp = max(1, (len(current_items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
-            current_page[0] = max(0, min(current_page[0], tp - 1))
-            page_label.setText(f"Page {current_page[0] + 1} of {tp}")
-            prev_btn.setEnabled(current_page[0] > 0)
-            next_btn.setEnabled(current_page[0] < tp - 1)
-            start = current_page[0] * ITEMS_PER_PAGE
-            page_items = current_items[start:start + ITEMS_PER_PAGE]
-            for i, tw in enumerate(thumb_widgets):
-                if i < len(page_items):
-                    item = page_items[i]
-                    tw["item"] = item
-                    tw["check"].setChecked(False)
-                    tw["check"].setVisible(True)
-                    tw["label"].setVisible(True)
-                    # Use pre-generated thumbnail for speed (much smaller files)
-                    thumb_path = item.get("thumbnail_path", "")
-                    file_path = item.get("file_path", "")
-                    px = None
-                    if thumb_path and os.path.exists(thumb_path):
-                        px = QPixmap(thumb_path)
-                    elif file_path and os.path.exists(file_path):
-                        # Fallback to full image if no thumbnail
-                        px = QPixmap(file_path)
-                    if px and not px.isNull():
-                        tw["label"].setPixmap(px.scaled(THUMB_SIZE, THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
-                    else:
-                        tw["label"].setText("N/A")
+        def _zoom_in():
+            current = _get_current_scale()
+            if current < max_scale:
+                view.scale(1.25, 1.25)
+
+        def _zoom_out():
+            current = _get_current_scale()
+            if current > min_scale[0] * 1.1:
+                view.scale(0.8, 0.8)
+
+        def _zoom_fit():
+            if current_pixmap[0] and scene.sceneRect().width() > 0:
+                view.resetTransform()
+                view.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+                min_scale[0] = _get_current_scale() * 0.95
+                view.scale(0.95, 0.95)
+
+        def _zoom_100():
+            view.resetTransform()
+
+        def _update_preview():
+            item = list_widget.currentItem()
+            if not item:
+                scene.clear()
+                current_label_display.setText("Current Label: —")
+                suggestion_label.setText("AI Suggests: —")
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            path = data.get("file_path")
+            photo_id = data.get("photo_id")
+            tags = data.get("_tags", [])
+            reason = data.get("reason", "")
+
+            # Display current label
+            if tags:
+                current_label_display.setText(f"Current Label: {', '.join(tags)}")
+                current_label_display.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffcc00; padding: 5px; background: #333;")
+            else:
+                current_label_display.setText("Current Label: (none)")
+                current_label_display.setStyleSheet("font-size: 18px; font-weight: bold; color: #888; padding: 5px; background: #333;")
+
+            # Display AI suggestion from reason
+            suggestion_label.setText(f"AI Suggests: {reason}" if reason else "AI Suggests: —")
+
+            if path and os.path.exists(path):
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    scene.clear()
+                    scene.addPixmap(pixmap)
+                    scene.setSceneRect(pixmap.rect().toRectF())
+                    current_pixmap[0] = pixmap
+
+                    # Draw detection boxes
+                    if photo_id:
+                        boxes = self.db.get_boxes(photo_id)
+                        w = pixmap.width()
+                        h = pixmap.height()
+                        for b in boxes:
+                            if b["y1"] >= 0.95:
+                                continue
+                            rect = QRectF(b["x1"] * w, b["y1"] * h, (b["x2"] - b["x1"]) * w, (b["y2"] - b["y1"]) * h)
+                            lbl = b.get("label", "")
+                            if str(lbl).startswith("ai_"):
+                                pen = QPen(Qt.GlobalColor.yellow)
+                            else:
+                                pen = QPen(Qt.GlobalColor.green)
+                            pen.setWidth(4)
+                            scene.addRect(rect, pen)
+
+                    _zoom_fit()
                 else:
-                    tw["item"] = None
-                    tw["check"].setVisible(False)
-                    tw["label"].setVisible(False)
-                    tw["label"].clear()
-            dlg.setWindowTitle(f"Claude Review Queue ({len(current_items)} photos)")
+                    scene.clear()
+                    current_pixmap[0] = None
+            else:
+                scene.clear()
+                current_pixmap[0] = None
 
-        def get_selected():
-            return [tw["item"] for tw in thumb_widgets if tw["item"] and tw["check"].isChecked()]
+        def _mark_reviewed(item, action_text: str):
+            """Mark item as reviewed with visual feedback."""
+            row = list_widget.row(item)
+            reviewed_items.add(row)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            name = os.path.basename(data.get("file_path", ""))[:20]
+            item.setText(f"✓ {action_text} - {name}")
+            item.setBackground(QColor(144, 238, 144))
+            remaining = list_widget.count() - len(reviewed_items)
+            dlg.setWindowTitle(f"Claude Review Queue ({remaining} remaining)")
 
-        def apply_tag(species):
-            sel = get_selected()
-            if not sel:
-                QMessageBox.information(dlg, "No Selection", "Select photos first.")
+        def _next_unreviewed():
+            """Move to next unreviewed item."""
+            current = list_widget.currentRow()
+            total = list_widget.count()
+            for i in range(current + 1, total):
+                if i not in reviewed_items:
+                    list_widget.setCurrentRow(i)
+                    _update_preview()
+                    return
+            for i in range(0, current):
+                if i not in reviewed_items:
+                    list_widget.setCurrentRow(i)
+                    _update_preview()
+                    return
+            # All done
+            QMessageBox.information(dlg, "Done", "All photos reviewed!")
+            dlg.close()
+
+        def _apply_species(species):
+            """Apply a species label and advance."""
+            item = list_widget.currentItem()
+            if not item:
                 return
-            for item in sel:
-                pid = item["photo_id"]
-                self.db.add_tag(pid, species)
-                self.db.set_suggested_tag(pid, None, None)
-                self.db.mark_claude_reviewed(pid)
-                if item in queue:
-                    queue.remove(item)
-            self._update_claude_queue_menu()
-            load_page()
-            if not queue:
-                QMessageBox.information(dlg, "Done", "All reviewed!")
-                dlg.close()
-
-        def mark_sel_reviewed():
-            sel = get_selected()
-            if not sel:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            pid = data.get("photo_id")
+            if not pid:
                 return
-            for item in sel:
-                self.db.mark_claude_reviewed(item["photo_id"])
-                if item in queue:
-                    queue.remove(item)
+            # Remove old tags and add new one
+            old_tags = data.get("_tags", [])
+            for tag in old_tags:
+                self.db.remove_tag(pid, tag)
+            self.db.add_tag(pid, species)
+            self.db.set_suggested_tag(pid, None, None)
+            self.db.mark_claude_reviewed(pid)
+            _mark_reviewed(item, species)
             self._update_claude_queue_menu()
-            load_page()
-            if not queue:
-                dlg.close()
+            _next_unreviewed()
 
-        reason_filter.currentIndexChanged.connect(lambda: (current_page.__setitem__(0, 0), load_page()))
-        prev_btn.clicked.connect(lambda: (current_page.__setitem__(0, current_page[0] - 1), load_page()))
-        next_btn.clicked.connect(lambda: (current_page.__setitem__(0, current_page[0] + 1), load_page()))
-        select_all_btn.clicked.connect(lambda: [tw["check"].setChecked(True) for tw in thumb_widgets if tw["item"]])
-        clear_sel_btn.clicked.connect(lambda: [tw["check"].setChecked(False) for tw in thumb_widgets])
-        mark_reviewed_btn.clicked.connect(mark_sel_reviewed)
+        def _keep_label():
+            """Keep current label and advance."""
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            pid = data.get("photo_id")
+            tags = data.get("_tags", [])
+            if not pid:
+                return
+            self.db.set_suggested_tag(pid, None, None)
+            self.db.mark_claude_reviewed(pid)
+            tag_text = ", ".join(tags) if tags else "kept"
+            _mark_reviewed(item, tag_text)
+            self._update_claude_queue_menu()
+            _next_unreviewed()
+
+        def _clear_label():
+            """Clear all labels and advance."""
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            pid = data.get("photo_id")
+            tags = data.get("_tags", [])
+            if not pid:
+                return
+            for tag in tags:
+                self.db.remove_tag(pid, tag)
+            self.db.set_suggested_tag(pid, None, None)
+            self.db.mark_claude_reviewed(pid)
+            _mark_reviewed(item, "cleared")
+            self._update_claude_queue_menu()
+            _next_unreviewed()
+
+        def _skip():
+            """Skip to next without marking reviewed."""
+            current = list_widget.currentRow()
+            total = list_widget.count()
+            if current < total - 1:
+                list_widget.setCurrentRow(current + 1)
+                _update_preview()
+
+        def _open_properties():
+            """Navigate to photo in main window and close review dialog."""
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            navigate_to_photo[0] = data.get("photo_id")
+            dlg.accept()
+
+        # Keyboard shortcuts
+        def _key_handler(event):
+            key = event.key()
+            if key == Qt.Key.Key_K:
+                _keep_label()
+            elif key == Qt.Key.Key_C:
+                _clear_label()
+            elif key == Qt.Key.Key_S:
+                _skip()
+            elif key == Qt.Key.Key_P:
+                _open_properties()
+            elif key == Qt.Key.Key_Plus or key == Qt.Key.Key_Equal:
+                _zoom_in()
+            elif key == Qt.Key.Key_Minus:
+                _zoom_out()
+            else:
+                QDialog.keyPressEvent(dlg, event)
+        dlg.keyPressEvent = _key_handler
+
+        # Connect signals
+        list_widget.currentItemChanged.connect(lambda: _update_preview())
+        zoom_in_btn.clicked.connect(_zoom_in)
+        zoom_out_btn.clicked.connect(_zoom_out)
+        zoom_fit_btn.clicked.connect(_zoom_fit)
+        zoom_100_btn.clicked.connect(_zoom_100)
+        keep_btn.clicked.connect(_keep_label)
+        clear_btn.clicked.connect(_clear_label)
+        skip_btn.clicked.connect(_skip)
+        props_btn.clicked.connect(_open_properties)
         close_btn.clicked.connect(dlg.close)
-        for tw in thumb_widgets:
-            tw["label"].mousePressEvent = lambda e, t=tw: t["check"].setChecked(not t["check"].isChecked()) if t["item"] else None
-        load_page()
+
+        _update_preview()
         dlg.exec()
+
+        # Handle navigation to specific photo if Properties was clicked
+        if navigate_to_photo[0]:
+            target_pid = navigate_to_photo[0]
+            # Refresh photos from database INCLUDING archived (target may be archived)
+            self.photos = self._sorted_photos(self.db.search_photos(include_archived=True))
+            # Find the target photo index
+            target_index = None
+            for i, p in enumerate(self.photos):
+                if p.get("id") == target_pid:
+                    target_index = i
+                    break
+            if target_index is not None:
+                # Reset filters to ensure target photo is visible
+                self.collection_filter_combo.blockSignals(True)
+                self.collection_filter_combo.setCurrentIndex(0)  # "All Collections"
+                self.collection_filter_combo.blockSignals(False)
+                if hasattr(self.species_filter_combo, 'select_all'):
+                    self.species_filter_combo.select_all()
+                self.archive_filter_combo.setCurrentText("All Photos")
+                # Navigate to photo
+                self.current_index = target_index
+                self._rebuild_photo_list()
+                self._sync_list_selection()
+                self.load_photo()
 
     def open_stamp_reader(self):
         """Open the stamp reader for pattern-based OCR."""

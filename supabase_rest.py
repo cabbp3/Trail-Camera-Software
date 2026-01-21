@@ -250,10 +250,10 @@ def get_client() -> Optional[SupabaseRestClient]:
         return None
 
     url = config.get("url")
-    key = config.get("key")
+    key = config.get("key") or config.get("anon_key")  # Support both key names
 
     if not url or not key:
-        logger.error("Supabase config missing 'url' or 'key'")
+        logger.error("Supabase config missing 'url' or 'key'/'anon_key'")
         return None
 
     _cached_client = SupabaseRestClient(url, key)
