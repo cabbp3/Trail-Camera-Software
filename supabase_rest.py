@@ -265,3 +265,54 @@ def is_configured() -> bool:
     """Check if Supabase is configured and accessible."""
     client = get_client()
     return client is not None and client.is_configured()
+
+
+def get_cloud_photo_hashes() -> List[str]:
+    """Get all file_hashes from Supabase photos_sync table.
+
+    Returns:
+        List of file_hash strings from cloud
+    """
+    client = get_client()
+    if not client:
+        return []
+
+    try:
+        result = client.table("photos_sync").select("file_hash").execute(fetch_all=True)
+        hashes = [row["file_hash"] for row in result.data if row.get("file_hash")]
+        logger.info(f"Found {len(hashes)} photos in cloud")
+        return hashes
+    except Exception as e:
+        logger.error(f"Failed to get cloud photo hashes: {e}")
+        return []
+
+
+def get_cloud_photos_not_local(local_hashes: set) -> List[Dict]:
+    """Get full photo records from Supabase that don't exist locally.
+
+    Args:
+        local_hashes: Set of file_hashes that exist in local database
+
+    Returns:
+        List of photo records from cloud that are not in local_hashes
+    """
+    client = get_client()
+    if not client:
+        return []
+
+    try:
+        # Get all photos from cloud
+        result = client.table("photos_sync").select("*").execute(fetch_all=True)
+
+        # Filter to only those not in local
+        cloud_only = []
+        for row in result.data:
+            file_hash = row.get("file_hash")
+            if file_hash and file_hash not in local_hashes:
+                cloud_only.append(row)
+
+        logger.info(f"Found {len(cloud_only)} cloud-only photos (not in local DB)")
+        return cloud_only
+    except Exception as e:
+        logger.error(f"Failed to get cloud photos: {e}")
+        return []

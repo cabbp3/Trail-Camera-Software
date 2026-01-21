@@ -2120,6 +2120,8 @@ class TrainerWindow(QMainWindow):
         upload_thumbs_action.triggered.connect(lambda: self.upload_to_cloud(thumbnails_only=True))
         upload_all_action = self.tools_menu.addAction("Upload All Photos to Cloud...")
         upload_all_action.triggered.connect(lambda: self.upload_to_cloud(thumbnails_only=False))
+        download_cloud_action = self.tools_menu.addAction("Download New Photos from Cloud...")
+        download_cloud_action.triggered.connect(self._check_for_new_cloud_photos)
         change_username_action = self.tools_menu.addAction("Change Username...")
         change_username_action.triggered.connect(self.change_username)
         admin_panel_action = self.tools_menu.addAction("Admin: View All Users...")
@@ -2476,9 +2478,169 @@ class TrainerWindow(QMainWindow):
                 self._populate_photo_list()
                 if self.photos:
                     self.load_photo()
+
+            # After pulling labels, check for new photos that only exist in cloud
+            QTimer.singleShot(100, self._check_for_new_cloud_photos)
+
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "Cloud Sync", f"Failed to pull from cloud:\n{str(e)}")
+
+    def _check_for_new_cloud_photos(self):
+        """Check if there are photos in cloud that don't exist locally, offer to download."""
+        try:
+            from supabase_rest import get_cloud_photos_not_local
+            from r2_storage import R2Storage
+
+            # Get local file hashes
+            local_hashes = self.db.get_all_file_hashes()
+
+            # Get cloud photos not in local
+            cloud_only = get_cloud_photos_not_local(local_hashes)
+
+            if not cloud_only:
+                return  # No new photos in cloud
+
+            # Show dialog asking user if they want to download
+            count = len(cloud_only)
+            reply = QMessageBox.question(
+                self,
+                "New Photos in Cloud",
+                f"Found {count} photo{'s' if count != 1 else ''} in the cloud that {'are' if count != 1 else 'is'} not on this device.\n\n"
+                f"Would you like to download {'them' if count != 1 else 'it'}?\n\n"
+                "(Only thumbnails will be downloaded for viewing. Full photos remain in cloud.)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            # Start download with progress dialog
+            self._download_cloud_photos(cloud_only)
+
+        except Exception as e:
+            logger.error(f"Error checking for cloud photos: {e}", exc_info=True)
+
+    def _download_cloud_photos(self, cloud_photos: list):
+        """Download thumbnails for cloud-only photos with progress dialog."""
+        from r2_storage import R2Storage
+        from pathlib import Path
+
+        # Create progress dialog
+        self._cloud_dl_dialog = QDialog(self)
+        self._cloud_dl_dialog.setWindowTitle("Downloading from Cloud")
+        self._cloud_dl_dialog.setMinimumWidth(400)
+        self._cloud_dl_dialog.setModal(True)
+        layout = QVBoxLayout(self._cloud_dl_dialog)
+
+        self._cloud_dl_label = QLabel(f"Preparing to download {len(cloud_photos)} photos...")
+        layout.addWidget(self._cloud_dl_label)
+
+        self._cloud_dl_progress = QProgressBar()
+        self._cloud_dl_progress.setMaximum(len(cloud_photos))
+        self._cloud_dl_progress.setValue(0)
+        layout.addWidget(self._cloud_dl_progress)
+
+        cancel_btn = QPushButton("Cancel")
+        layout.addWidget(cancel_btn)
+
+        self._cloud_dl_cancelled = False
+
+        def on_cancel():
+            self._cloud_dl_cancelled = True
+            if hasattr(self, '_cloud_dl_worker') and self._cloud_dl_worker.isRunning():
+                self._cloud_dl_worker.cancel()
+            self._cloud_dl_dialog.close()
+
+        cancel_btn.clicked.connect(on_cancel)
+
+        # Create worker thread
+        class CloudPhotoDownloadWorker(QThread):
+            progress = pyqtSignal(int, int, str)  # current, total, message
+            finished = pyqtSignal(int, int)  # downloaded, failed
+
+            def __init__(self, photos, db, r2, thumb_dir):
+                super().__init__()
+                self.photos = photos
+                self.db = db
+                self.r2 = r2
+                self.thumb_dir = thumb_dir
+                self._cancelled = False
+
+            def cancel(self):
+                self._cancelled = True
+
+            def run(self):
+                downloaded = 0
+                failed = 0
+                total = len(self.photos)
+
+                for i, photo in enumerate(self.photos):
+                    if self._cancelled:
+                        break
+
+                    file_hash = photo.get("file_hash")
+                    if not file_hash:
+                        failed += 1
+                        continue
+
+                    self.progress.emit(i + 1, total, f"Downloading {i + 1} of {total}...")
+
+                    # Add photo record to local database
+                    photo_id = self.db.add_cloud_photo(photo)
+                    if not photo_id:
+                        # Already exists
+                        continue
+
+                    # Download thumbnail from R2
+                    r2_key = f"thumbnails/{file_hash}_thumb.jpg"
+                    thumb_path = self.thumb_dir / f"{file_hash}_thumb.jpg"
+
+                    if self.r2.download_photo(r2_key, thumb_path):
+                        self.db.update_thumbnail_path(photo_id, str(thumb_path))
+                        downloaded += 1
+                    else:
+                        # Still count as success - photo record exists, just no thumbnail
+                        downloaded += 1
+
+                self.finished.emit(downloaded, failed)
+
+        # Set up paths
+        thumb_dir = Path.home() / "TrailCamLibrary" / ".thumbnails"
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+
+        r2 = R2Storage()
+        if not r2.is_configured():
+            QMessageBox.warning(self, "Cloud Download", "R2 storage is not configured.")
+            return
+
+        self._cloud_dl_worker = CloudPhotoDownloadWorker(cloud_photos, self.db, r2, thumb_dir)
+
+        def on_progress(current, total, message):
+            self._cloud_dl_label.setText(message)
+            self._cloud_dl_progress.setValue(current)
+
+        def on_finished(downloaded, failed):
+            self._cloud_dl_dialog.close()
+
+            if self._cloud_dl_cancelled:
+                QMessageBox.information(self, "Download Cancelled",
+                    f"Download cancelled.\n{downloaded} photos were added before cancellation.")
+            else:
+                QMessageBox.information(self, "Download Complete",
+                    f"Successfully added {downloaded} photos from cloud.")
+
+            # Refresh photo list
+            self.photos = self._sorted_photos(self.db.get_all_photos())
+            self._populate_photo_list()
+            if self.photos:
+                self.load_photo()
+
+        self._cloud_dl_worker.progress.connect(on_progress)
+        self._cloud_dl_worker.finished.connect(on_finished)
+        self._cloud_dl_worker.start()
+
+        self._cloud_dl_dialog.show()
 
     def closeEvent(self, event):
         """Save settings and optionally push to cloud before closing."""

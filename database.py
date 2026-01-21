@@ -669,7 +669,85 @@ class TrailCamDatabase:
         cursor.execute("SELECT * FROM photos WHERE file_hash = ?", (file_hash,))
         row = cursor.fetchone()
         return dict(row) if row else None
-    
+
+    def get_all_file_hashes(self) -> set:
+        """Get all file_hashes from local database.
+
+        Returns:
+            Set of file_hash strings
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT file_hash FROM photos WHERE file_hash IS NOT NULL AND file_hash != ''")
+        return {row['file_hash'] for row in cursor.fetchall()}
+
+    def add_cloud_photo(self, cloud_record: Dict) -> Optional[int]:
+        """Add a photo record from cloud data (for photos that only exist in cloud).
+
+        The file_path will be set to 'cloud://{file_hash}' to indicate it's cloud-only.
+        The thumbnail will be downloaded separately.
+
+        Args:
+            cloud_record: Photo record from Supabase photos_sync table
+
+        Returns:
+            Photo ID if inserted, None if already exists
+        """
+        file_hash = cloud_record.get("file_hash")
+        if not file_hash:
+            return None
+
+        # Check if already exists
+        if self.photo_exists_by_hash(file_hash):
+            return None
+
+        # Use cloud:// prefix to indicate this photo only exists in cloud
+        file_path = f"cloud://{file_hash}"
+
+        # Extract fields from cloud record
+        original_name = cloud_record.get("original_name", "")
+        date_taken = cloud_record.get("date_taken", "")
+        camera_model = cloud_record.get("camera_model", "")
+        camera_location = cloud_record.get("camera_location", "")
+        favorite = cloud_record.get("favorite", 0)
+        notes = cloud_record.get("notes", "")
+        collection = cloud_record.get("collection", "")
+
+        # Compute season year
+        season_year = self.compute_season_year(date_taken) if date_taken else None
+
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT INTO photos
+                (file_path, original_name, date_taken, camera_model, import_date,
+                 thumbnail_path, favorite, notes, season_year, camera_location,
+                 collection, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (file_path, original_name, date_taken, camera_model,
+                  datetime.now().isoformat(), None, favorite, notes,
+                  season_year, camera_location, collection, file_hash))
+            photo_id = cursor.lastrowid
+            self.conn.commit()
+            return photo_id
+
+    def update_thumbnail_path(self, photo_id: int, thumbnail_path: str):
+        """Update the thumbnail_path for a photo."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET thumbnail_path = ? WHERE id = ?",
+                          (thumbnail_path, photo_id))
+            self.conn.commit()
+
+    def get_cloud_only_photos(self) -> List[Dict]:
+        """Get all photos that only exist in cloud (file_path starts with 'cloud://').
+
+        Returns:
+            List of photo dicts
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM photos WHERE file_path LIKE 'cloud://%'")
+        return [dict(row) for row in cursor.fetchall()]
+
     def get_photo_path(self, photo_id: int) -> Optional[str]:
         """Get file path for a photo ID."""
         cursor = self.conn.cursor()
@@ -2432,6 +2510,14 @@ class TrailCamDatabase:
             cursor.execute("SELECT COUNT(*) FROM annotation_boxes")
             local_box_count = cursor.fetchone()[0]
 
+            # Check if cloud annotation_boxes is empty - if so, need full sync
+            cloud_box_count = 0
+            try:
+                result = supabase_client.table("annotation_boxes").select("id").execute()
+                cloud_box_count = len(result.data) if result.data else 0
+            except Exception:
+                pass  # If check fails, assume we need incremental sync
+
             # Safety check: don't delete cloud boxes if local has very few
             # (protects against pushing from empty/new database)
             if local_box_count < 100:
@@ -2440,11 +2526,17 @@ class TrailCamDatabase:
                 print("  Run 'Pull from Cloud' first if this is a new computer.")
                 counts["annotation_boxes"] = 0
             else:
+                # If cloud is empty but local has data, do full sync (skip since_clause)
+                force_full_sync = (cloud_box_count == 0 and local_box_count > 100)
+                if force_full_sync:
+                    print(f"  Cloud annotation_boxes is empty but local has {local_box_count} - doing full sync")
+
+                box_filter = "" if force_full_sync else since_clause('b')
                 cursor.execute(f"""
                     SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
                     FROM annotation_boxes b
                     JOIN photos p ON b.photo_id = p.id
-                    WHERE 1=1 {since_clause('b')}
+                    WHERE 1=1 {box_filter}
                 """)
                 boxes_data = []
                 for row in cursor.fetchall():
@@ -2467,7 +2559,7 @@ class TrailCamDatabase:
                     })
                 # For incremental sync, use upsert instead of delete+insert
                 if boxes_data:
-                    if last_sync is None:
+                    if last_sync is None or force_full_sync:
                         # Full sync: delete all and re-insert
                         supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
                         for i in range(0, len(boxes_data), BATCH_SIZE):
