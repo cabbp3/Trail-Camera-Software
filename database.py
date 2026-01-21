@@ -2343,7 +2343,7 @@ class TrailCamDatabase:
                     "archived": bool(photo.get("archived")),  # Hide from mobile by default
                     "updated_at": now
                 })
-            batch_upsert("photos_sync", photos_data, "photo_key")
+            batch_upsert("photos_sync", photos_data, "file_hash")
             counts["photos"] = len(photos_data)
 
             # Push tags
@@ -2363,7 +2363,7 @@ class TrailCamDatabase:
                     "tag_name": row["tag_name"],
                     "updated_at": now
                 })
-            batch_upsert("tags", tags_data, "photo_key,tag_name")
+            batch_upsert("tags", tags_data, "file_hash,tag_name")
             counts["tags"] = len(tags_data)
 
             # Delete tags from Supabase that were deleted locally
@@ -2432,7 +2432,7 @@ class TrailCamDatabase:
                     "broken_antler_note": d.get("broken_antler_note"),
                     "updated_at": now
                 })
-            batch_upsert("deer_metadata", deer_meta_data, "photo_key")
+            batch_upsert("deer_metadata", deer_meta_data, "file_hash")
             counts["deer_metadata"] = len(deer_meta_data)
 
             # Push deer_additional
@@ -2468,7 +2468,7 @@ class TrailCamDatabase:
                     "broken_antler_note": d.get("broken_antler_note"),
                     "updated_at": now
                 })
-            batch_upsert("deer_additional", deer_add_data, "photo_key,deer_id")
+            batch_upsert("deer_additional", deer_add_data, "file_hash,deer_id")
             counts["deer_additional"] = len(deer_add_data)
 
             # Push buck_profiles
@@ -2576,7 +2576,7 @@ class TrailCamDatabase:
                                 supabase_client.table("annotation_boxes").insert(batch).execute()
                     else:
                         # Incremental sync: upsert changed boxes
-                        batch_upsert("annotation_boxes", boxes_data, "photo_key,label,x1,y1")
+                        batch_upsert("annotation_boxes", boxes_data, "file_hash,label,x1,y1")
                 counts["annotation_boxes"] = len(boxes_data)
 
             report(7, "Sync complete!")

@@ -241,26 +241,50 @@ def get_exif_datetime(image_path: Path):
         from PIL.ExifTags import TAGS
 
         with Image.open(image_path) as img:
-            exif_data = img._getexif()
+            # Try _getexif() first (works for JPEG)
+            exif_data = None
+            try:
+                exif_data = img._getexif()
+            except AttributeError:
+                pass
+
+            # Try getexif() as fallback (newer Pillow API)
+            if not exif_data:
+                try:
+                    exif_obj = img.getexif()
+                    if exif_obj:
+                        exif_data = dict(exif_obj)
+                except Exception:
+                    pass
 
             if not exif_data:
+                print(f"    [EXIF] No EXIF data found in {image_path.name}")
                 return None
 
-            # Look for DateTimeOriginal (preferred) or DateTime
-            for tag_id, value in exif_data.items():
-                tag = TAGS.get(tag_id, tag_id)
-                if tag == 'DateTimeOriginal' and value:
-                    # Format: "2026:01:20 19:06:54" -> "2026-01-20T19:06:54"
-                    return value.replace(':', '-', 2).replace(' ', 'T')
+            # Look for DateTimeOriginal (tag 36867) or DateTime (tag 306)
+            datetime_original = exif_data.get(36867)  # DateTimeOriginal
+            datetime_tag = exif_data.get(306)  # DateTime
 
-            # Fallback to DateTime
+            # Also try by name in case tag IDs differ
             for tag_id, value in exif_data.items():
                 tag = TAGS.get(tag_id, tag_id)
-                if tag == 'DateTime' and value:
-                    return value.replace(':', '-', 2).replace(' ', 'T')
+                if tag == 'DateTimeOriginal' and value and not datetime_original:
+                    datetime_original = value
+                elif tag == 'DateTime' and value and not datetime_tag:
+                    datetime_tag = value
+
+            # Use DateTimeOriginal if available, else DateTime
+            timestamp = datetime_original or datetime_tag
+
+            if timestamp:
+                # Format: "2026:01:20 19:06:54" -> "2026-01-20T19:06:54"
+                result = str(timestamp).replace(':', '-', 2).replace(' ', 'T')
+                return result
+
+            print(f"    [EXIF] EXIF data exists but no timestamp tags found in {image_path.name}")
 
     except Exception as e:
-        print(f"[EXIF] Failed to read timestamp: {e}")
+        print(f"[EXIF] Failed to read timestamp from {image_path.name}: {e}")
 
     return None
 
@@ -333,8 +357,9 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
     }
 
     try:
+        # Use file_hash as conflict key to prevent duplicates
         resp = requests.post(
-            f"{supabase_url}/rest/v1/photos_sync",
+            f"{supabase_url}/rest/v1/photos_sync?on_conflict=file_hash",
             headers=headers,
             json=data,
             timeout=30,
