@@ -738,6 +738,14 @@ class TrailCamDatabase:
                           (thumbnail_path, photo_id))
             self.conn.commit()
 
+    def update_file_path(self, photo_id: int, file_path: str):
+        """Update the file_path for a photo (used after downloading from cloud)."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET file_path = ? WHERE id = ?",
+                          (file_path, photo_id))
+            self.conn.commit()
+
     def get_cloud_only_photos(self) -> List[Dict]:
         """Get all photos that only exist in cloud (file_path starts with 'cloud://').
 

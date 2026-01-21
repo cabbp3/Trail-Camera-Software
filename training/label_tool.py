@@ -2559,16 +2559,53 @@ class TrainerWindow(QMainWindow):
             progress = pyqtSignal(int, int, str)  # current, total, message
             finished = pyqtSignal(int, int)  # downloaded, failed
 
-            def __init__(self, photos, db, r2, thumb_dir):
+            def __init__(self, photos, db, r2, thumb_dir, photo_dir):
                 super().__init__()
                 self.photos = photos
                 self.db = db
                 self.r2 = r2
                 self.thumb_dir = thumb_dir
+                self.photo_dir = photo_dir  # Base photo directory
                 self._cancelled = False
 
             def cancel(self):
                 self._cancelled = True
+
+            def _get_photo_dest_path(self, photo):
+                """Get destination path for photo based on date_taken."""
+                from datetime import datetime as dt
+                date_taken = photo.get("date_taken", "")
+                file_hash = photo.get("file_hash")
+                original_name = photo.get("original_name", f"{file_hash}.jpg")
+
+                # Parse date to get year/month for folder structure
+                year, month = "Unknown", "Unknown"
+                if date_taken:
+                    try:
+                        # Handle various date formats
+                        for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+                            try:
+                                parsed = dt.strptime(date_taken[:19], fmt)
+                                year = str(parsed.year)
+                                month = f"{parsed.month:02d}"
+                                break
+                            except ValueError:
+                                continue
+                    except Exception:
+                        pass
+
+                # Create destination folder
+                dest_folder = self.photo_dir / year / month
+                dest_folder.mkdir(parents=True, exist_ok=True)
+
+                # Use original filename, but ensure uniqueness with hash if needed
+                dest_path = dest_folder / original_name
+                if dest_path.exists():
+                    # File exists, use hash-based name
+                    ext = Path(original_name).suffix or ".jpg"
+                    dest_path = dest_folder / f"{file_hash}{ext}"
+
+                return dest_path
 
             def run(self):
                 downloaded = 0
@@ -2592,21 +2629,34 @@ class TrainerWindow(QMainWindow):
                         # Already exists
                         continue
 
+                    # Download full photo from R2
+                    photo_r2_key = f"photos/{file_hash}.jpg"
+                    photo_dest = self._get_photo_dest_path(photo)
+
+                    if self.r2.download_photo(photo_r2_key, photo_dest):
+                        # Update file_path to local path
+                        self.db.update_file_path(photo_id, str(photo_dest))
+                    else:
+                        # Try .jpeg extension
+                        photo_r2_key = f"photos/{file_hash}.jpeg"
+                        if self.r2.download_photo(photo_r2_key, photo_dest):
+                            self.db.update_file_path(photo_id, str(photo_dest))
+
                     # Download thumbnail from R2
-                    r2_key = f"thumbnails/{file_hash}_thumb.jpg"
+                    thumb_r2_key = f"thumbnails/{file_hash}_thumb.jpg"
                     thumb_path = self.thumb_dir / f"{file_hash}_thumb.jpg"
 
-                    if self.r2.download_photo(r2_key, thumb_path):
+                    if self.r2.download_photo(thumb_r2_key, thumb_path):
                         self.db.update_thumbnail_path(photo_id, str(thumb_path))
-                        downloaded += 1
-                    else:
-                        # Still count as success - photo record exists, just no thumbnail
-                        downloaded += 1
+
+                    downloaded += 1
 
                 self.finished.emit(downloaded, failed)
 
         # Set up paths
-        thumb_dir = Path.home() / "TrailCamLibrary" / ".thumbnails"
+        photo_dir = Path.home() / "TrailCamLibrary"
+        photo_dir.mkdir(parents=True, exist_ok=True)
+        thumb_dir = photo_dir / ".thumbnails"
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
         r2 = R2Storage()
@@ -2614,7 +2664,7 @@ class TrainerWindow(QMainWindow):
             QMessageBox.warning(self, "Cloud Download", "R2 storage is not configured.")
             return
 
-        self._cloud_dl_worker = CloudPhotoDownloadWorker(cloud_photos, self.db, r2, thumb_dir)
+        self._cloud_dl_worker = CloudPhotoDownloadWorker(cloud_photos, self.db, r2, thumb_dir, photo_dir)
 
         def on_progress(current, total, message):
             self._cloud_dl_label.setText(message)
