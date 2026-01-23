@@ -66,45 +66,62 @@ def get_library_path() -> Path:
 
 def extract_exif_data(image_path: str) -> Tuple[Optional[str], Optional[str]]:
     """Extract date/time and camera model from EXIF data.
-    
+
     Args:
         image_path: Path to the image file
-        
+
     Returns:
         Tuple of (date_taken, camera_model) or (None, None) if not found
     """
     try:
         with Image.open(image_path) as img:
             exifdata = img.getexif()
-            
+
             if exifdata is None:
                 return None, None
-            
+
             date_taken = None
             camera_model = None
-            
-            for tag_id, value in exifdata.items():
-                # Use direct tag ID comparison for Pillow 11.3.0 compatibility
-                if tag_id == EXIF_DATETIME_ORIGINAL:
-                    # Format: "YYYY:MM:DD HH:MM:SS"
-                    try:
-                        dt = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-                        date_taken = dt.isoformat()
-                    except (ValueError, TypeError):
-                        pass
-                
-                elif tag_id == EXIF_DATETIME:
-                    # Use DateTime if DateTimeOriginal not found
-                    if date_taken is None:
-                        try:
-                            dt = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-                            date_taken = dt.isoformat()
-                        except (ValueError, TypeError):
-                            pass
-                
-                elif tag_id == EXIF_MODEL:
-                    camera_model = _sanitize_camera_model(value)
-            
+
+            # Get camera model from IFD0 (main EXIF)
+            if EXIF_MODEL in exifdata:
+                camera_model = _sanitize_camera_model(exifdata[EXIF_MODEL])
+
+            # DateTime (tag 306) is in IFD0 - use as fallback
+            datetime_fallback = exifdata.get(EXIF_DATETIME)
+
+            # DateTimeOriginal (tag 36867) is in the EXIF sub-IFD (0x8769)
+            # This is where the ACTUAL capture time is stored
+            datetime_original = None
+            try:
+                exif_ifd = exifdata.get_ifd(0x8769)  # EXIF IFD
+                if exif_ifd:
+                    datetime_original = exif_ifd.get(EXIF_DATETIME_ORIGINAL)
+            except (AttributeError, Exception):
+                pass  # get_ifd not available in older Pillow
+
+            # Try deprecated _getexif() as fallback (merges all IFDs)
+            if not datetime_original:
+                try:
+                    old_exif = img._getexif()
+                    if old_exif:
+                        datetime_original = old_exif.get(EXIF_DATETIME_ORIGINAL)
+                        if not datetime_fallback:
+                            datetime_fallback = old_exif.get(EXIF_DATETIME)
+                        if not camera_model:
+                            camera_model = _sanitize_camera_model(old_exif.get(EXIF_MODEL))
+                except (AttributeError, Exception):
+                    pass
+
+            # Use DateTimeOriginal (capture time) if available, else DateTime
+            timestamp = datetime_original or datetime_fallback
+            if timestamp:
+                try:
+                    dt = datetime.strptime(str(timestamp), "%Y:%m:%d %H:%M:%S")
+                    date_taken = dt.isoformat()
+                except (ValueError, TypeError):
+                    pass
+
             # If no date found in EXIF, try file modification time
             if date_taken is None:
                 try:
@@ -113,11 +130,11 @@ def extract_exif_data(image_path: str) -> Tuple[Optional[str], Optional[str]]:
                     date_taken = dt.isoformat()
                 except OSError:
                     pass
-            
+
             return date_taken, camera_model
-            
+
     except Exception as e:
-        print(f"Error extracting EXIF from {image_path}: {e}")
+        logger.warning(f"Error extracting EXIF from {image_path}: {e}")
         # Fallback to file modification time
         try:
             mtime = os.path.getmtime(image_path)

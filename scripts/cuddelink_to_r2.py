@@ -236,83 +236,91 @@ def get_exif_datetime(image_path: Path):
 
     Returns ISO datetime string like: 2026-01-20T19:06:54
     Returns None if no EXIF timestamp found.
+
+    IMPORTANT: This is the ONLY reliable source of capture time.
+    Filename timestamps from CuddeLink are UPLOAD times, not capture times.
     """
     try:
         from PIL.ExifTags import TAGS
+        import subprocess
 
+        timestamp = None
+
+        # Method 1: Try Pillow getexif() with proper EXIF IFD access (Pillow 10+)
         with Image.open(image_path) as img:
-            # Try _getexif() first (works for JPEG)
-            exif_data = None
+            datetime_original = None
+            datetime_tag = None
+
             try:
-                exif_data = img._getexif()
-            except AttributeError:
+                exif_obj = img.getexif()
+                if exif_obj:
+                    # DateTime (tag 306) is in IFD0 (main EXIF)
+                    datetime_tag = exif_obj.get(306)
+
+                    # DateTimeOriginal (tag 36867) is in the EXIF sub-IFD (0x8769)
+                    # This is where the ACTUAL capture time is stored
+                    try:
+                        exif_ifd = exif_obj.get_ifd(0x8769)  # EXIF IFD
+                        if exif_ifd:
+                            datetime_original = exif_ifd.get(36867)  # DateTimeOriginal
+                            if not datetime_original:
+                                datetime_original = exif_ifd.get(0x9003)  # Same tag, hex
+                    except (AttributeError, Exception):
+                        pass  # get_ifd not available in older Pillow
+            except Exception:
                 pass
 
-            # Try getexif() as fallback (newer Pillow API)
-            if not exif_data:
+            # Method 2: Try deprecated _getexif() as fallback (merges all IFDs)
+            if not datetime_original:
                 try:
-                    exif_obj = img.getexif()
-                    if exif_obj:
-                        exif_data = dict(exif_obj)
-                except Exception:
+                    exif_data = img._getexif()
+                    if exif_data:
+                        datetime_original = exif_data.get(36867)
+                        if not datetime_tag:
+                            datetime_tag = exif_data.get(306)
+                except (AttributeError, Exception):
                     pass
 
-            if not exif_data:
-                print(f"    [EXIF] No EXIF data found in {image_path.name}")
-                return None
-
-            # Look for DateTimeOriginal (tag 36867) or DateTime (tag 306)
-            datetime_original = exif_data.get(36867)  # DateTimeOriginal
-            datetime_tag = exif_data.get(306)  # DateTime
-
-            # Also try by name in case tag IDs differ
-            for tag_id, value in exif_data.items():
-                tag = TAGS.get(tag_id, tag_id)
-                if tag == 'DateTimeOriginal' and value and not datetime_original:
-                    datetime_original = value
-                elif tag == 'DateTime' and value and not datetime_tag:
-                    datetime_tag = value
-
-            # Use DateTimeOriginal if available, else DateTime
+            # Use DateTimeOriginal (capture time) if available, else DateTime
             timestamp = datetime_original or datetime_tag
 
-            if timestamp:
-                # Format: "2026:01:20 19:06:54" -> "2026-01-20T19:06:54"
-                result = str(timestamp).replace(':', '-', 2).replace(' ', 'T')
-                return result
+        # Method 3: Try exiftool as last resort (if installed)
+        if not timestamp:
+            try:
+                result = subprocess.run(
+                    ['exiftool', '-DateTimeOriginal', '-s3', str(image_path)],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    timestamp = result.stdout.strip()
+                    print(f"    [EXIF] Got timestamp via exiftool: {timestamp}")
+            except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+                pass  # exiftool not installed or failed
 
-            print(f"    [EXIF] EXIF data exists but no timestamp tags found in {image_path.name}")
+        if timestamp:
+            # Format: "2026:01:20 19:06:54" -> "2026-01-20T19:06:54"
+            result = str(timestamp).replace(':', '-', 2).replace(' ', 'T')
+            return result
+
+        print(f"    [EXIF] No timestamp found in {image_path.name} (tried Pillow + exiftool)")
 
     except Exception as e:
-        print(f"[EXIF] Failed to read timestamp from {image_path.name}: {e}")
+        print(f"    [EXIF] Failed to read timestamp from {image_path.name}: {e}")
 
     return None
 
 
 def parse_cuddelink_datetime(filename: str, fallback_date: str) -> str:
-    """Parse datetime from CuddeLink filename (DEPRECATED - use ocr_timestamp_from_image).
+    """DEPRECATED - DO NOT USE. Filename timestamp is CuddeLink upload time, NOT capture time.
 
-    This is kept as a fallback but the filename timestamp is when CuddeLink
-    processed the photo, NOT when the trail camera captured it.
+    This function is kept for reference but should never be called.
+    Using filename timestamps causes ~1 hour errors vs actual EXIF time.
     """
-    # Try to extract datetime from filename
-    # Pattern: YYYY-MM-DDTHH_MM_SS.microseconds-sequence.ext
-    match = re.match(r'(\d{4}-\d{2}-\d{2})T(\d{2})_(\d{2})_(\d{2})', filename)
-    if match:
-        date_part = match.group(1)
-        hour = int(match.group(2))
-        minute = match.group(3)
-        second = match.group(4)
-
-        # Convert UTC to Central time (UTC-6)
-        # Note: This is approximate since filename is upload time, not capture time
-        utc_dt = datetime.fromisoformat(f"{date_part}T{hour:02d}:{minute}:{second}")
-        central_dt = utc_dt - timedelta(hours=6)
-
-        return central_dt.strftime("%Y-%m-%dT%H:%M:%S")
-
-    # Fallback to just the date
-    return fallback_date
+    # WARNING: This returns WRONG timestamps - the filename contains CuddeLink upload time,
+    # not the actual camera capture time. Always use EXIF instead.
+    print(f"    [WARNING] parse_cuddelink_datetime called - this produces WRONG timestamps!")
+    print(f"    [WARNING] Filename time != camera capture time. Returning None instead.")
+    return None  # Return None instead of wrong timestamp
 
 
 def upload_to_r2(s3_client, bucket: str, file_path: Path, r2_key: str) -> bool:
@@ -417,13 +425,17 @@ def process_day(session: requests.Session, day_str: str, s3_client, config: dict
                 except Exception as e:
                     print(f"  Uploaded: {img_path.name} (thumbnail failed: {e})")
 
-                # Get datetime from EXIF (preferred) or filename (fallback)
+                # Get datetime from EXIF - DO NOT use filename fallback (it's wrong!)
                 datetime_taken = get_exif_datetime(img_path)
                 if datetime_taken:
                     print(f"    EXIF timestamp: {datetime_taken}")
                 else:
-                    datetime_taken = parse_cuddelink_datetime(img_path.name, day_str)
-                    print(f"    Filename timestamp (fallback): {datetime_taken}")
+                    # No EXIF timestamp found - save with None and flag for later fix
+                    print(f"    [WARNING] No EXIF timestamp found for {img_path.name}")
+                    print(f"    [WARNING] Photo saved WITHOUT timestamp - needs manual fix!")
+                    # Use the date from the folder as a rough approximation (just the date, no time)
+                    datetime_taken = f"{day_str}T00:00:00"
+                    print(f"    Using date-only placeholder: {datetime_taken}")
 
                 # Save metadata
                 save_to_supabase(
