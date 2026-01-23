@@ -349,7 +349,6 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
         "apikey": supabase_key,
         "Authorization": f"Bearer {supabase_key}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates",
     }
 
     # Extract just the date part for the photo_key path
@@ -365,14 +364,17 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
     }
 
     try:
-        # Use file_hash as conflict key to prevent duplicates
+        # Simple INSERT - check_photo_exists prevents duplicates before this is called
         resp = requests.post(
-            f"{supabase_url}/rest/v1/photos_sync?on_conflict=file_hash",
+            f"{supabase_url}/rest/v1/photos_sync",
             headers=headers,
             json=data,
             timeout=30,
         )
-        return resp.status_code < 400
+        if resp.status_code >= 400:
+            print(f"    [Supabase] Save failed: {resp.status_code} {resp.text[:100]}")
+            return False
+        return True
     except Exception as e:
         print(f"[Supabase] Save failed: {e}")
         return False
