@@ -20,7 +20,7 @@
 </head>
 <body>
     <h1>Privacy Policy</h1>
-    <p class="updated">Last updated: January 8, 2026</p>
+    <p class="updated">Last updated: January 22, 2026</p>
 
     <h2>Trail Camera Organizer</h2>
     <p>This privacy policy describes how Trail Camera Organizer ("the App") handles information.</p>
@@ -33,13 +33,37 @@
         <li>Does not track location data</li>
         <li>Does not use analytics or tracking services</li>
         <li>Does not display advertisements</li>
+        <li>Does not access your camera</li>
+    </ul>
+
+    <h2>Permissions</h2>
+    <p>The App requests the following permissions:</p>
+    <ul>
+        <li><strong>Photo Gallery Access:</strong> To allow you to select trail camera photos from your device for upload to your cloud storage. The App only accesses photos you explicitly select.</li>
+        <li><strong>Internet Access:</strong> To sync photos with cloud storage services.</li>
     </ul>
 
     <h2>Data Storage</h2>
-    <p>The App displays trail camera photos stored on external cloud servers. These photos are accessed read-only and are not modified by the App. No data is stored locally on your device except for temporary image caches that can be cleared through your device settings.</p>
+    <p>The App handles data in the following ways:</p>
+    <ul>
+        <li><strong>Cloud Photos:</strong> The App displays trail camera photos stored on your personal cloud storage (Cloudflare R2, Supabase).</li>
+        <li><strong>Local Cache:</strong> Photos you choose to save for offline viewing are stored locally on your device. You can clear this cache at any time through the App or your device settings.</li>
+        <li><strong>Photo Uploads:</strong> When you select photos from your gallery to upload, they are sent to your personal cloud storage. These photos are not shared with us or any third parties.</li>
+    </ul>
 
     <h2>Third-Party Services</h2>
-    <p>The App connects to cloud storage services (Cloudflare R2, Supabase) to retrieve trail camera photos. These services have their own privacy policies. The App does not share any user data with these services.</p>
+    <p>The App connects to cloud storage services (Cloudflare R2, Supabase) to store and retrieve trail camera photos. These are your personal storage accounts. The App does not share any data with third parties.</p>
+
+    <h2>Data Security</h2>
+    <p>All data transfers between the App and cloud services use encrypted HTTPS connections. Photos are stored in your personal cloud storage accounts that only you control.</p>
+
+    <h2>Your Rights</h2>
+    <p>You have full control over your data:</p>
+    <ul>
+        <li>You can delete cached photos from the App at any time</li>
+        <li>You can revoke photo gallery permissions through your device settings</li>
+        <li>Photos in your cloud storage can be deleted through the desktop application</li>
+    </ul>
 
     <h2>Children's Privacy</h2>
     <p>The App does not knowingly collect any information from children under 13 years of age.</p>
