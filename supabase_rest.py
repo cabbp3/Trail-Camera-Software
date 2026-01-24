@@ -49,6 +49,7 @@ class TableQuery:
         self._upsert_data = None
         self._upsert_conflict = None
         self._insert_data = None
+        self._update_data = None
         self._is_delete = False
 
     def select(self, columns: str = "*") -> 'TableQuery':
@@ -67,6 +68,11 @@ class TableQuery:
         self._insert_data = data
         return self
 
+    def update(self, data: Dict) -> 'TableQuery':
+        """Set data to update. Must be used with filters (e.g., .eq())."""
+        self._update_data = data
+        return self
+
     def delete(self) -> 'TableQuery':
         """Mark as delete operation."""
         self._is_delete = True
@@ -80,6 +86,26 @@ class TableQuery:
     def eq(self, column: str, value: Any) -> 'TableQuery':
         """Add equal filter."""
         self._filters.append(f"{column}=eq.{value}")
+        return self
+
+    def gt(self, column: str, value: Any) -> 'TableQuery':
+        """Add greater-than filter (for incremental sync)."""
+        self._filters.append(f"{column}=gt.{value}")
+        return self
+
+    def gte(self, column: str, value: Any) -> 'TableQuery':
+        """Add greater-than-or-equal filter."""
+        self._filters.append(f"{column}=gte.{value}")
+        return self
+
+    def lt(self, column: str, value: Any) -> 'TableQuery':
+        """Add less-than filter."""
+        self._filters.append(f"{column}=lt.{value}")
+        return self
+
+    def lte(self, column: str, value: Any) -> 'TableQuery':
+        """Add less-than-or-equal filter."""
+        self._filters.append(f"{column}=lte.{value}")
         return self
 
     def execute(self, fetch_all: bool = False) -> SupabaseResponse:
@@ -134,6 +160,15 @@ class TableQuery:
             elif self._insert_data is not None:
                 # INSERT query
                 response = requests.post(url, headers=headers, json=self._insert_data, timeout=60)
+                response.raise_for_status()
+                return SupabaseResponse([])
+
+            elif self._update_data is not None:
+                # UPDATE (PATCH) query - requires filters
+                if self._filters:
+                    for f in self._filters:
+                        url += ("?" if "?" not in url else "&") + f
+                response = requests.patch(url, headers=headers, json=self._update_data, timeout=60)
                 response.raise_for_status()
                 return SupabaseResponse([])
 

@@ -142,7 +142,8 @@ class SyncManager(QObject):
         """Check if we can reach the Supabase server."""
         try:
             # Quick socket check to Supabase
-            socket.create_connection(("iwvehmthbjcvdqjqxtty.supabase.co", 443), timeout=5)
+            sock = socket.create_connection(("iwvehmthbjcvdqjqxtty.supabase.co", 443), timeout=5)
+            sock.close()  # Close socket to prevent resource leak
             return True
         except (socket.timeout, socket.error, OSError):
             return False

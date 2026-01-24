@@ -170,3 +170,12 @@ ALTER TABLE annotation_boxes ADD COLUMN IF NOT EXISTS sex_conf REAL;
 -- Add archived column to photos_sync (Jan 12, 2026)
 ALTER TABLE photos_sync ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_photos_sync_archived ON photos_sync(archived);
+
+-- Add indexes on updated_at for faster incremental sync (Jan 22, 2026)
+CREATE INDEX IF NOT EXISTS idx_photos_sync_updated_at ON photos_sync(updated_at);
+CREATE INDEX IF NOT EXISTS idx_tags_updated_at ON tags(updated_at);
+CREATE INDEX IF NOT EXISTS idx_deer_metadata_updated_at ON deer_metadata(updated_at);
+CREATE INDEX IF NOT EXISTS idx_deer_additional_updated_at ON deer_additional(updated_at);
+CREATE INDEX IF NOT EXISTS idx_buck_profiles_updated_at ON buck_profiles(updated_at);
+CREATE INDEX IF NOT EXISTS idx_buck_profile_seasons_updated_at ON buck_profile_seasons(updated_at);
+CREATE INDEX IF NOT EXISTS idx_annotation_boxes_updated_at ON annotation_boxes(updated_at);

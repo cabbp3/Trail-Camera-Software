@@ -42,12 +42,12 @@ class AnimalIdentification:
 
 class MegaDetectorV5:
     """Local MegaDetector v5 inference"""
-    
-    # Category mappings
+
+    # Category mappings (0-indexed when loaded via torch.hub)
     CATEGORIES = {
-        1: 'animal',
-        2: 'person',
-        3: 'vehicle'
+        0: 'animal',
+        1: 'person',
+        2: 'vehicle'
     }
     
     # Species heuristics (can be improved with additional classifiers)
@@ -61,24 +61,34 @@ class MegaDetectorV5:
         self.confidence_threshold = confidence_threshold
         self.model = None
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
+        self.is_available = False
+        self.error_message = None
+
         if MEGADETECTOR_AVAILABLE:
             self._load_model(model_path)
-    
-    # MegaDetector v5a download URL
-    MODEL_URL = "https://github.com/microsoft/CameraTraps/releases/download/v5.0/md_v5a.0.0.pt"
+        else:
+            self.error_message = "PyTorch not installed. Install with: pip install torch torchvision"
+
+    # MegaDetector v5a download URLs (prefer newer version)
+    MODEL_URLS = {
+        'md_v5a.0.1.pt': "https://github.com/agentmorris/MegaDetector/releases/download/v5.0/md_v5a.0.1.pt",
+        'md_v5a.0.0.pt': "https://github.com/microsoft/CameraTraps/releases/download/v5.0/md_v5a.0.0.pt",
+    }
     MODEL_SIZE_MB = 281  # Approximate size for progress display
 
     def _download_model(self, model_path: Path) -> bool:
         """Download MegaDetector model from GitHub releases"""
+        model_name = model_path.name
+        url = self.MODEL_URLS.get(model_name, self.MODEL_URLS['md_v5a.0.0.pt'])
+
         print(f"Downloading MegaDetector v5a model ({self.MODEL_SIZE_MB} MB)...")
-        print(f"From: {self.MODEL_URL}")
+        print(f"From: {url}")
 
         # Ensure directory exists
         model_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            response = requests.get(self.MODEL_URL, stream=True, timeout=30)
+            response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
 
             total_size = int(response.headers.get('content-length', 0))
@@ -100,6 +110,7 @@ class MegaDetectorV5:
 
         except Exception as e:
             print(f"\n  Error downloading model: {e}")
+            self.error_message = f"Failed to download MegaDetector model: {e}"
             # Clean up partial download
             if model_path.exists():
                 model_path.unlink()
@@ -108,7 +119,10 @@ class MegaDetectorV5:
     def _load_model(self, model_path: Optional[str] = None):
         """Load MegaDetector model, downloading if necessary"""
         if model_path is None:
-            model_path = Path.home() / '.trailcam' / 'md_v5a.0.0.pt'
+            # Prefer newer model version, fall back to older
+            model_path = Path.home() / '.trailcam' / 'md_v5a.0.1.pt'
+            if not model_path.exists():
+                model_path = Path.home() / '.trailcam' / 'md_v5a.0.0.pt'
 
         self.model_path = Path(model_path)
 
@@ -117,6 +131,7 @@ class MegaDetectorV5:
             print(f"MegaDetector model not found at {self.model_path}")
             if not self._download_model(self.model_path):
                 print("Failed to download MegaDetector model.")
+                self.error_message = f"MegaDetector model not found at {self.model_path} and download failed"
                 return
 
         try:
@@ -124,13 +139,19 @@ class MegaDetectorV5:
                                        path=str(self.model_path), force_reload=False)
             self.model.to(self.device)
             self.model.conf = self.confidence_threshold
+            self.is_available = True
+            self.error_message = None
             print(f"MegaDetector loaded on {self.device}")
         except Exception as e:
             print(f"Error loading MegaDetector: {e}")
+            self.error_message = f"Failed to load MegaDetector model: {e}"
+            self.is_available = False
     
     def detect(self, image_path: str) -> List[Detection]:
-        """Run detection on an image"""
+        """Run detection on an image. Returns empty list if model not available."""
         if self.model is None:
+            if self.error_message:
+                print(f"MegaDetector not available: {self.error_message}")
             return []
         
         try:
@@ -143,11 +164,11 @@ class MegaDetectorV5:
                 x1, y1, x2, y2 = box
                 category_id = int(cls)
                 category = self.CATEGORIES.get(category_id, 'unknown')
-                
+
                 # Get image dimensions for normalization
-                img = Image.open(image_path)
-                w, h = img.size
-                
+                with Image.open(image_path) as img:
+                    w, h = img.size
+
                 # Normalize bounding box
                 bbox = (x1/w, y1/h, (x2-x1)/w, (y2-y1)/h)
                 
@@ -176,6 +197,309 @@ class MegaDetectorV5:
                 return species
         
         return 'animal'  # Generic fallback
+
+
+class MegaDetectorV6:
+    """MegaDetector v6 using Ultralytics YOLO - smaller and faster than v5"""
+
+    # Category mappings (same as v5)
+    CATEGORIES = {
+        0: 'animal',
+        1: 'person',
+        2: 'vehicle'
+    }
+
+    # Download URL for v6 compact model
+    MODEL_URL = "https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1"
+    MODEL_SIZE_MB = 49  # Much smaller than v5's 268 MB
+
+    def __init__(self, model_path: Optional[str] = None, confidence_threshold: float = 0.2):
+        self.confidence_threshold = confidence_threshold
+        self.model = None
+        self.is_available = False
+        self.error_message = None
+
+        # Check for ultralytics
+        try:
+            from ultralytics import YOLO
+            self._YOLO = YOLO
+            self._load_model(model_path)
+        except ImportError:
+            self.error_message = "ultralytics not installed. Install with: pip install ultralytics"
+            print(f"Warning: {self.error_message}")
+
+    def _download_model(self, model_path: Path) -> bool:
+        """Download MegaDetector v6 model from Zenodo"""
+        print(f"Downloading MegaDetector v6 compact model ({self.MODEL_SIZE_MB} MB)...")
+        print(f"From: {self.MODEL_URL}")
+
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            response = requests.get(self.MODEL_URL, stream=True, timeout=30)
+            response.raise_for_status()
+
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+
+            with open(model_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            pct = (downloaded / total_size) * 100
+                            mb_done = downloaded / (1024 * 1024)
+                            mb_total = total_size / (1024 * 1024)
+                            print(f"\r  Downloaded {mb_done:.1f}/{mb_total:.1f} MB ({pct:.0f}%)", end="", flush=True)
+
+            print(f"\n  Model saved to {model_path}")
+            return True
+
+        except Exception as e:
+            print(f"\n  Error downloading model: {e}")
+            self.error_message = f"Failed to download MegaDetector v6 model: {e}"
+            if model_path.exists():
+                model_path.unlink()
+            return False
+
+    def _load_model(self, model_path: Optional[str] = None):
+        """Load MegaDetector v6 model, downloading if necessary"""
+        if model_path is None:
+            model_path = Path.home() / '.trailcam' / 'MDV6-yolov9-c.pt'
+
+        self.model_path = Path(model_path)
+
+        if not self.model_path.exists():
+            print(f"MegaDetector v6 model not found at {self.model_path}")
+            if not self._download_model(self.model_path):
+                return
+
+        try:
+            self.model = self._YOLO(str(self.model_path))
+            self.is_available = True
+            self.error_message = None
+            print(f"MegaDetector v6 loaded ({self.MODEL_SIZE_MB} MB model)")
+        except Exception as e:
+            print(f"Error loading MegaDetector v6: {e}")
+            self.error_message = f"Failed to load MegaDetector v6: {e}"
+            self.is_available = False
+
+    def detect(self, image_path: str) -> List[Detection]:
+        """Run detection on an image. Returns empty list if model not available."""
+        if self.model is None:
+            if self.error_message:
+                print(f"MegaDetector v6 not available: {self.error_message}")
+            return []
+
+        try:
+            # Run inference with ultralytics
+            results = self.model.predict(image_path, conf=self.confidence_threshold, verbose=False)
+            detections = []
+
+            # Get image dimensions
+            from PIL import Image as PILImage
+            img = PILImage.open(image_path)
+            w, h = img.size
+
+            # Parse results (ultralytics format)
+            for r in results:
+                for box in r.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = float(box.conf[0])
+                    cls = int(box.cls[0])
+                    category = self.CATEGORIES.get(cls, 'unknown')
+
+                    # Normalize bounding box to [0, 1]
+                    bbox = (x1/w, y1/h, (x2-x1)/w, (y2-y1)/h)
+
+                    detections.append(Detection(
+                        category=category,
+                        confidence=conf,
+                        bbox=bbox
+                    ))
+
+            return detections
+        except Exception as e:
+            print(f"Error detecting in {image_path}: {e}")
+            return []
+
+
+class MegaDetectorV6ONNX:
+    """MegaDetector v6 using ONNX - works without PyTorch for Windows builds"""
+
+    CATEGORIES = {0: 'animal', 1: 'person', 2: 'vehicle'}
+    MODEL_URL = "https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1"
+    ONNX_SIZE_MB = 97
+
+    def __init__(self, model_path: Optional[str] = None, confidence_threshold: float = 0.2):
+        self.confidence_threshold = confidence_threshold
+        self.session = None
+        self.is_available = False
+        self.error_message = None
+        self.input_size = 640
+
+        try:
+            import onnxruntime as ort
+            self._ort = ort
+            self._load_model(model_path)
+        except ImportError:
+            self.error_message = "onnxruntime not installed. Install with: pip install onnxruntime"
+            print(f"Warning: {self.error_message}")
+
+    def _load_model(self, model_path: Optional[str] = None):
+        """Load ONNX model"""
+        if model_path is None:
+            model_path = Path.home() / '.trailcam' / 'MDV6-yolov9-c.onnx'
+
+        self.model_path = Path(model_path)
+
+        if not self.model_path.exists():
+            self.error_message = f"ONNX model not found at {self.model_path}. Export using: model.export(format='onnx')"
+            print(f"MegaDetector v6 ONNX: {self.error_message}")
+            return
+
+        try:
+            self.session = self._ort.InferenceSession(
+                str(self.model_path),
+                providers=['CPUExecutionProvider']
+            )
+            self.input_name = self.session.get_inputs()[0].name
+            self.is_available = True
+            self.error_message = None
+            print(f"MegaDetector v6 ONNX loaded ({self.ONNX_SIZE_MB} MB model)")
+        except Exception as e:
+            print(f"Error loading MegaDetector v6 ONNX: {e}")
+            self.error_message = f"Failed to load ONNX model: {e}"
+            self.is_available = False
+
+    def _nms(self, boxes, scores, iou_threshold=0.5):
+        """Non-Maximum Suppression to filter overlapping boxes"""
+        if len(boxes) == 0:
+            return []
+
+        # Convert to numpy arrays
+        boxes = np.array(boxes)
+        scores = np.array(scores)
+
+        # Sort by score
+        order = scores.argsort()[::-1]
+
+        keep = []
+        while len(order) > 0:
+            i = order[0]
+            keep.append(i)
+
+            if len(order) == 1:
+                break
+
+            # Calculate IoU with remaining boxes
+            xx1 = np.maximum(boxes[i, 0], boxes[order[1:], 0])
+            yy1 = np.maximum(boxes[i, 1], boxes[order[1:], 1])
+            xx2 = np.minimum(boxes[i, 2], boxes[order[1:], 2])
+            yy2 = np.minimum(boxes[i, 3], boxes[order[1:], 3])
+
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            inter = w * h
+
+            area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+            area_j = (boxes[order[1:], 2] - boxes[order[1:], 0]) * (boxes[order[1:], 3] - boxes[order[1:], 1])
+            union = area_i + area_j - inter
+
+            iou = inter / (union + 1e-6)
+
+            # Keep boxes with IoU below threshold
+            inds = np.where(iou <= iou_threshold)[0]
+            order = order[inds + 1]
+
+        return keep
+
+    def detect(self, image_path: str) -> List[Detection]:
+        """Run detection using ONNX model"""
+        if self.session is None:
+            if self.error_message:
+                print(f"MegaDetector v6 ONNX not available: {self.error_message}")
+            return []
+
+        try:
+            from PIL import Image as PILImage
+
+            # Load and preprocess image
+            img = PILImage.open(image_path).convert('RGB')
+            orig_w, orig_h = img.size
+            img_resized = img.resize((self.input_size, self.input_size))
+
+            arr = np.array(img_resized).astype(np.float32) / 255.0
+            arr = arr.transpose(2, 0, 1)  # HWC -> CHW
+            arr = np.expand_dims(arr, 0)  # Add batch dim
+
+            # Run inference
+            outputs = self.session.run(None, {self.input_name: arr})
+
+            # Parse YOLOv9 output: [batch, 7, 8400] -> [7, 8400]
+            # 7 = 4 (x_center, y_center, w, h) + 3 (animal, person, vehicle scores)
+            output = outputs[0][0].T  # [8400, 7]
+
+            boxes_raw = output[:, :4]  # x_center, y_center, w, h (in 640x640 space)
+            class_scores = output[:, 4:]
+
+            class_ids = np.argmax(class_scores, axis=1)
+            confidences = np.max(class_scores, axis=1)
+
+            # Filter by confidence
+            mask = confidences > self.confidence_threshold
+            boxes_filtered = boxes_raw[mask]
+            classes_filtered = class_ids[mask]
+            confs_filtered = confidences[mask]
+
+            if len(boxes_filtered) == 0:
+                return []
+
+            # Convert center format to corner format for NMS
+            x_center, y_center, w, h = boxes_filtered.T
+            x1 = x_center - w / 2
+            y1 = y_center - h / 2
+            x2 = x_center + w / 2
+            y2 = y_center + h / 2
+            boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+
+            # Apply NMS per class
+            detections = []
+            for cls_id in range(3):  # animal, person, vehicle
+                cls_mask = classes_filtered == cls_id
+                if not np.any(cls_mask):
+                    continue
+
+                cls_boxes = boxes_xyxy[cls_mask]
+                cls_confs = confs_filtered[cls_mask]
+
+                keep = self._nms(cls_boxes, cls_confs, iou_threshold=0.5)
+
+                for idx in keep:
+                    box = cls_boxes[idx]
+                    conf = cls_confs[idx]
+
+                    # Convert from 640x640 to normalized [0,1] then to original image coords
+                    x1_norm = box[0] / self.input_size
+                    y1_norm = box[1] / self.input_size
+                    x2_norm = box[2] / self.input_size
+                    y2_norm = box[3] / self.input_size
+
+                    # Bbox in (x, y, w, h) normalized format
+                    bbox = (x1_norm, y1_norm, x2_norm - x1_norm, y2_norm - y1_norm)
+
+                    detections.append(Detection(
+                        category=self.CATEGORIES.get(cls_id, 'unknown'),
+                        confidence=float(conf),
+                        bbox=bbox
+                    ))
+
+            return detections
+
+        except Exception as e:
+            print(f"Error detecting in {image_path}: {e}")
+            return []
 
 
 class WildlifeAIClient:

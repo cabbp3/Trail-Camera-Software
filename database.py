@@ -45,6 +45,98 @@ class TrailCamDatabase:
         # Set crash flag - will be removed on clean exit
         self._set_crash_flag()
 
+        # Audit log connection (lazy loaded)
+        self._audit_conn = None
+
+        # Create daily backup if not done today (protects against corruption)
+        self.check_daily_backup()
+
+    def _get_audit_conn(self):
+        """Get connection to audit log database (lazy loaded)."""
+        if self._audit_conn is None:
+            audit_path = self.db_dir / "audit_log.db"
+            self._audit_conn = sqlite3.connect(str(audit_path), check_same_thread=False)
+            self._audit_conn.execute("""
+                CREATE TABLE IF NOT EXISTS tag_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT DEFAULT (datetime('now')),
+                    action TEXT NOT NULL,
+                    photo_id INTEGER NOT NULL,
+                    file_path TEXT,
+                    file_hash TEXT,
+                    tag_name TEXT NOT NULL
+                )
+            """)
+            self._audit_conn.commit()
+        return self._audit_conn
+
+    def _log_tag_change(self, action: str, photo_id: int, tag_name: str):
+        """Log a tag change to the audit database. Thread-safe."""
+        try:
+            # Get file_path and file_hash for this photo
+            with self._lock:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT file_path, file_hash FROM photos WHERE id = ?", (photo_id,))
+                row = cursor.fetchone()
+                file_path = row['file_path'] if row else None
+                file_hash = row['file_hash'] if row else None
+
+            audit = self._get_audit_conn()
+            audit.execute(
+                "INSERT INTO tag_log (action, photo_id, file_path, file_hash, tag_name) VALUES (?, ?, ?, ?, ?)",
+                (action, photo_id, file_path, file_hash, tag_name)
+            )
+            audit.commit()
+        except Exception as e:
+            logger.warning(f"Failed to log tag change: {e}")
+
+    def log_tag_confirmation(self, photo_id: int, tags: list):
+        """Log that existing tags were confirmed/kept during review."""
+        for tag in tags:
+            self._log_tag_change('confirm', photo_id, tag)
+
+    def verify_audit_log(self) -> Dict:
+        """Compare audit log against main database to find discrepancies.
+
+        Returns a dict with:
+            - missing_in_db: Tags in audit log (net adds) but not in main DB
+            - extra_in_db: Tags in main DB but not accounted for in audit log
+            - total_audit_entries: Number of entries in audit log
+        """
+        audit = self._get_audit_conn()
+        cursor = audit.cursor()
+
+        # Get net state from audit log (adds/baseline minus removes per photo/tag)
+        cursor.execute("""
+            SELECT file_hash, tag_name,
+                   SUM(CASE WHEN action IN ('add', 'baseline') THEN 1 ELSE -1 END) as net
+            FROM tag_log
+            WHERE file_hash IS NOT NULL
+            GROUP BY file_hash, tag_name
+            HAVING net > 0
+        """)
+        audit_tags = {(row[0], row[1]) for row in cursor.fetchall()}
+
+        # Get current state from main DB (thread-safe)
+        with self._lock:
+            main_cursor = self.conn.cursor()
+            main_cursor.execute("""
+                SELECT p.file_hash, t.tag_name
+                FROM tags t
+                JOIN photos p ON t.photo_id = p.id
+                WHERE p.file_hash IS NOT NULL
+            """)
+            db_tags = {(row[0], row[1]) for row in main_cursor.fetchall()}
+
+        cursor.execute("SELECT COUNT(*) FROM tag_log")
+        total_entries = cursor.fetchone()[0]
+
+        return {
+            'missing_in_db': audit_tags - db_tags,
+            'extra_in_db': db_tags - audit_tags,
+            'total_audit_entries': total_entries
+        }
+
     def _get_crash_flag_path(self) -> Path:
         """Get path to crash detection flag file."""
         return self.db_dir / ".running"
@@ -68,60 +160,136 @@ class TrailCamDatabase:
 
     def _check_and_repair_after_crash(self):
         """Check if previous session crashed and repair database if needed."""
+        import shutil
         flag_path = self._get_crash_flag_path()
 
         if not flag_path.exists():
             return  # Clean shutdown last time
 
         logger.warning("Detected unclean shutdown - checking database integrity...")
-        print("Detected previous crash - checking database integrity...")
+        print("Detected unclean shutdown - checking database integrity...")
+
+        db_path = Path(self.db_path)
+        wal_path = db_path.with_suffix('.db-wal')
+        shm_path = db_path.with_suffix('.db-shm')
 
         try:
-            # Connect temporarily to check and repair
+            # Step 1: Try to checkpoint WAL to merge pending writes
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
-
-            # Checkpoint WAL to ensure all data is written
             cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.close()
 
-            # Check integrity
+            # Step 2: Clean up WAL/SHM files after checkpoint
+            # These can cause issues if left over from a crash
+            for f in [wal_path, shm_path]:
+                if f.exists():
+                    try:
+                        f.unlink()
+                        logger.info(f"Removed stale {f.name}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove {f.name}: {e}")
+
+            # Step 3: Check integrity
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            cursor = conn.cursor()
             cursor.execute("PRAGMA integrity_check")
             result = cursor.fetchone()[0]
+            conn.close()
 
             if result != "ok":
-                logger.warning(f"Database integrity issues found: {result[:100]}...")
-                print("Database integrity issues found - attempting repair...")
+                logger.warning(f"Database integrity issues: {result[:200]}...")
+                print("Database corruption detected - attempting recovery...")
 
-                # Try to repair by rebuilding indexes
-                cursor.execute("REINDEX")
-                conn.commit()
+                # Back up the corrupted database first
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                corrupt_backup = db_path.parent / f"trailcam_corrupted_{timestamp}.db"
+                shutil.copy2(self.db_path, corrupt_backup)
+                logger.info(f"Backed up corrupted database to {corrupt_backup}")
+                print(f"Backed up corrupted DB to: {corrupt_backup.name}")
 
-                # Check again
-                cursor.execute("PRAGMA integrity_check")
-                result2 = cursor.fetchone()[0]
+                # Try VACUUM INTO to create a clean copy
+                recovered_path = db_path.parent / "trailcam_recovered.db"
+                try:
+                    conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                    conn.execute(f"VACUUM INTO '{recovered_path}'")
+                    conn.close()
 
-                if result2 == "ok":
-                    logger.info("Database repaired successfully")
-                    print("Database repaired successfully!")
-                else:
-                    logger.error(f"Database repair incomplete: {result2[:100]}...")
-                    print("WARNING: Some database issues remain. Consider restoring from backup.")
+                    # Verify the recovered database
+                    test_conn = sqlite3.connect(str(recovered_path), check_same_thread=False)
+                    test_cursor = test_conn.cursor()
+                    test_cursor.execute("PRAGMA integrity_check")
+                    test_result = test_cursor.fetchone()[0]
+                    test_cursor.execute("SELECT COUNT(*) FROM photos")
+                    photo_count = test_cursor.fetchone()[0]
+                    test_conn.close()
+
+                    if test_result == "ok" and photo_count > 0:
+                        # Replace corrupted DB with recovered one
+                        db_path.unlink()
+                        recovered_path.rename(db_path)
+                        logger.info(f"Database recovered successfully ({photo_count} photos)")
+                        print(f"Database recovered! ({photo_count} photos intact)")
+                    else:
+                        recovered_path.unlink()
+                        raise Exception(f"Recovery failed: integrity={test_result}, photos={photo_count}")
+
+                except Exception as vacuum_error:
+                    logger.error(f"VACUUM recovery failed: {vacuum_error}")
+                    print(f"VACUUM recovery failed: {vacuum_error}")
+
+                    # Try to find most recent good backup
+                    backup_dir = db_path.parent / "backups"
+                    if backup_dir.exists():
+                        backups = sorted(backup_dir.glob("trailcam_*.db"),
+                                        key=lambda p: p.stat().st_mtime, reverse=True)
+                        for backup in backups:
+                            try:
+                                test_conn = sqlite3.connect(str(backup), check_same_thread=False)
+                                test_cursor = test_conn.cursor()
+                                test_cursor.execute("PRAGMA integrity_check")
+                                if test_cursor.fetchone()[0] == "ok":
+                                    test_cursor.execute("SELECT COUNT(*) FROM photos")
+                                    count = test_cursor.fetchone()[0]
+                                    test_conn.close()
+
+                                    print(f"Found good backup: {backup.name} ({count} photos)")
+                                    logger.info(f"Restoring from backup: {backup.name}")
+                                    db_path.unlink()
+                                    shutil.copy2(backup, db_path)
+                                    print(f"Restored from backup! ({count} photos)")
+                                    break
+                                test_conn.close()
+                            except Exception:
+                                continue
+                        else:
+                            print("WARNING: No valid backup found. Database may be corrupted.")
+                            logger.error("No valid backup found for restoration")
+                    else:
+                        print("WARNING: No backups exist. Consider restoring manually.")
             else:
                 logger.info("Database integrity OK after crash recovery")
                 print("Database integrity verified - OK")
-
-            conn.close()
 
             # Clear the old crash flag (we'll set a new one after init)
             flag_path.unlink()
 
         except Exception as e:
-            logger.error(f"Error during crash recovery check: {e}")
-            print(f"Error checking database: {e}")
+            logger.error(f"Error during crash recovery: {e}")
+            print(f"Error during recovery: {e}")
+            # Still try to clear the flag to avoid infinite loop
+            try:
+                flag_path.unlink()
+            except Exception:
+                pass
 
     def close(self):
         """Close database connection cleanly."""
         try:
+            # Close audit log connection if open
+            if self._audit_conn:
+                self._audit_conn.close()
+                self._audit_conn = None
             # Checkpoint WAL before closing
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self.conn.close()
@@ -130,6 +298,152 @@ class TrailCamDatabase:
             logger.info("Database closed cleanly")
         except Exception as e:
             logger.error(f"Error closing database: {e}")
+
+    def checkpoint_wal(self) -> bool:
+        """Checkpoint WAL to main database file.
+
+        This should be called periodically (e.g., every 5 minutes) to reduce
+        data loss risk in case of crash. The WAL checkpoint merges pending
+        writes from the write-ahead log into the main database file.
+
+        Returns:
+            True if checkpoint succeeded, False otherwise
+        """
+        try:
+            with self._lock:
+                result = self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                # PASSIVE checkpoint doesn't block - returns (busy, log, checkpointed)
+                if result:
+                    logger.debug(f"WAL checkpoint: log={result[1]}, checkpointed={result[2]}")
+                return True
+        except Exception as e:
+            logger.warning(f"WAL checkpoint failed: {e}")
+            return False
+
+    # --- Backup Methods ---
+
+    def get_backup_dir(self) -> Path:
+        """Get the backup directory path, creating it if needed."""
+        backup_dir = self.db_dir / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        return backup_dir
+
+    def create_backup(self, reason: str = "manual") -> Optional[Path]:
+        """Create a backup of the database.
+
+        Args:
+            reason: Reason for backup (e.g., 'manual', 'batch_operation', 'daily')
+
+        Returns:
+            Path to backup file, or None if backup failed
+        """
+        import shutil
+
+        try:
+            # Checkpoint WAL first to ensure all data is in main db file
+            with self._lock:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+            backup_dir = self.get_backup_dir()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"trailcam_{reason}_{timestamp}.db"
+            backup_path = backup_dir / backup_name
+
+            # Copy the database file
+            shutil.copy2(self.db_path, backup_path)
+
+            logger.info(f"Database backup created: {backup_path}")
+            print(f"[Backup] Created: {backup_name}")
+
+            # Clean up old backups (keep last 10 per reason)
+            self._cleanup_old_backups(reason, keep=10)
+
+            return backup_path
+
+        except Exception as e:
+            logger.error(f"Failed to create backup: {e}")
+            print(f"[Backup] Failed: {e}")
+            return None
+
+    def _cleanup_old_backups(self, reason: str, keep: int = 10):
+        """Remove old backups, keeping only the most recent ones."""
+        try:
+            backup_dir = self.get_backup_dir()
+            pattern = f"trailcam_{reason}_*.db"
+            backups = sorted(backup_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+
+            # Remove backups beyond the keep limit
+            for old_backup in backups[keep:]:
+                old_backup.unlink()
+                logger.info(f"Removed old backup: {old_backup.name}")
+        except Exception as e:
+            logger.warning(f"Error cleaning up old backups: {e}")
+
+    def backup_before_batch_operation(self) -> bool:
+        """Create a backup before a batch operation.
+
+        Returns:
+            True if backup was successful, False otherwise
+        """
+        backup_path = self.create_backup(reason="pre_batch")
+        return backup_path is not None
+
+    def check_daily_backup(self) -> bool:
+        """Create a daily backup if one hasn't been made today.
+
+        Returns:
+            True if a new backup was created or today's backup exists
+        """
+        try:
+            backup_dir = self.get_backup_dir()
+            today = datetime.now().strftime("%Y%m%d")
+
+            # Check if today's backup already exists
+            today_pattern = f"trailcam_daily_{today}*.db"
+            existing = list(backup_dir.glob(today_pattern))
+
+            if existing:
+                logger.info(f"Daily backup already exists: {existing[0].name}")
+                return True
+
+            # Create today's backup
+            backup_path = self.create_backup(reason="daily")
+            return backup_path is not None
+
+        except Exception as e:
+            logger.error(f"Error checking daily backup: {e}")
+            return False
+
+    def get_latest_backup(self) -> Optional[Path]:
+        """Get the most recent backup file."""
+        try:
+            backup_dir = self.get_backup_dir()
+            backups = sorted(backup_dir.glob("trailcam_*.db"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            return backups[0] if backups else None
+        except Exception as e:
+            logger.error(f"Error finding latest backup: {e}")
+            return None
+
+    # --- Transaction Methods ---
+
+    def begin_transaction(self):
+        """Begin an explicit transaction for batch operations."""
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            logger.debug("Transaction started")
+
+    def commit_transaction(self):
+        """Commit the current transaction."""
+        with self._lock:
+            self.conn.commit()
+            logger.debug("Transaction committed")
+
+    def rollback_transaction(self):
+        """Rollback the current transaction."""
+        with self._lock:
+            self.conn.rollback()
+            logger.debug("Transaction rolled back")
 
     def _execute_with_lock(self, func):
         """Execute a database operation with thread safety."""
@@ -654,31 +968,35 @@ class TrailCamDatabase:
         """Check if a photo with this file_hash already exists.
 
         This prevents importing duplicate photos even if they have different filenames.
+        Thread-safe for use from worker threads.
         """
         if not file_hash:
             return False
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT 1 FROM photos WHERE file_hash = ? LIMIT 1", (file_hash,))
-        return cursor.fetchone() is not None
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT 1 FROM photos WHERE file_hash = ? LIMIT 1", (file_hash,))
+            return cursor.fetchone() is not None
 
     def get_photo_by_hash(self, file_hash: str) -> Optional[Dict]:
-        """Get photo by its file hash."""
+        """Get photo by its file hash. Thread-safe."""
         if not file_hash:
             return None
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM photos WHERE file_hash = ?", (file_hash,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM photos WHERE file_hash = ?", (file_hash,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
     def get_all_file_hashes(self) -> set:
-        """Get all file_hashes from local database.
+        """Get all file_hashes from local database. Thread-safe.
 
         Returns:
             Set of file_hash strings
         """
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT file_hash FROM photos WHERE file_hash IS NOT NULL AND file_hash != ''")
-        return {row['file_hash'] for row in cursor.fetchall()}
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT file_hash FROM photos WHERE file_hash IS NOT NULL AND file_hash != ''")
+            return {row['file_hash'] for row in cursor.fetchall()}
 
     def add_cloud_photo(self, cloud_record: Dict) -> Optional[int]:
         """Add a photo record from cloud data (for photos that only exist in cloud).
@@ -746,21 +1064,32 @@ class TrailCamDatabase:
                           (file_path, photo_id))
             self.conn.commit()
 
+    def update_date_taken(self, photo_id: int, date_taken: str):
+        """Update the date_taken for a photo (thread-safe for worker threads)."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET date_taken = ? WHERE id = ?",
+                          (date_taken, photo_id))
+            self.conn.commit()
+
     def get_cloud_only_photos(self) -> List[Dict]:
         """Get all photos that only exist in cloud (file_path starts with 'cloud://').
+        Thread-safe.
 
         Returns:
             List of photo dicts
         """
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM photos WHERE file_path LIKE 'cloud://%'")
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM photos WHERE file_path LIKE 'cloud://%'")
+            return [dict(row) for row in cursor.fetchall()]
 
     def get_photo_path(self, photo_id: int) -> Optional[str]:
-        """Get file path for a photo ID."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT file_path FROM photos WHERE id = ?", (photo_id,))
-        row = cursor.fetchone()
+        """Get file path for a photo ID. Thread-safe."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT file_path FROM photos WHERE id = ?", (photo_id,))
+            row = cursor.fetchone()
         return row['file_path'] if row else None
 
     def get_photo_by_path(self, file_path: str) -> Optional[Dict]:
@@ -793,6 +1122,8 @@ class TrailCamDatabase:
                 cursor.execute("INSERT INTO tags (photo_id, tag_name) VALUES (?, ?)",
                              (photo_id, tag_name))
                 self.conn.commit()
+                # Log to audit trail
+                self._log_tag_change('add', photo_id, tag_name)
             except sqlite3.IntegrityError:
                 # Tag already exists, ignore
                 pass
@@ -805,9 +1136,16 @@ class TrailCamDatabase:
         """
         with self._lock:
             cursor = self.conn.cursor()
+
+            # Get current tags for audit logging
+            cursor.execute("SELECT tag_name FROM tags WHERE photo_id = ?", (photo_id,))
+            old_tags = set(row[0] for row in cursor.fetchall())
+
             cursor.execute("DELETE FROM tags WHERE photo_id = ?", (photo_id,))
             # Deduplicate tags to avoid UNIQUE constraint violation
             unique_tags = list(dict.fromkeys(tags))  # Preserves order
+            new_tags = set(unique_tags)
+
             cursor.executemany(
                 "INSERT INTO tags (photo_id, tag_name) VALUES (?, ?)",
                 [(photo_id, tag) for tag in unique_tags]
@@ -823,30 +1161,41 @@ class TrailCamDatabase:
                 """, (found_review, photo_id))
 
             self.conn.commit()
+
+            # Log tag changes to audit trail
+            for tag in old_tags - new_tags:
+                self._log_tag_change('remove', photo_id, tag)
+            for tag in new_tags - old_tags:
+                self._log_tag_change('add', photo_id, tag)
     
     def get_photo_tags(self, photo_id: int) -> List[str]:
         """Alias for get_tags; returns all tags for a photo."""
         return self.get_tags(photo_id)
     
     def remove_tag(self, photo_id: int, tag_name: str):
-        """Remove a tag from a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM tags WHERE photo_id = ? AND tag_name = ?", 
-                      (photo_id, tag_name))
-        self.conn.commit()
+        """Remove a tag from a photo. Thread-safe."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM tags WHERE photo_id = ? AND tag_name = ?",
+                          (photo_id, tag_name))
+            self.conn.commit()
+        # Log to audit trail
+        self._log_tag_change('remove', photo_id, tag_name)
     
     def get_tags(self, photo_id: int) -> List[str]:
-        """Get all tags for a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT tag_name FROM tags WHERE photo_id = ? ORDER BY tag_name",
-                      (photo_id,))
-        return [row['tag_name'] for row in cursor.fetchall()]
+        """Get all tags for a photo. Thread-safe."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT tag_name FROM tags WHERE photo_id = ? ORDER BY tag_name",
+                          (photo_id,))
+            return [row['tag_name'] for row in cursor.fetchall()]
 
     def get_all_distinct_tags(self) -> List[str]:
-        """Get all distinct tag names across all photos."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT DISTINCT tag_name FROM tags ORDER BY tag_name")
-        return [row['tag_name'] for row in cursor.fetchall()]
+        """Get all distinct tag names across all photos. Thread-safe."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT DISTINCT tag_name FROM tags ORDER BY tag_name")
+            return [row['tag_name'] for row in cursor.fetchall()]
 
     def set_deer_metadata(self, photo_id: int, deer_id: str = None, age_class: str = None,
                           left_points_min: Optional[int] = None, right_points_min: Optional[int] = None,
@@ -855,23 +1204,24 @@ class TrailCamDatabase:
                           left_ab_points_uncertain: bool = False, right_ab_points_uncertain: bool = False,
                           abnormal_points_min: Optional[int] = None, abnormal_points_max: Optional[int] = None,
                           broken_antler_side: Optional[str] = None, broken_antler_note: Optional[str] = None):
-        """Set deer metadata for a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO deer_metadata (photo_id, deer_id, age_class,
-                left_points_min, left_points_max, right_points_min, right_points_max,
-                left_points_uncertain, right_points_uncertain,
-                left_ab_points_min, right_ab_points_min,
-                left_ab_points_uncertain, right_ab_points_uncertain,
-                abnormal_points_min, abnormal_points_max,
-                broken_antler_side, broken_antler_note)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (photo_id, deer_id, age_class, left_points_min, None, right_points_min, None,
-              1 if left_points_uncertain else 0, 1 if right_points_uncertain else 0,
-              left_ab_points_min, right_ab_points_min,
-              1 if left_ab_points_uncertain else 0, 1 if right_ab_points_uncertain else 0,
-              abnormal_points_min, abnormal_points_max, broken_antler_side, broken_antler_note))
-        self.conn.commit()
+        """Set deer metadata for a photo. Thread-safe."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO deer_metadata (photo_id, deer_id, age_class,
+                    left_points_min, left_points_max, right_points_min, right_points_max,
+                    left_points_uncertain, right_points_uncertain,
+                    left_ab_points_min, right_ab_points_min,
+                    left_ab_points_uncertain, right_ab_points_uncertain,
+                    abnormal_points_min, abnormal_points_max,
+                    broken_antler_side, broken_antler_note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (photo_id, deer_id, age_class, left_points_min, None, right_points_min, None,
+                  1 if left_points_uncertain else 0, 1 if right_points_uncertain else 0,
+                  left_ab_points_min, right_ab_points_min,
+                  1 if left_ab_points_uncertain else 0, 1 if right_ab_points_uncertain else 0,
+                  abnormal_points_min, abnormal_points_max, broken_antler_side, broken_antler_note))
+            self.conn.commit()
 
     # Additional deer helpers
     def add_additional_deer(self, photo_id: int, deer_id: str, age_class: str = None,
@@ -1919,6 +2269,62 @@ class TrailCamDatabase:
         cursor.execute("SELECT COUNT(*) FROM photos WHERE archived = 1")
         return cursor.fetchone()[0]
 
+    def get_photos_for_auto_archive(self, keep_species: List[str]) -> List[int]:
+        """Get photo IDs that should be auto-archived based on species criteria.
+
+        Returns photos that:
+        - Are NOT archived
+        - Are NOT favorite
+        - Have at least one tag (not unlabeled)
+        - Have NO tags in the keep_species list
+
+        Args:
+            keep_species: List of species/tags to keep (not archive)
+
+        Returns:
+            List of photo IDs to archive
+        """
+        if not keep_species:
+            return []
+
+        cursor = self.conn.cursor()
+
+        # Build placeholders for the keep_species list
+        placeholders = ",".join(["?" for _ in keep_species])
+
+        # Find photos that:
+        # 1. Have tags (not unlabeled)
+        # 2. None of their tags are in keep_species
+        # 3. Not archived
+        # 4. Not favorite
+        query = f"""
+            SELECT DISTINCT p.id
+            FROM photos p
+            INNER JOIN tags t ON t.photo_id = p.id
+            WHERE p.archived = 0
+              AND (p.favorite IS NULL OR p.favorite = 0)
+              AND p.id NOT IN (
+                  SELECT DISTINCT photo_id
+                  FROM tags
+                  WHERE tag_name IN ({placeholders})
+              )
+        """
+
+        cursor.execute(query, keep_species)
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_all_species_tags(self) -> List[str]:
+        """Get all unique species tags from the database, sorted by frequency."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT tag_name, COUNT(*) as cnt
+            FROM tags
+            WHERE tag_name NOT IN ('Buck', 'Doe', 'Unknown')
+            GROUP BY tag_name
+            ORDER BY cnt DESC
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
     # ========== Site Management ==========
 
     def create_site(self, name: str, description: str = "", representative_photo_id: int = None,
@@ -2294,18 +2700,20 @@ class TrailCamDatabase:
 
         try:
             cursor = sync_conn.cursor()
-            now = datetime.utcnow().isoformat()
+            # Use ISO format with UTC timezone suffix to match Supabase TIMESTAMPTZ
+            now = datetime.utcnow().isoformat() + "+00:00"
             BATCH_SIZE = 500  # Supabase handles batches well
 
-            # Build WHERE clause for incremental sync
+            # Build WHERE clause for incremental sync (parameterized to prevent SQL injection)
             # Normalize last_sync to match SQLite datetime format (space instead of T)
+            normalized_sync = last_sync.replace('T', ' ') if last_sync else None
+
             def since_clause(table_alias=""):
+                """Returns (clause_string, params_tuple) for parameterized query."""
                 if last_sync is None:
-                    return ""
-                # SQLite datetime uses space, Python ISO uses T - normalize for comparison
-                normalized_sync = last_sync.replace('T', ' ')
+                    return ("", ())
                 prefix = f"{table_alias}." if table_alias else ""
-                return f" AND {prefix}updated_at > '{normalized_sync}'"
+                return (f" AND {prefix}updated_at > ?", (normalized_sync,))
 
             def batch_upsert(table_name, data_list, on_conflict):
                 """Upsert data in batches."""
@@ -2322,8 +2730,9 @@ class TrailCamDatabase:
 
             # Push photos_sync (photo identifiers and basic metadata)
             report(1, "Syncing photos...")
-            query = "SELECT * FROM photos WHERE 1=1" + since_clause()
-            cursor.execute(query)
+            clause, params = since_clause()
+            query = "SELECT * FROM photos WHERE 1=1" + clause
+            cursor.execute(query, params)
             photos_data = []
             for row in cursor.fetchall():
                 photo = dict(row)
@@ -2473,7 +2882,8 @@ class TrailCamDatabase:
 
             # Push buck_profiles
             report(5, "Syncing buck profiles...")
-            cursor.execute(f"SELECT * FROM buck_profiles WHERE 1=1 {since_clause()}")
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM buck_profiles WHERE 1=1{clause}", params)
             profiles_data = []
             for row in cursor.fetchall():
                 d = dict(row)
@@ -2488,7 +2898,8 @@ class TrailCamDatabase:
 
             # Push buck_profile_seasons
             report(6, "Syncing buck profile seasons...")
-            cursor.execute(f"SELECT * FROM buck_profile_seasons WHERE 1=1 {since_clause()}")
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM buck_profile_seasons WHERE 1=1{clause}", params)
             seasons_data = []
             for row in cursor.fetchall():
                 d = dict(row)
@@ -2590,44 +3001,77 @@ class TrailCamDatabase:
             # Always close the dedicated sync connection
             sync_conn.close()
 
-    def pull_from_supabase(self, supabase_client, progress_callback=None) -> Dict[str, int]:
+    def pull_from_supabase(self, supabase_client, progress_callback=None, force_full=False) -> Dict[str, int]:
         """Pull data from Supabase and update local database. Returns counts.
 
         Args:
             supabase_client: Supabase client instance
             progress_callback: Optional callable(step, total, message) for progress updates
+            force_full: If True, pull all data regardless of last sync time
         """
+        from datetime import datetime
+
         def report(step, msg):
             if progress_callback:
-                progress_callback(step, 8, msg)
+                progress_callback(step, 9, msg)
             print(msg)
 
         # Ensure all required columns exist before syncing (handles old databases)
         self._ensure_deer_columns()
+
+        # Get last sync time for incremental pull
+        last_sync = None if force_full else self.get_last_sync_time('pull')
+        sync_mode = "full" if last_sync is None else "incremental"
+        report(0, f"Starting {sync_mode} pull...")
+
+        # Use ISO format with UTC timezone suffix to match Supabase TIMESTAMPTZ
+        now = datetime.utcnow().isoformat() + "+00:00"
 
         counts = {"photos": 0, "tags": 0, "deer_metadata": 0, "deer_additional": 0,
                   "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0}
 
         cursor = self.conn.cursor()
 
-        # Pull photos_sync - update local photo metadata (fetch_all to bypass 1000 row limit)
+        def fetch_table(table_name):
+            """Fetch from table with optional incremental filter."""
+            query = supabase_client.table(table_name).select("*")
+            if last_sync:
+                query = query.gt("updated_at", last_sync)
+            return query.execute(fetch_all=True)
+
+        # Pull photos_sync - update existing or create new cloud-only stubs
         report(1, "Pulling photos...")
-        result = supabase_client.table("photos_sync").select("*").execute(fetch_all=True)
+        result = fetch_table("photos_sync")
+        counts["photos_created"] = 0
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
+                # Update existing photo
+                # For date_taken, prefer LOCAL value (read from EXIF during import)
+                # Cloud values from CuddeLink may be upload times, not capture times
+                # Only use cloud date if local is empty
+                cloud_date = row.get("date_taken")
                 cursor.execute("""
                     UPDATE photos SET
                         camera_location = COALESCE(?, camera_location),
                         favorite = COALESCE(?, favorite),
-                        notes = COALESCE(?, notes)
+                        notes = COALESCE(?, notes),
+                        date_taken = COALESCE(date_taken, ?)
                     WHERE id = ?
-                """, (row.get("camera_location"), row.get("favorite"), row.get("notes"), photo["id"]))
+                """, (row.get("camera_location"), row.get("favorite"), row.get("notes"),
+                      cloud_date, photo["id"]))
                 counts["photos"] += 1
+            else:
+                # Create cloud-only stub for photos that don't exist locally
+                file_hash = row.get("file_hash")
+                if file_hash:
+                    new_id = self.add_cloud_photo(row)
+                    if new_id:
+                        counts["photos_created"] += 1
 
-        # Pull tags (fetch_all to bypass 1000 row limit)
+        # Pull tags
         report(2, "Pulling tags...")
-        result = supabase_client.table("tags").select("*").execute(fetch_all=True)
+        result = fetch_table("tags")
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
@@ -2636,9 +3080,9 @@ class TrailCamDatabase:
                 """, (photo["id"], row["tag_name"]))
                 counts["tags"] += 1
 
-        # Pull deer_metadata (fetch_all to bypass 1000 row limit)
+        # Pull deer_metadata
         report(3, "Pulling deer metadata...")
-        result = supabase_client.table("deer_metadata").select("*").execute(fetch_all=True)
+        result = fetch_table("deer_metadata")
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
@@ -2659,9 +3103,9 @@ class TrailCamDatabase:
                       row.get("broken_antler_side"), row.get("broken_antler_note")))
                 counts["deer_metadata"] += 1
 
-        # Pull deer_additional (fetch_all to bypass 1000 row limit)
+        # Pull deer_additional
         report(4, "Pulling additional deer...")
-        result = supabase_client.table("deer_additional").select("*").execute(fetch_all=True)
+        result = fetch_table("deer_additional")
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo and row.get("deer_id"):
@@ -2682,9 +3126,9 @@ class TrailCamDatabase:
                       row.get("broken_antler_side"), row.get("broken_antler_note")))
                 counts["deer_additional"] += 1
 
-        # Pull buck_profiles (fetch_all to bypass 1000 row limit)
+        # Pull buck_profiles
         report(5, "Pulling buck profiles...")
-        result = supabase_client.table("buck_profiles").select("*").execute(fetch_all=True)
+        result = fetch_table("buck_profiles")
         for row in result.data:
             if row.get("deer_id"):
                 cursor.execute("""
@@ -2693,9 +3137,9 @@ class TrailCamDatabase:
                 """, (row["deer_id"], row.get("display_name"), row.get("notes")))
                 counts["buck_profiles"] += 1
 
-        # Pull buck_profile_seasons (fetch_all to bypass 1000 row limit)
+        # Pull buck_profile_seasons
         report(6, "Pulling buck profile seasons...")
-        result = supabase_client.table("buck_profile_seasons").select("*").execute(fetch_all=True)
+        result = fetch_table("buck_profile_seasons")
         for row in result.data:
             if row.get("deer_id") and row.get("season_year"):
                 cursor.execute("""
@@ -2713,9 +3157,9 @@ class TrailCamDatabase:
                       row.get("abnormal_points_min"), row.get("abnormal_points_max")))
                 counts["buck_profile_seasons"] += 1
 
-        # Pull annotation_boxes (fetch_all to bypass 1000 row limit)
+        # Pull annotation_boxes
         report(7, "Pulling annotation boxes...")
-        result = supabase_client.table("annotation_boxes").select("*").execute(fetch_all=True)
+        result = fetch_table("annotation_boxes")
 
         def safe_float(val):
             """Safely convert value to float, handling bytes/blob corruption."""
@@ -2789,8 +3233,47 @@ class TrailCamDatabase:
                           row.get("head_notes")))
                 counts["annotation_boxes"] += 1
 
-        report(8, "Sync complete!")
+        # Sync deletions: Remove local records that were deleted from cloud
+        # This is critical for keeping devices in sync when records are removed
+        report(8, "Checking for deleted records...")
+        counts["tags_deleted"] = 0
+
+        try:
+            # Get all tags from cloud (need full list to detect deletions)
+            cloud_tags_result = supabase_client.table("tags").select("file_hash,tag_name").execute(fetch_all=True)
+            cloud_tags = set()
+            for row in cloud_tags_result.data:
+                if row.get("file_hash") and row.get("tag_name"):
+                    cloud_tags.add((row["file_hash"], row["tag_name"]))
+
+            # Get all local tags with file_hash
+            cursor.execute("""
+                SELECT t.id, t.tag_name, p.file_hash
+                FROM tags t
+                JOIN photos p ON t.photo_id = p.id
+                WHERE p.file_hash IS NOT NULL
+            """)
+            local_tags = cursor.fetchall()
+
+            # Find and delete local tags that don't exist in cloud
+            for row in local_tags:
+                tag_id = row[0]
+                tag_name = row[1]
+                file_hash = row[2]
+                if (file_hash, tag_name) not in cloud_tags:
+                    cursor.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+                    counts["tags_deleted"] += 1
+                    logger.info(f"Deleted local tag '{tag_name}' for {file_hash} (removed from cloud)")
+
+        except Exception as e:
+            logger.warning(f"Failed to sync tag deletions: {e}")
+
+        report(9, "Sync complete!")
         self.conn.commit()
+
+        # Save pull sync time for next incremental pull
+        self.set_last_sync_time('pull', now)
+
         return counts
 
     # ─────────────────────────────────────────────────────────────────────

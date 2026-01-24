@@ -748,9 +748,9 @@ class AIWorker(QThread):
                     elif has_vehicle:
                         label, conf = "Vehicle", 0.95
                     elif has_animal:
-                        crop = self._best_crop_for_photo(p)
+                        crop, pixel_area = self._best_crop_for_photo(p)
                         path = str(crop) if crop else p.get("file_path")
-                        res = self.suggester.predict(path) if self.suggester else None
+                        res = self.suggester.predict(path, pixel_area=pixel_area) if self.suggester else None
                         if res:
                             label, conf = res
                             if label in ("Empty", "Other"):
@@ -850,19 +850,19 @@ class AIWorker(QThread):
             return []
 
     def _best_crop_for_photo(self, photo: dict):
-        """Return a temp file path of the best crop or None."""
+        """Return (temp_file_path, pixel_area) of the best crop or (None, None)."""
         from PIL import Image
 
         pid = photo.get("id")
         if not pid:
-            return None
+            return None, None
         boxes = []
         try:
             boxes = self.db.get_boxes(pid)
         except Exception:
             boxes = []
         if not boxes:
-            return None
+            return None, None
         # Prefer deer_head, then ai_animal, then subject
         chosen = None
         for b in boxes:
@@ -880,10 +880,10 @@ class AIWorker(QThread):
                     chosen = b
                     break
         if chosen is None:
-            return None
+            return None, None
         path = photo.get("file_path")
         if not path or not os.path.exists(path):
-            return None
+            return None, None
         try:
             img = Image.open(path).convert("RGB")
             w, h = img.size
@@ -892,12 +892,13 @@ class AIWorker(QThread):
             x1 = max(0, min(w, x1)); x2 = max(0, min(w, x2))
             y1 = max(0, min(h, y1)); y2 = max(0, min(h, y2))
             if x2 - x1 < 5 or y2 - y1 < 5:
-                return None
+                return None, None
+            pixel_area = (x2 - x1) * (y2 - y1)
             tmp = Path(tempfile.mkstemp(suffix=".jpg")[1])
             img.crop((x1, y1, x2, y2)).save(tmp, "JPEG", quality=90)
-            return tmp
+            return tmp, pixel_area
         except Exception:
-            return None
+            return None, None
 
     def _best_head_crop_for_photo(self, photo: dict):
         """Return a temp file path of deer_head crop or None."""
@@ -951,6 +952,28 @@ class AIWorker(QThread):
         # This would use a separate deer head detector model
         # For now, skip if not available
         pass
+
+
+class CloudCheckWorker(QThread):
+    """Background worker for checking cloud photos without blocking UI."""
+
+    # Signals
+    finished = pyqtSignal(list)  # list of cloud-only photos
+    error = pyqtSignal(str)  # error message
+
+    def __init__(self, local_hashes: set, parent=None):
+        super().__init__(parent)
+        self.local_hashes = local_hashes
+
+    def run(self):
+        """Run cloud check in background thread."""
+        try:
+            from supabase_rest import get_cloud_photos_not_local
+            cloud_only = get_cloud_photos_not_local(self.local_hashes)
+            self.finished.emit(cloud_only)
+        except Exception as e:
+            logger.error(f"Cloud check worker error: {e}", exc_info=True)
+            self.error.emit(str(e))
 
 
 class AIOptionsDialog(QDialog):
@@ -1268,6 +1291,12 @@ class TrainerWindow(QMainWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save_current)
         self._known_hashes = None  # lazy-populated MD5 set for duplicate skip
+
+        # Periodic WAL checkpoint timer - reduces data loss risk on crash
+        # Checkpoints every 5 minutes (300,000 ms)
+        self.wal_checkpoint_timer = QTimer(self)
+        self.wal_checkpoint_timer.timeout.connect(self._periodic_wal_checkpoint)
+        self.wal_checkpoint_timer.start(300000)  # 5 minutes
         # Photo list cache to reduce database calls
         self._photos_cache = None
         self._photos_cache_time = 0
@@ -2039,6 +2068,8 @@ class TrainerWindow(QMainWindow):
         ai_action.triggered.connect(self.run_ai_suggestions)
         rerun_ai_action = self.tools_menu.addAction("Re-run AI on Selection...")
         rerun_ai_action.triggered.connect(self.rerun_ai_on_selection)
+        detect_missing_boxes_action = self.tools_menu.addAction("Detect Boxes for Tagged Photos...")
+        detect_missing_boxes_action.triggered.connect(self.detect_boxes_for_tagged_photos)
         self.tools_menu.addSeparator()
         sex_suggest_action = self.tools_menu.addAction("Suggest Buck/Doe (AI) on Deer Photos...")
         sex_suggest_action.triggered.connect(self.run_sex_suggestions_on_deer)
@@ -2147,6 +2178,9 @@ class TrainerWindow(QMainWindow):
         supabase_setup_action.triggered.connect(self.setup_supabase_credentials)
         reset_sync_prefs_action = settings_menu.addAction("Reset Cloud Sync Preferences...")
         reset_sync_prefs_action.triggered.connect(self._reset_cloud_sync_preferences)
+        settings_menu.addSeparator()
+        auto_archive_action = settings_menu.addAction("Auto-Archive Settings...")
+        auto_archive_action.triggered.connect(self._show_auto_archive_settings)
         menubar.addMenu(settings_menu)
 
         # Help menu
@@ -2209,6 +2243,14 @@ class TrainerWindow(QMainWindow):
 
         # Check cloud storage on startup (delayed so UI loads first)
         QTimer.singleShot(2000, self._check_cloud_storage_warning)
+
+    def _periodic_wal_checkpoint(self):
+        """Periodically checkpoint WAL to reduce data loss risk on crash."""
+        try:
+            if hasattr(self, 'db') and self.db:
+                self.db.checkpoint_wal()
+        except Exception as e:
+            logger.warning(f"Periodic WAL checkpoint failed: {e}")
 
     def _check_cloud_storage_warning(self):
         """Check cloud storage and warn if over 8GB (admin only)."""
@@ -2283,13 +2325,11 @@ class TrainerWindow(QMainWindow):
             QTimer.singleShot(500, self._run_startup_prompts)
 
     def _run_startup_prompts(self):
-        """Run all startup prompts in sequence."""
+        """Run startup tasks with progress dialog."""
         # First check if user needs to set up username/hunting club
         self._check_user_setup_on_startup()
-        # Then check cloud sync
-        QTimer.singleShot(100, self._check_cloud_pull_on_startup)
-        # Check CuddeLink after cloud sync
-        QTimer.singleShot(200, self._check_cuddelink_on_startup)
+        # Then run startup tasks with progress
+        QTimer.singleShot(100, self._run_startup_with_progress)
 
     def _check_user_setup_on_startup(self):
         """Prompt for username and hunting clubs if not set."""
@@ -2301,6 +2341,373 @@ class TrainerWindow(QMainWindow):
         # Show setup if no username, or no clubs selected (unless admin)
         if not username or (not clubs and not is_admin()):
             self._show_user_setup_dialog()
+
+    def _reset_filters_to_defaults(self):
+        """Reset all filters to their default state (show all non-archived photos)."""
+        # Block signals to prevent multiple photo list rebuilds
+        self.collection_filter_combo.blockSignals(True)
+        self.collection_filter_combo.setCurrentIndex(0)  # "All Collections"
+        self.collection_filter_combo.blockSignals(False)
+
+        if hasattr(self.species_filter_combo, 'select_all'):
+            self.species_filter_combo.select_all()
+        else:
+            self.species_filter_combo.blockSignals(True)
+            self.species_filter_combo.setCurrentIndex(0)
+            self.species_filter_combo.blockSignals(False)
+
+        self.archive_filter_combo.blockSignals(True)
+        self.archive_filter_combo.setCurrentIndex(0)  # "Active" (non-archived) - index 0
+        self.archive_filter_combo.blockSignals(False)
+
+        self.sex_filter_combo.blockSignals(True)
+        self.sex_filter_combo.setCurrentIndex(0)  # "All"
+        self.sex_filter_combo.blockSignals(False)
+
+        self.site_filter_combo.blockSignals(True)
+        self.site_filter_combo.setCurrentIndex(0)  # "All Sites"
+        self.site_filter_combo.blockSignals(False)
+
+        self.year_filter_combo.blockSignals(True)
+        self.year_filter_combo.setCurrentIndex(0)  # "All Years"
+        self.year_filter_combo.blockSignals(False)
+
+        self.deer_id_filter_combo.blockSignals(True)
+        self.deer_id_filter_combo.setCurrentIndex(0)  # "All"
+        self.deer_id_filter_combo.blockSignals(False)
+
+        self.suggest_filter_combo.blockSignals(True)
+        self.suggest_filter_combo.setCurrentIndex(0)  # "All"
+        self.suggest_filter_combo.blockSignals(False)
+
+    def _navigate_to_photo_by_id(self, photo_id: int):
+        """Navigate to a specific photo by its database ID, bypassing all filters."""
+        # Reload all photos including archived
+        self.photos = self._sorted_photos(self.db.search_photos(include_archived=True))
+
+        # Find the target photo index in the full list
+        target_index = None
+        for i, p in enumerate(self.photos):
+            if p.get("id") == photo_id:
+                target_index = i
+                break
+
+        if target_index is None:
+            print(f"[WARNING] Photo {photo_id} not found in database")
+            return
+
+        # Reset all filters to defaults
+        self._reset_filters_to_defaults()
+
+        # Set archive filter to show ALL photos (including archived)
+        self.archive_filter_combo.blockSignals(True)
+        self.archive_filter_combo.setCurrentIndex(3)  # "All Photos"
+        self.archive_filter_combo.blockSignals(False)
+
+        # Set the index BEFORE populating
+        self.index = target_index
+
+        # Temporarily set a flag to bypass the "jump to first filtered" behavior
+        self._navigating_to_specific_photo = True
+
+        # Populate the list - this will rebuild filters but our flag prevents index change
+        self._populate_photo_list()
+
+        self._navigating_to_specific_photo = False
+
+        # Make sure we're on the right photo
+        self.index = target_index
+        self.load_photo()
+
+        # Also select it in the list widget
+        for row in range(self.photo_list_widget.count()):
+            item = self.photo_list_widget.item(row)
+            idx = item.data(Qt.ItemDataRole.UserRole)
+            if idx == target_index:
+                self.photo_list_widget.blockSignals(True)
+                self.photo_list_widget.setCurrentItem(item)
+                item.setSelected(True)
+                self.photo_list_widget.scrollToItem(item)
+                self.photo_list_widget.blockSignals(False)
+                break
+
+    def _run_startup_with_progress(self):
+        """Run startup tasks with a unified progress dialog.
+
+        Combines label sync and cloud photo checks into one streamlined flow.
+        Uses background thread to avoid blocking UI.
+        """
+        # Reset all filters to defaults on startup
+        self._reset_filters_to_defaults()
+
+        # Check if we have cloud configured
+        has_supabase = False
+        try:
+            import json
+            from pathlib import Path
+            config_paths = [
+                Path(__file__).parent.parent / "cloud_config.json",
+                Path(__file__).parent / "cloud_config.json",
+                Path.cwd() / "cloud_config.json",
+            ]
+            for config_path in config_paths:
+                if config_path.exists():
+                    with open(config_path) as f:
+                        config = json.load(f)
+                    if config.get("supabase", {}).get("url") and config.get("supabase", {}).get("anon_key"):
+                        has_supabase = True
+                        break
+        except:
+            pass
+
+        if not has_supabase:
+            # No cloud configured, nothing to do
+            return
+
+        # Worker thread for cloud sync
+        class StartupSyncWorker(QThread):
+            progress = pyqtSignal(str)  # status message
+            finished = pyqtSignal(list)  # photos needing thumbnails
+            error = pyqtSignal(str)
+
+            def __init__(self, db, get_client_func, parent=None):
+                super().__init__(parent)
+                self.db = db
+                self.get_client_func = get_client_func
+
+            def run(self):
+                try:
+                    self.progress.emit("Syncing labels from cloud...")
+                    client = self.get_client_func()
+                    if client:
+                        self.db.pull_from_supabase(client)
+
+                    self.progress.emit("Checking for photos to download...")
+                    photos_to_download = []
+                    cloud_only_photos = self.db.get_cloud_only_photos()
+                    for photo in cloud_only_photos:
+                        thumb_path = photo.get("thumbnail_path")
+                        if not thumb_path or not os.path.exists(str(thumb_path)):
+                            photos_to_download.append(photo)
+
+                    self.finished.emit(photos_to_download)
+                except Exception as e:
+                    logger.error(f"Startup sync failed: {e}")
+                    self.error.emit(str(e))
+
+        # Create unified startup dialog
+        startup_dlg = QDialog(self)
+        startup_dlg.setWindowTitle("Syncing with Cloud")
+        startup_dlg.setFixedWidth(400)
+        startup_dlg.setWindowFlags(startup_dlg.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+        layout = QVBoxLayout(startup_dlg)
+
+        status_label = QLabel("Connecting to cloud...")
+        status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(status_label)
+
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 0)  # Indeterminate while syncing
+        layout.addWidget(progress_bar)
+
+        result = {"photos_to_download": [], "done": False}
+
+        def on_progress(msg):
+            status_label.setText(msg)
+
+        def on_finished(photos):
+            result["photos_to_download"] = photos
+            result["done"] = True
+            startup_dlg.close()
+
+        def on_error(err):
+            result["done"] = True
+            startup_dlg.close()
+
+        # Start worker
+        worker = StartupSyncWorker(self.db, self._get_supabase_client, startup_dlg)
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        worker.start()
+
+        startup_dlg.exec()
+
+        # Wait for worker if dialog was closed early
+        if worker.isRunning():
+            worker.wait(10000)
+
+        # Refresh photo list after sync
+        self.photos = self._sorted_photos(self.db.get_all_photos())
+        self._populate_photo_list()
+
+        # Mark that we've done the cloud check so it doesn't run again
+        self._cloud_only_prompted = True
+
+        # If there are photos to download, show single combined prompt
+        if result["photos_to_download"]:
+            self._prompt_cloud_download(result["photos_to_download"])
+
+    def _prompt_cloud_download(self, photos_to_download: list):
+        """Show a single combined prompt to download photos from cloud with progress bar."""
+        count = len(photos_to_download)
+
+        # Create download dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Download from Cloud")
+        dlg.setFixedWidth(450)
+        layout = QVBoxLayout(dlg)
+
+        # Info label
+        info_label = QLabel(
+            f"<b>{count} photo{'s' if count != 1 else ''}</b> {'are' if count != 1 else 'is'} "
+            f"available in the cloud but not on this device.\n\n"
+            f"Download thumbnails for viewing?"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Progress bar (hidden initially)
+        progress_bar = QProgressBar()
+        progress_bar.setMaximum(count)
+        progress_bar.setValue(0)
+        progress_bar.setVisible(False)
+        layout.addWidget(progress_bar)
+
+        status_label = QLabel("")
+        status_label.setVisible(False)
+        layout.addWidget(status_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        download_btn = QPushButton("Download")
+        skip_btn = QPushButton("Skip")
+        btn_layout.addWidget(download_btn)
+        btn_layout.addWidget(skip_btn)
+        layout.addLayout(btn_layout)
+
+        # Worker thread for downloading
+        class ThumbnailDownloadWorker(QThread):
+            progress = pyqtSignal(int, int, str)  # current, total, message
+            finished = pyqtSignal(int, int)  # downloaded, failed
+
+            def __init__(self, photos, db, parent=None):
+                super().__init__(parent)
+                self.photos = photos
+                self.db = db
+                self._cancelled = False
+
+            def cancel(self):
+                self._cancelled = True
+
+            def run(self):
+                from r2_storage import R2Storage
+                from pathlib import Path
+
+                r2 = R2Storage()
+                if not r2.is_configured():
+                    self.finished.emit(0, len(self.photos))
+                    return
+
+                thumb_dir = Path.home() / "TrailCamLibrary" / ".thumbnails"
+                thumb_dir.mkdir(parents=True, exist_ok=True)
+
+                downloaded = 0
+                failed = 0
+                total = len(self.photos)
+
+                for i, photo in enumerate(self.photos):
+                    if self._cancelled:
+                        break
+
+                    file_hash = photo.get("file_hash")
+                    photo_id = photo.get("id")
+                    if not file_hash:
+                        failed += 1
+                        continue
+
+                    self.progress.emit(i + 1, total, f"Downloading {i + 1} of {total}...")
+
+                    # Download thumbnail
+                    thumb_key = f"thumbnails/{file_hash}_thumb.jpg"
+                    thumb_path = thumb_dir / f"{file_hash}_thumb.jpg"
+
+                    try:
+                        success = False
+                        if thumb_path.exists():
+                            success = True  # Already exists
+                        else:
+                            success = r2.download_photo(thumb_key, thumb_path)
+
+                        if success:
+                            downloaded += 1
+                            # Update thumbnail_path in database so photos display correctly
+                            if photo_id:
+                                try:
+                                    self.db.update_thumbnail_path(photo_id, str(thumb_path))
+                                except Exception as e:
+                                    logger.warning(f"Failed to update thumbnail_path: {e}")
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        logger.error(f"Failed to download thumbnail {file_hash}: {e}")
+                        failed += 1
+
+                self.finished.emit(downloaded, failed)
+
+        result = {"cancelled": False, "worker": None}
+
+        def on_skip():
+            result["cancelled"] = True
+            if result["worker"] and result["worker"].isRunning():
+                result["worker"].cancel()
+                result["worker"].wait(2000)
+            dlg.close()
+
+        skip_btn.clicked.connect(on_skip)
+
+        def on_progress(current, total, msg):
+            progress_bar.setValue(current)
+            status_label.setText(msg)
+
+        def on_finished(downloaded, failed):
+            if result["cancelled"]:
+                info_label.setText(f"Cancelled. Downloaded {downloaded} of {count}.")
+            else:
+                if failed > 0:
+                    info_label.setText(f"Done! Downloaded {downloaded}, {failed} failed.")
+                else:
+                    info_label.setText(f"Done! Downloaded {downloaded} thumbnails.")
+            skip_btn.setText("Close")
+            download_btn.setEnabled(False)
+            progress_bar.setValue(count)
+
+        def on_download():
+            # Switch to download mode
+            download_btn.setEnabled(False)
+            skip_btn.setText("Cancel")
+            progress_bar.setVisible(True)
+            status_label.setVisible(True)
+            info_label.setText("Downloading thumbnails...")
+
+            # Start worker thread
+            worker = ThumbnailDownloadWorker(photos_to_download, self.db, dlg)
+            worker.progress.connect(on_progress)
+            worker.finished.connect(on_finished)
+            result["worker"] = worker
+            worker.start()
+
+        download_btn.clicked.connect(on_download)
+
+        dlg.exec()
+
+        # Wait for worker to finish if still running
+        if result["worker"] and result["worker"].isRunning():
+            result["worker"].wait(5000)
+
+        # Refresh photo list after downloads
+        self.photos = self._sorted_photos(self.db.get_all_photos())
+        self._populate_photo_list()
 
     def _check_cloud_pull_on_startup(self):
         """Check if we should pull from cloud on startup."""
@@ -2487,39 +2894,273 @@ class TrainerWindow(QMainWindow):
             QMessageBox.warning(self, "Cloud Sync", f"Failed to pull from cloud:\n{str(e)}")
 
     def _check_for_new_cloud_photos(self):
-        """Check if there are photos in cloud that don't exist locally, offer to download."""
-        try:
-            from supabase_rest import get_cloud_photos_not_local
-            from r2_storage import R2Storage
+        """Check if there are photos in cloud that don't exist locally, offer to download.
 
-            # Get local file hashes
+        Runs the cloud query in a background thread to avoid blocking the UI.
+        """
+        try:
+            # Get local file hashes (fast - from local DB)
             local_hashes = self.db.get_all_file_hashes()
 
-            # Get cloud photos not in local
-            cloud_only = get_cloud_photos_not_local(local_hashes)
+            # Create and start background worker for cloud check
+            self._cloud_check_worker = CloudCheckWorker(local_hashes, self)
+            self._cloud_check_worker.finished.connect(self._on_cloud_check_finished)
+            self._cloud_check_worker.error.connect(self._on_cloud_check_error)
+            self._cloud_check_worker.start()
 
-            if not cloud_only:
-                return  # No new photos in cloud
+        except Exception as e:
+            logger.error(f"Error starting cloud check: {e}", exc_info=True)
+            # Still check for existing cloud-only photos
+            QTimer.singleShot(200, self._check_for_cloud_only_photos)
 
-            # Show dialog asking user if they want to download
-            count = len(cloud_only)
-            reply = QMessageBox.question(
-                self,
-                "New Photos in Cloud",
-                f"Found {count} photo{'s' if count != 1 else ''} in the cloud that {'are' if count != 1 else 'is'} not on this device.\n\n"
-                f"Would you like to download {'them' if count != 1 else 'it'}?\n\n"
-                "(Only thumbnails will be downloaded for viewing. Full photos remain in cloud.)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
+    def _on_cloud_check_finished(self, cloud_only: list):
+        """Handle results from background cloud check."""
+        # Clean up worker reference
+        if hasattr(self, '_cloud_check_worker'):
+            self._cloud_check_worker.deleteLater()
+            del self._cloud_check_worker
 
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+        if not cloud_only:
+            # No new photos in cloud - check for existing cloud-only photos
+            QTimer.singleShot(200, self._check_for_cloud_only_photos)
+            return
 
+        # Show dialog asking user if they want to download
+        count = len(cloud_only)
+        reply = QMessageBox.question(
+            self,
+            "New Photos in Cloud",
+            f"Found {count} photo{'s' if count != 1 else ''} in the cloud that {'are' if count != 1 else 'is'} not on this device.\n\n"
+            f"Would you like to download {'them' if count != 1 else 'it'}?\n\n"
+            "(Only thumbnails will be downloaded for viewing. Full photos remain in cloud.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
             # Start download with progress dialog
             self._download_cloud_photos(cloud_only)
 
+        # After handling, also check for existing cloud-only photos
+        QTimer.singleShot(200, self._check_for_cloud_only_photos)
+
+    def _on_cloud_check_error(self, error_msg: str):
+        """Handle error from background cloud check."""
+        # Clean up worker reference
+        if hasattr(self, '_cloud_check_worker'):
+            self._cloud_check_worker.deleteLater()
+            del self._cloud_check_worker
+
+        logger.error(f"Cloud check failed: {error_msg}")
+        # Still check for existing cloud-only photos
+        QTimer.singleShot(200, self._check_for_cloud_only_photos)
+
+    def _check_for_cloud_only_photos(self):
+        """Check for photos with cloud:// paths that need to be downloaded."""
+        # Prevent showing prompt twice
+        if getattr(self, '_cloud_only_prompted', False):
+            return
+        self._cloud_only_prompted = True
+
+        try:
+            # Get photos where file_path starts with cloud://
+            cloud_only_photos = self.db.get_cloud_only_photos()
+
+            if not cloud_only_photos:
+                return  # All photos are downloaded
+
+            count = len(cloud_only_photos)
+            reply = QMessageBox.question(
+                self,
+                "Download Cloud Photos",
+                f"{count} photo{'s are' if count != 1 else ' is'} stored in the cloud but not downloaded to this device.\n\n"
+                f"Would you like to download {'them' if count != 1 else 'it'} now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+
+            if reply == QMessageBox.StandardButton.Yes:
+                self._download_existing_cloud_photos(cloud_only_photos)
+
         except Exception as e:
-            logger.error(f"Error checking for cloud photos: {e}", exc_info=True)
+            logger.error(f"Error checking for cloud-only photos: {e}", exc_info=True)
+
+    def _download_existing_cloud_photos(self, photos: list):
+        """Download full photos for existing cloud-only records."""
+        from r2_storage import R2Storage
+        from pathlib import Path
+
+        # Create progress dialog
+        self._cloud_dl_dialog = QDialog(self)
+        self._cloud_dl_dialog.setWindowTitle("Downloading Photos from Cloud")
+        self._cloud_dl_dialog.setMinimumWidth(400)
+        self._cloud_dl_dialog.setModal(True)
+        layout = QVBoxLayout(self._cloud_dl_dialog)
+
+        self._cloud_dl_label = QLabel(f"Preparing to download {len(photos)} photos...")
+        layout.addWidget(self._cloud_dl_label)
+
+        self._cloud_dl_progress = QProgressBar()
+        self._cloud_dl_progress.setMaximum(len(photos))
+        self._cloud_dl_progress.setValue(0)
+        layout.addWidget(self._cloud_dl_progress)
+
+        cancel_btn = QPushButton("Cancel")
+        layout.addWidget(cancel_btn)
+
+        self._cloud_dl_cancelled = False
+
+        def on_cancel():
+            self._cloud_dl_cancelled = True
+            if hasattr(self, '_cloud_dl_worker') and self._cloud_dl_worker.isRunning():
+                self._cloud_dl_worker.cancel()
+            self._cloud_dl_dialog.close()
+
+        cancel_btn.clicked.connect(on_cancel)
+
+        # Worker thread for downloading
+        class ExistingCloudPhotoWorker(QThread):
+            progress = pyqtSignal(int, int, str)  # current, total, message
+            finished = pyqtSignal(int, int)  # downloaded, failed
+
+            def __init__(self, photos, db, r2, photo_dir):
+                super().__init__()
+                self.photos = photos
+                self.db = db
+                self.r2 = r2
+                self.photo_dir = photo_dir
+                self._cancelled = False
+
+            def cancel(self):
+                self._cancelled = True
+
+            def run(self):
+                from datetime import datetime as dt
+                downloaded = 0
+                failed = 0
+                total = len(self.photos)
+
+                try:
+                    for i, photo in enumerate(self.photos):
+                        if self._cancelled:
+                            break
+
+                        try:
+                            file_hash = photo.get("file_hash")
+                            photo_id = photo.get("id")
+                            if not file_hash or not photo_id:
+                                failed += 1
+                                continue
+
+                            self.progress.emit(i + 1, total, f"Downloading {i + 1} of {total}...")
+
+                            # Determine destination path
+                            date_taken = photo.get("date_taken", "")
+                            original_name = photo.get("original_name", f"{file_hash}.jpg")
+
+                            year, month = "Unknown", "Unknown"
+                            if date_taken:
+                                try:
+                                    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+                                        try:
+                                            parsed = dt.strptime(date_taken[:19], fmt)
+                                            year = str(parsed.year)
+                                            month = f"{parsed.month:02d}"
+                                            break
+                                        except ValueError:
+                                            continue
+                                except Exception:
+                                    pass
+
+                            dest_folder = self.photo_dir / year / month
+                            dest_folder.mkdir(parents=True, exist_ok=True)
+
+                            dest_path = dest_folder / original_name
+                            if dest_path.exists():
+                                ext = Path(original_name).suffix or ".jpg"
+                                dest_path = dest_folder / f"{file_hash}{ext}"
+
+                            # Download from R2
+                            r2_key = f"photos/{file_hash}.jpg"
+                            download_success = self.r2.download_photo(r2_key, dest_path)
+                            if not download_success:
+                                # Try .jpeg
+                                r2_key = f"photos/{file_hash}.jpeg"
+                                download_success = self.r2.download_photo(r2_key, dest_path)
+
+                            if download_success:
+                                self.db.update_file_path(photo_id, str(dest_path))
+                                downloaded += 1
+
+                                # SAFEGUARD: Verify timestamp from local EXIF after download
+                                # This catches cases where cloud had wrong timestamp
+                                try:
+                                    exif_date = self._read_exif_datetime(dest_path)
+                                    if exif_date and exif_date != date_taken:
+                                        # EXIF differs from cloud - update local DB (thread-safe)
+                                        self.db.update_date_taken(photo_id, exif_date)
+                                except Exception:
+                                    pass  # Don't fail download if EXIF check fails
+                            else:
+                                failed += 1
+
+                        except Exception as e:
+                            logger.error(f"Error downloading photo {photo.get('file_hash', 'unknown')}: {e}")
+                            failed += 1
+
+                except Exception as e:
+                    logger.error(f"Critical error in download worker: {e}", exc_info=True)
+
+                self.finished.emit(downloaded, failed)
+
+            def _read_exif_datetime(self, image_path):
+                """Read DateTimeOriginal from EXIF."""
+                try:
+                    from PIL import Image
+                    from PIL.ExifTags import TAGS
+                    with Image.open(image_path) as img:
+                        exif = img._getexif()
+                        if exif:
+                            dt_orig = exif.get(36867)  # DateTimeOriginal
+                            if dt_orig:
+                                return str(dt_orig).replace(':', '-', 2).replace(' ', 'T')
+                except Exception:
+                    pass
+                return None
+
+        photo_dir = Path.home() / "TrailCamLibrary"
+        photo_dir.mkdir(parents=True, exist_ok=True)
+
+        r2 = R2Storage()
+        if not r2.is_configured():
+            QMessageBox.warning(self, "Cloud Download", "R2 storage is not configured.")
+            return
+
+        self._cloud_dl_worker = ExistingCloudPhotoWorker(photos, self.db, r2, photo_dir)
+
+        def on_progress(current, total, message):
+            self._cloud_dl_label.setText(message)
+            self._cloud_dl_progress.setValue(current)
+
+        def on_finished(downloaded, failed):
+            self._cloud_dl_dialog.close()
+
+            if self._cloud_dl_cancelled:
+                QMessageBox.information(self, "Download Cancelled",
+                    f"Download cancelled.\n{downloaded} photos were downloaded before cancellation.")
+            else:
+                QMessageBox.information(self, "Download Complete",
+                    f"Successfully downloaded {downloaded} photos.\n{failed} failed.")
+
+            # Refresh photo list
+            self.photos = self._sorted_photos(self.db.get_all_photos())
+            self._populate_photo_list()
+            if self.photos:
+                self.load_photo()
+
+        self._cloud_dl_worker.progress.connect(on_progress)
+        self._cloud_dl_worker.finished.connect(on_finished)
+        self._cloud_dl_worker.start()
+
+        self._cloud_dl_dialog.show()
 
     def _download_cloud_photos(self, cloud_photos: list):
         """Download thumbnails for cloud-only photos with progress dialog."""
@@ -2607,49 +3248,88 @@ class TrainerWindow(QMainWindow):
 
                 return dest_path
 
+            def _read_exif_datetime(self, image_path):
+                """Read DateTimeOriginal from EXIF to verify/correct cloud timestamps."""
+                try:
+                    from PIL import Image
+                    with Image.open(image_path) as img:
+                        exif = img._getexif()
+                        if exif:
+                            # DateTimeOriginal (preferred) or DateTime (fallback)
+                            dt_orig = exif.get(36867) or exif.get(306)
+                            if dt_orig:
+                                return str(dt_orig).replace(':', '-', 2).replace(' ', 'T')
+                except Exception:
+                    pass
+                return None
+
             def run(self):
                 downloaded = 0
                 failed = 0
                 total = len(self.photos)
 
-                for i, photo in enumerate(self.photos):
-                    if self._cancelled:
-                        break
+                try:
+                    for i, photo in enumerate(self.photos):
+                        if self._cancelled:
+                            break
 
-                    file_hash = photo.get("file_hash")
-                    if not file_hash:
-                        failed += 1
-                        continue
+                        try:
+                            file_hash = photo.get("file_hash")
+                            if not file_hash:
+                                failed += 1
+                                continue
 
-                    self.progress.emit(i + 1, total, f"Downloading {i + 1} of {total}...")
+                            self.progress.emit(i + 1, total, f"Downloading {i + 1} of {total}...")
 
-                    # Add photo record to local database
-                    photo_id = self.db.add_cloud_photo(photo)
-                    if not photo_id:
-                        # Already exists
-                        continue
+                            # Add photo record to local database
+                            photo_id = self.db.add_cloud_photo(photo)
+                            if not photo_id:
+                                # Already exists
+                                continue
 
-                    # Download full photo from R2
-                    photo_r2_key = f"photos/{file_hash}.jpg"
-                    photo_dest = self._get_photo_dest_path(photo)
+                            # Download full photo from R2
+                            photo_r2_key = f"photos/{file_hash}.jpg"
+                            photo_dest = self._get_photo_dest_path(photo)
 
-                    if self.r2.download_photo(photo_r2_key, photo_dest):
-                        # Update file_path to local path
-                        self.db.update_file_path(photo_id, str(photo_dest))
-                    else:
-                        # Try .jpeg extension
-                        photo_r2_key = f"photos/{file_hash}.jpeg"
-                        if self.r2.download_photo(photo_r2_key, photo_dest):
-                            self.db.update_file_path(photo_id, str(photo_dest))
+                            photo_downloaded = False
+                            if self.r2.download_photo(photo_r2_key, photo_dest):
+                                # Update file_path to local path
+                                self.db.update_file_path(photo_id, str(photo_dest))
+                                photo_downloaded = True
+                            else:
+                                # Try .jpeg extension
+                                photo_r2_key = f"photos/{file_hash}.jpeg"
+                                if self.r2.download_photo(photo_r2_key, photo_dest):
+                                    self.db.update_file_path(photo_id, str(photo_dest))
+                                    photo_downloaded = True
 
-                    # Download thumbnail from R2
-                    thumb_r2_key = f"thumbnails/{file_hash}_thumb.jpg"
-                    thumb_path = self.thumb_dir / f"{file_hash}_thumb.jpg"
+                            # CRITICAL: Verify timestamp from EXIF after download
+                            # Cloud timestamps from CuddeLink may be upload times, not capture times
+                            if photo_downloaded and photo_dest.exists():
+                                try:
+                                    exif_date = self._read_exif_datetime(photo_dest)
+                                    cloud_date = photo.get("date_taken", "")
+                                    if exif_date and exif_date != cloud_date:
+                                        # EXIF differs from cloud - use EXIF (thread-safe)
+                                        self.db.update_date_taken(photo_id, exif_date)
+                                except Exception:
+                                    pass  # Don't fail download if EXIF check fails
 
-                    if self.r2.download_photo(thumb_r2_key, thumb_path):
-                        self.db.update_thumbnail_path(photo_id, str(thumb_path))
+                            # Download thumbnail from R2
+                            thumb_r2_key = f"thumbnails/{file_hash}_thumb.jpg"
+                            thumb_path = self.thumb_dir / f"{file_hash}_thumb.jpg"
 
-                    downloaded += 1
+                            if self.r2.download_photo(thumb_r2_key, thumb_path):
+                                self.db.update_thumbnail_path(photo_id, str(thumb_path))
+
+                            downloaded += 1
+
+                        except Exception as e:
+                            logger.error(f"Error downloading photo {photo.get('file_hash', 'unknown')}: {e}")
+                            failed += 1
+
+                except Exception as e:
+                    logger.error(f"Critical error in download worker: {e}", exc_info=True)
 
                 self.finished.emit(downloaded, failed)
 
@@ -2692,9 +3372,132 @@ class TrainerWindow(QMainWindow):
 
         self._cloud_dl_dialog.show()
 
+    def _handle_cloud_photo(self, photo):
+        """Handle viewing a cloud-only photo - show thumbnail without prompting."""
+        thumb_path = photo.get("thumbnail_path")
+
+        # Show thumbnail
+        self.scene.clear()
+        self.box_items = []
+        if thumb_path and os.path.exists(thumb_path):
+            pix = QPixmap(thumb_path)
+            if not pix.isNull():
+                self.current_pixmap = pix
+                self.scene.addPixmap(pix)
+                self.view.zoom_fit()
+                # Add "Cloud Photo" overlay text
+                text_item = self.scene.addText("[Cloud Photo - Thumbnail Only]")
+                text_item.setDefaultTextColor(Qt.GlobalColor.yellow)
+                font = text_item.font()
+                font.setPointSize(14)
+                font.setBold(True)
+                text_item.setFont(font)
+                text_item.setPos(10, 10)
+        else:
+            self.current_pixmap = None
+            self.scene.addText(f"Cloud photo - no thumbnail available")
+
+        # Load boxes and metadata even for cloud photos
+        self.current_boxes = []
+        try:
+            if photo.get("id"):
+                self.current_boxes = self.db.get_boxes(photo["id"])
+        except Exception:
+            pass
+        self._draw_boxes()
+        self._update_box_tab_bar()
+
+        # Load other metadata
+        pid = photo.get("id")
+        if pid:
+            tags = self.db.get_tags(pid)
+            self.tags_edit.setText(", ".join(tags))
+            self.favorite_checkbox.blockSignals(True)
+            self.favorite_checkbox.setChecked(bool(photo.get("favorite")))
+            self.favorite_checkbox.blockSignals(False)
+
+    def _download_single_cloud_photo(self, photo):
+        """Download a single cloud photo and update local database."""
+        from r2_storage import R2Storage
+        from pathlib import Path
+        from datetime import datetime as dt
+
+        file_hash = photo.get("file_hash")
+        if not file_hash:
+            QMessageBox.warning(self, "Error", "Photo has no file hash.")
+            return
+
+        r2 = R2Storage()
+        if not r2.is_configured():
+            QMessageBox.warning(self, "Error", "R2 storage is not configured.")
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+
+        try:
+            # Determine destination path based on date
+            date_taken = photo.get("date_taken", "")
+            original_name = photo.get("original_name", f"{file_hash}.jpg")
+
+            year, month = "Unknown", "Unknown"
+            if date_taken:
+                try:
+                    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+                        try:
+                            parsed = dt.strptime(date_taken[:19], fmt)
+                            year = str(parsed.year)
+                            month = f"{parsed.month:02d}"
+                            break
+                        except ValueError:
+                            continue
+                except Exception:
+                    pass
+
+            photo_dir = Path.home() / "TrailCamLibrary" / year / month
+            photo_dir.mkdir(parents=True, exist_ok=True)
+
+            # Use original filename, fall back to hash if exists
+            dest_path = photo_dir / original_name
+            if dest_path.exists():
+                ext = Path(original_name).suffix or ".jpg"
+                dest_path = photo_dir / f"{file_hash}{ext}"
+
+            # Download from R2
+            r2_key = f"photos/{file_hash}.jpg"
+            if r2.download_photo(r2_key, dest_path):
+                # Update database with local path
+                self.db.update_file_path(photo["id"], str(dest_path))
+
+                # Update the photo dict in memory
+                photo["file_path"] = str(dest_path)
+
+                # Refresh photos list to get updated data
+                self.photos = self._sorted_photos(self.db.get_all_photos())
+
+                QApplication.restoreOverrideCursor()
+                QMessageBox.information(self, "Success", f"Photo downloaded to:\n{dest_path}")
+
+                # Reload the photo with the new local path
+                self.load_photo()
+            else:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.warning(self, "Error", "Failed to download photo from cloud.")
+
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Error", f"Download failed: {e}")
+
     def closeEvent(self, event):
         """Save settings and optionally push to cloud before closing."""
         self._save_settings()
+
+        # Create daily backup if one hasn't been made today
+        try:
+            if self.db.check_daily_backup():
+                print("[Shutdown] Daily backup created")
+        except Exception as e:
+            print(f"[Shutdown] Daily backup failed: {e}")
 
         # Check for pending offline changes and warn user
         if hasattr(self, 'sync_manager') and self.sync_manager._pending and self.sync_manager.status == 'offline':
@@ -2803,6 +3606,139 @@ class TrainerWindow(QMainWindow):
             "Startup preferences have been reset.\n\n"
             "The app will ask you about cloud sync and CuddeLink downloads next time."
         )
+
+    def _show_auto_archive_settings(self):
+        """Show dialog for configuring auto-archive after sync."""
+        settings = QSettings("TrailCam", "Trainer")
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Auto-Archive Settings")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+
+        # Enable checkbox
+        enable_cb = QCheckBox("Enable auto-archive after sync")
+        enable_cb.setChecked(settings.value("auto_archive_enabled", False, type=bool))
+        layout.addWidget(enable_cb)
+
+        layout.addSpacing(10)
+
+        # Description
+        desc = QLabel("When enabled, photos will be archived after sync if they\n"
+                      "don't match your selected species. Favorites and unlabeled\n"
+                      "photos are always kept.")
+        desc.setStyleSheet("color: #888;")
+        layout.addWidget(desc)
+
+        layout.addSpacing(10)
+
+        # Preset selection
+        preset_group = QGroupBox("Keep photos tagged as:")
+        preset_layout = QVBoxLayout(preset_group)
+
+        bucks_only_rb = QRadioButton("Bucks Only")
+        custom_rb = QRadioButton("Custom Selection")
+
+        current_preset = settings.value("auto_archive_preset", "custom")
+        if current_preset == "bucks_only":
+            bucks_only_rb.setChecked(True)
+        else:
+            custom_rb.setChecked(True)
+
+        preset_layout.addWidget(bucks_only_rb)
+        preset_layout.addWidget(custom_rb)
+
+        # Custom species checkboxes
+        species_widget = QWidget()
+        species_layout = QVBoxLayout(species_widget)
+        species_layout.setContentsMargins(20, 5, 0, 0)
+
+        # Get all species from database
+        all_species = ["Buck", "Deer", "Doe"]  # Common ones first
+        if self.db:
+            db_species = self.db.get_all_species_tags()
+            for s in db_species:
+                if s not in all_species:
+                    all_species.append(s)
+
+        # Get currently saved species
+        saved_species_str = settings.value("auto_archive_keep_species", "Buck")
+        saved_species = [s.strip() for s in saved_species_str.split(",") if s.strip()]
+
+        species_checkboxes = {}
+        for species in all_species[:15]:  # Limit to top 15 species
+            cb = QCheckBox(species)
+            cb.setChecked(species in saved_species)
+            species_layout.addWidget(cb)
+            species_checkboxes[species] = cb
+
+        preset_layout.addWidget(species_widget)
+        layout.addWidget(preset_group)
+
+        # Enable/disable species checkboxes based on preset
+        def update_species_enabled():
+            is_custom = custom_rb.isChecked()
+            species_widget.setEnabled(is_custom)
+
+        bucks_only_rb.toggled.connect(update_species_enabled)
+        custom_rb.toggled.connect(update_species_enabled)
+        update_species_enabled()
+
+        layout.addSpacing(10)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        btn_layout.addStretch()
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        def save_settings():
+            settings.setValue("auto_archive_enabled", enable_cb.isChecked())
+
+            if bucks_only_rb.isChecked():
+                settings.setValue("auto_archive_preset", "bucks_only")
+                settings.setValue("auto_archive_keep_species", "Buck")
+            else:
+                settings.setValue("auto_archive_preset", "custom")
+                selected = [s for s, cb in species_checkboxes.items() if cb.isChecked()]
+                settings.setValue("auto_archive_keep_species", ",".join(selected))
+
+            dialog.accept()
+            QMessageBox.information(self, "Auto-Archive",
+                                    "Auto-archive settings saved.\n\n"
+                                    "Photos will be archived after the next sync operation.")
+
+        save_btn.clicked.connect(save_settings)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        dialog.exec()
+
+    def run_auto_archive(self):
+        """Run auto-archive based on current settings. Called after sync."""
+        settings = QSettings("TrailCam", "Trainer")
+
+        if not settings.value("auto_archive_enabled", False, type=bool):
+            return 0
+
+        preset = settings.value("auto_archive_preset", "custom")
+        if preset == "bucks_only":
+            keep_species = ["Buck"]
+        else:
+            keep_str = settings.value("auto_archive_keep_species", "")
+            keep_species = [s.strip() for s in keep_str.split(",") if s.strip()]
+
+        if not keep_species:
+            return 0
+
+        photo_ids = self.db.get_photos_for_auto_archive(keep_species)
+        if photo_ids:
+            self.db.archive_photos(photo_ids)
+            logger.info(f"Auto-archived {len(photo_ids)} photos (kept species: {keep_species})")
+            return len(photo_ids)
+        return 0
 
     def prune_missing_files(self):
         """Remove DB entries whose files no longer exist; report summary."""
@@ -2914,7 +3850,15 @@ class TrainerWindow(QMainWindow):
             filtered_pos = self.index + 1
             filtered_total = len(self.photos)
         self.setWindowTitle(f"Trainer ({filtered_pos}/{filtered_total}) - {os.path.basename(path)}")
-        pix = QPixmap(path)
+
+        # Handle cloud-only photos (file_path starts with cloud://)
+        if path and path.startswith("cloud://"):
+            # Offer to download full photo from cloud
+            self._handle_cloud_photo(photo)
+            return  # _handle_cloud_photo will call load_photo again after download
+        else:
+            pix = QPixmap(path)
+
         self.scene.clear()
         self.box_items = []
         if not pix.isNull():
@@ -3570,27 +4514,59 @@ class TrainerWindow(QMainWindow):
 
     # --- Detection helpers ---
     def _get_megadetector(self):
-        """Load and cache MegaDetector model."""
+        """Load and cache MegaDetector model from persistent storage."""
         if hasattr(self, "_megadetector") and self._megadetector is not None:
             return self._megadetector
+
+        # Use persistent model path instead of temp directory
+        from pathlib import Path
+        model_path = Path.home() / '.trailcam' / 'md_v5a.0.1.pt'
+
+        # Fall back to older version if newer not available
+        if not model_path.exists():
+            model_path = Path.home() / '.trailcam' / 'md_v5a.0.0.pt'
+
         try:
             from megadetector.detection import run_detector
-            self._megadetector = run_detector.load_detector('MDV5A')
+
+            if model_path.exists():
+                # Use direct path to avoid temp directory downloads
+                logger.info(f"Loading MegaDetector from: {model_path}")
+                self._megadetector = run_detector.load_detector(str(model_path))
+            else:
+                # Fall back to auto-download (will use temp, but at least works)
+                logger.warning(f"MegaDetector model not found at {model_path}, using auto-download")
+                self._megadetector = run_detector.load_detector('MDV5A')
+
+            self._megadetector_available = True
             return self._megadetector
+        except ImportError as e:
+            logger.error(f"MegaDetector package not installed: {e}")
+            self._megadetector_available = False
+            self._megadetector_error = "MegaDetector package not installed. Install with: pip install megadetector"
+            return None
         except Exception as e:
-            logger.warning(f"Failed to load MegaDetector: {e}")
+            logger.error(f"Failed to load MegaDetector: {e}")
+            self._megadetector_available = False
+            self._megadetector_error = str(e)
             return None
 
     def _detect_boxes_megadetector(self, path: str, conf_thresh: float = 0.2):
         """Detect animals/people/vehicles using MegaDetector."""
+        print(f"[MD DEBUG] _detect_boxes_megadetector called for: {path}")
         model = self._get_megadetector()
         if model is None:
+            print("[MD DEBUG] Model is None!")
             return []
+        print("[MD DEBUG] Model loaded, running detection...")
         try:
             from megadetector.visualization import visualization_utils as vis_utils
             image = vis_utils.load_image(path)
             result = model.generate_detections_one_image(image)
-            detections = [d for d in result.get('detections', []) if d['conf'] >= conf_thresh]
+            all_detections = result.get('detections', [])
+            print(f"[MD DEBUG] Raw detections: {len(all_detections)}")
+            detections = [d for d in all_detections if d['conf'] >= conf_thresh]
+            print(f"[MD DEBUG] After filtering (conf >= {conf_thresh}): {len(detections)}")
             boxes = []
             for det in detections:
                 # MegaDetector format: [x, y, width, height] normalized 0-1
@@ -4569,7 +5545,7 @@ class TrainerWindow(QMainWindow):
         dt = None
         for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
             if exif_data.get(key):
-                dt = str(exif_data[key]).replace(":", "-", 2).replace(" ", " ")
+                dt = str(exif_data[key]).replace(":", "-", 2).replace(" ", "T")
                 break
         if need_date and dt:
             self.db.set_date_taken(pid, dt)
@@ -5413,6 +6389,10 @@ class TrainerWindow(QMainWindow):
         """Apply all filters to in-memory photo list."""
         result = list(enumerate(self.photos))
 
+        # If navigating to a specific photo, bypass ALL filters
+        if getattr(self, '_navigating_to_specific_photo', False):
+            return result
+
         # If in queue mode, filter to only queue photos (bypass other filters)
         if self.queue_mode and self.queue_photo_ids:
             queue_set = set(self.queue_photo_ids)
@@ -5807,23 +6787,27 @@ class TrainerWindow(QMainWindow):
     def _populate_photo_list(self):
         """Fill the navigation list with photos (sorted)."""
         # Refresh all filter dropdowns with contextual options
-        self._populate_suggest_filter_options()
-        self._populate_species_filter_options()
-        self._populate_sex_filter_options()
-        self._populate_deer_id_filter_options()
-        self._populate_site_filter_options()
-        self._populate_year_filter_options()
-        self._populate_collection_filter_options()
+        # UNLESS we're navigating to a specific photo (filters are bypassed anyway)
+        if not getattr(self, '_navigating_to_specific_photo', False):
+            self._populate_suggest_filter_options()
+            self._populate_species_filter_options()
+            self._populate_sex_filter_options()
+            self._populate_deer_id_filter_options()
+            self._populate_site_filter_options()
+            self._populate_year_filter_options()
+            self._populate_collection_filter_options()
         self.photo_list_widget.blockSignals(True)
         self.photo_list_widget.clear()
         filtered = self._filtered_photos()
         filtered_indices = [idx for idx, _ in filtered]
 
         # If current photo not in filtered set, jump to first filtered photo
+        # UNLESS we're navigating to a specific photo (e.g., from Properties button)
         jumped = False
         if filtered_indices and self.index not in filtered_indices:
-            self.index = filtered_indices[0]
-            jumped = True
+            if not getattr(self, '_navigating_to_specific_photo', False):
+                self.index = filtered_indices[0]
+                jumped = True
 
         target_item = None
         for row, (idx, p) in enumerate(filtered):
@@ -6476,18 +7460,18 @@ class TrainerWindow(QMainWindow):
     def _get_detector_for_suggestions(self):
         return self._get_deer_head_detector()
 
-    def _best_crop_for_photo(self, photo: dict) -> Optional[Path]:
-        """Return a temp file path of the best crop (deer_head > ai_animal > subject) or None."""
+    def _best_crop_for_photo(self, photo: dict):
+        """Return (temp_file_path, pixel_area) of the best crop (deer_head > ai_animal > subject) or (None, None)."""
         pid = photo.get("id")
         if not pid:
-            return None
+            return None, None
         boxes = []
         try:
             boxes = self.db.get_boxes(pid)
         except Exception:
             boxes = []
         if not boxes:
-            return None
+            return None, None
         # prefer deer_head, then ai_animal (MegaDetector), then subject/ai_subject
         chosen = None
         for b in boxes:
@@ -6505,10 +7489,10 @@ class TrainerWindow(QMainWindow):
                     chosen = b
                     break
         if chosen is None:
-            return None
+            return None, None
         path = photo.get("file_path")
         if not path or not os.path.exists(path):
-            return None
+            return None, None
         try:
             from PIL import Image
             img = Image.open(path).convert("RGB")
@@ -6518,13 +7502,14 @@ class TrainerWindow(QMainWindow):
             x1 = max(0, min(w, x1)); x2 = max(0, min(w, x2))
             y1 = max(0, min(h, y1)); y2 = max(0, min(h, y2))
             if x2 - x1 < 5 or y2 - y1 < 5:
-                return None
+                return None, None
+            pixel_area = (x2 - x1) * (y2 - y1)
             import tempfile
             tmp = Path(tempfile.mkstemp(suffix=".jpg")[1])
             img.crop((x1, y1, x2, y2)).save(tmp, "JPEG", quality=90)
-            return tmp
+            return tmp, pixel_area
         except Exception:
-            return None
+            return None, None
 
     def _crop_box(self, photo: dict, box: dict) -> Optional[Path]:
         """Crop a specific box from a photo and return temp file path."""
@@ -8018,6 +9003,17 @@ class TrainerWindow(QMainWindow):
         if count > 0:
             logger.info(f"Auto-sync completed: {count} items synced")
 
+        # Run auto-archive after sync if enabled
+        archived_count = self.run_auto_archive()
+        if archived_count > 0:
+            # Refresh the photo list to reflect archived photos
+            self.photos = self._sorted_photos(self.db.get_all_photos())
+            self._populate_photo_list()
+            if self.index >= len(self.photos):
+                self.index = max(0, len(self.photos) - 1)
+            if self.photos:
+                self.load_photo()
+
     def _on_sync_failed(self, error: str):
         """Handle sync failure."""
         logger.warning(f"Auto-sync failed: {error}")
@@ -8183,6 +9179,13 @@ class TrainerWindow(QMainWindow):
         try:
             counts = self.db.pull_from_supabase(client, progress_callback=update_progress)
             progress.close()
+
+            # Run auto-archive after pull if enabled
+            archived_count = self.run_auto_archive()
+            archive_msg = ""
+            if archived_count > 0:
+                archive_msg = f"\n\n• Auto-archived: {archived_count} photos"
+
             summary = (
                 f"Pulled from cloud:\n\n"
                 f"• Photos updated: {counts['photos']}\n"
@@ -8191,6 +9194,7 @@ class TrainerWindow(QMainWindow):
                 f"• Additional deer: {counts['deer_additional']}\n"
                 f"• Buck profiles: {counts['buck_profiles']}\n"
                 f"• Season profiles: {counts['buck_profile_seasons']}"
+                f"{archive_msg}"
             )
             QMessageBox.information(self, "Pull Complete", summary)
             # Reload current photo to show updated data
@@ -8380,9 +9384,9 @@ class TrainerWindow(QMainWindow):
                     elif has_vehicle:
                         label, conf = "Vehicle", 0.95
                     elif has_animal:
-                        crop = self._best_crop_for_photo(p)
+                        crop, pixel_area = self._best_crop_for_photo(p)
                         path = str(crop) if crop else p.get("file_path")
-                        res = self.suggester.predict(path) if self.suggester else None
+                        res = self.suggester.predict(path, pixel_area=pixel_area) if self.suggester else None
                         if res:
                             label, conf = res
                             if label in ("Empty", "Other"):
@@ -11071,37 +12075,12 @@ class TrainerWindow(QMainWindow):
         # Handle navigation to specific photo if Properties was clicked
         if navigate_to_photo:
             target_pid = navigate_to_photo.get("photo_id")
-            # Refresh photos from database INCLUDING archived (target may be archived)
-            self.photos = self._sorted_photos(self.db.search_photos(include_archived=True))
-            # Find the target photo index
-            target_index = None
-            for i, p in enumerate(self.photos):
-                if p.get("id") == target_pid:
-                    target_index = i
-                    break
-            if target_index is not None:
-                # Reset ALL filters to ensure target photo is visible
-                self.collection_filter_combo.blockSignals(True)
-                self.collection_filter_combo.setCurrentIndex(0)  # "All Collections"
-                self.collection_filter_combo.blockSignals(False)
-                if hasattr(self.species_filter_combo, 'select_all'):
-                    self.species_filter_combo.select_all()
-                else:
-                    self.species_filter_combo.blockSignals(True)
-                    self.species_filter_combo.setCurrentIndex(0)  # "All Species"
-                    self.species_filter_combo.blockSignals(False)
-                self.archive_filter_combo.blockSignals(True)
-                self.archive_filter_combo.setCurrentIndex(3)  # "All Photos" (index 3)
-                self.archive_filter_combo.blockSignals(False)
-                # Set target index BEFORE populating so _populate_photo_list selects it
-                self.index = target_index
-                self._populate_photo_list()
+            self._navigate_to_photo_by_id(target_pid)
+        else:
+            # Default: just refresh normally
+            self._populate_photo_list()
+            if self.photos and 0 <= self.index < len(self.photos):
                 self.load_photo()
-                return
-        # Default: just refresh normally
-        self._populate_photo_list()
-        if self.photos and 0 <= self.index < len(self.photos):
-            self.load_photo()
 
     def review_mislabeled_species(self):
         """Review boxes that may be mislabeled (AI disagrees with current label)."""
@@ -11465,28 +12444,27 @@ class TrainerWindow(QMainWindow):
             QMessageBox.information(self, "Re-run AI", "Image file not found.")
             return
 
-        self.statusBar().showMessage("Running AI detection and classification...")
+        # Update status and disable UI during processing
+        self.statusBar().showMessage("Running AI detection (this may take a moment)...")
+        self.setEnabled(False)
         QApplication.processEvents()
 
         results = []
 
-        # Step 1: Clear existing AI boxes AND suggested tag
-        self.current_boxes = [b for b in self.current_boxes if not str(b.get("label", "")).startswith("ai_")]
         try:
+            # Step 1: Clear existing AI boxes AND suggested tag
+            self.current_boxes = [b for b in self.current_boxes if not str(b.get("label", "")).startswith("ai_")]
             self.db.set_suggested_tag(pid, None, None)
             photo["suggested_tag"] = None
             photo["suggested_confidence"] = None
-        except Exception as e:
-            print(f"[AI] Warning: Could not clear suggested tag: {e}")
 
-        # Step 2: Run MegaDetector
-        try:
+            # Step 2: Run MegaDetector
             new_boxes = self._detect_boxes_megadetector(path, conf_thresh=0.2)
             if new_boxes:
                 self.current_boxes.extend(new_boxes)
                 results.append(f"Detected {len(new_boxes)} subject(s)")
             else:
-                # Only suggest Empty if there are NO boxes at all (including existing ones)
+                # Only suggest Empty if there are NO boxes at all
                 existing_boxes = self.db.get_boxes(pid)
                 if not existing_boxes and not self.current_boxes:
                     results.append("No subjects detected - suggesting Empty")
@@ -11495,55 +12473,56 @@ class TrainerWindow(QMainWindow):
                     photo["suggested_confidence"] = 1.0
                 else:
                     results.append("No new subjects detected (existing boxes preserved)")
-        except Exception as e:
-            results.append(f"Detection failed: {e}")
 
-        # Step 3: Run species classifier on detected boxes
-        try:
+            # Step 3: Run species classifier on detected boxes
             if hasattr(self, "ai_suggester") and self.ai_suggester:
                 animal_boxes = [b for b in self.current_boxes if str(b.get("label", "")).startswith("ai_animal")]
                 if animal_boxes:
-                    # Get species suggestion for the photo
                     import PIL.Image as PILImage
                     img = PILImage.open(path).convert("RGB")
                     w, h = img.size
 
                     species_results = []
+                    conf = 0.0
                     for box in animal_boxes:
-                        # Crop the box region
                         x1 = int(box["x1"] * w)
                         y1 = int(box["y1"] * h)
                         x2 = int(box["x2"] * w)
                         y2 = int(box["y2"] * h)
+                        pixel_area = (x2 - x1) * (y2 - y1)
                         crop = img.crop((x1, y1, x2, y2))
 
-                        # Run classifier
-                        label, conf = self.ai_suggester.predict(crop)
+                        label, conf = self.ai_suggester.predict(crop, pixel_area=pixel_area)
                         if label:
                             species_results.append(f"{label} ({int(conf*100)}%)")
-                            box["species"] = label  # Store on box
+                            box["species"] = label
 
                     if species_results:
                         results.append(f"Species: {', '.join(species_results)}")
-
-                        # Set suggested tag for the photo (use first result)
                         first_label = animal_boxes[0].get("species", "")
                         if first_label:
                             self.db.set_suggested_tag(pid, first_label, conf)
                             photo["suggested_tag"] = first_label
                             photo["suggested_confidence"] = conf
-        except Exception as e:
-            results.append(f"Classification failed: {e}")
 
-        # Step 4: Persist and update UI
-        self._persist_boxes()
-        self._draw_boxes()
-        self._update_box_tab_bar()
-        self._update_suggestion_display(photo)
-        self._populate_photo_list()
+            # Step 4: Persist and update UI
+            self._persist_boxes()
+            self._draw_boxes()
+            self._update_box_tab_bar()
+            self._update_suggestion_display(photo)
+            self._populate_photo_list()
+
+            result_msg = "\n".join(results) if results else "AI processing complete"
+
+        except Exception as e:
+            result_msg = f"AI processing failed: {e}"
+            logger.error(f"rerun_ai_current_photo error: {e}")
+
+        finally:
+            # Re-enable UI
+            self.setEnabled(True)
 
         # Show results
-        result_msg = "\n".join(results) if results else "AI processing complete"
         self.statusBar().showMessage(result_msg, 5000)
         QMessageBox.information(self, "Re-run AI", result_msg)
 
@@ -11616,12 +12595,15 @@ class TrainerWindow(QMainWindow):
 
             # Run MegaDetector
             try:
+                print(f"[AI DEBUG] Running MegaDetector on: {path}")
                 new_boxes = self._detect_boxes_megadetector(path, conf_thresh=0.2)
+                print(f"[AI DEBUG] Detected {len(new_boxes) if new_boxes else 0} boxes")
                 if new_boxes:
-                    # Save boxes to database
-                    for box in new_boxes:
-                        self.db.add_box(pid, box["label"], box["x1"], box["y1"], box["x2"], box["y2"],
-                                       box.get("confidence", 0))
+                    # Save boxes to database (get existing non-AI boxes first, then add new AI boxes)
+                    existing_boxes = self.db.get_boxes(pid)
+                    non_ai_boxes = [b for b in existing_boxes if not str(b.get("label", "")).startswith("ai_")]
+                    all_boxes = non_ai_boxes + new_boxes
+                    self.db.set_boxes(pid, all_boxes)
                     detected_count += len(new_boxes)
 
                     # Run species classifier
@@ -11636,8 +12618,9 @@ class TrainerWindow(QMainWindow):
                                 y1 = int(box["y1"] * h)
                                 x2 = int(box["x2"] * w)
                                 y2 = int(box["y2"] * h)
+                                pixel_area = (x2 - x1) * (y2 - y1)
                                 crop = img.crop((x1, y1, x2, y2))
-                                label, conf = self.ai_suggester.predict(crop)
+                                label, conf = self.ai_suggester.predict(crop, pixel_area=pixel_area)
                                 if label:
                                     self.db.set_suggested_tag(pid, label, conf)
                                     break  # Use first detection for suggestion
@@ -11663,6 +12646,130 @@ class TrainerWindow(QMainWindow):
         else:
             msg = f"Processed {processed} photo(s).\nDetected {detected_count} subject(s)."
         QMessageBox.information(self, "Re-run AI", msg)
+
+    def detect_boxes_for_tagged_photos(self):
+        """Run MegaDetector on photos that have species tags but no detection boxes."""
+        # Valid animal species
+        ANIMAL_SPECIES = {
+            'Armadillo', 'Bobcat', 'Chipmunk', 'Coyote', 'Deer', 'Dog', 'Fox',
+            'Ground Hog', 'House Cat', 'Opossum', 'Other', 'Other Bird', 'Otter',
+            'Quail', 'Rabbit', 'Raccoon', 'Skunk', 'Squirrel', 'Turkey', 'Turkey Buzzard',
+            'Flicker'
+        }
+
+        # Find photos with animal species tags but no boxes
+        photos = self.db.get_all_photos(include_archived=True)
+        needs_detection = []
+
+        for p in photos:
+            pid = p['id']
+            tags = set(self.db.get_tags(pid))
+            boxes = self.db.get_boxes(pid)
+
+            animal_tags = tags & ANIMAL_SPECIES
+            if animal_tags and not boxes:
+                needs_detection.append(p)
+
+        if not needs_detection:
+            QMessageBox.information(self, "Detect Boxes",
+                "All tagged photos already have detection boxes.")
+            return
+
+        # Confirm with user
+        reply = QMessageBox.question(
+            self, "Detect Boxes",
+            f"Found {len(needs_detection)} photos with species tags but no detection boxes.\n\n"
+            f"Run MegaDetector on these photos to add boxes?\n"
+            f"(This may take a while)\n\n"
+            f"A backup will be created before starting.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Create backup before batch operation
+        self.statusBar().showMessage("Creating backup before batch operation...")
+        QApplication.processEvents()
+        if not self.db.backup_before_batch_operation():
+            reply = QMessageBox.warning(
+                self, "Backup Failed",
+                "Could not create backup. Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Progress dialog
+        progress = QProgressDialog("Running MegaDetector...", "Cancel", 0, len(needs_detection), self)
+        progress.setWindowTitle("Detecting Boxes")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        processed = 0
+        detected_count = 0
+        errors = 0
+        cancelled = False
+
+        # Use transaction for batch writes
+        try:
+            self.db.begin_transaction()
+
+            for i, photo in enumerate(needs_detection):
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+
+                progress.setValue(i)
+                progress.setLabelText(f"Processing {i+1}/{len(needs_detection)}...")
+                QApplication.processEvents()
+
+                pid = photo.get("id")
+                path = photo.get("file_path")
+
+                if not path or not os.path.exists(path):
+                    errors += 1
+                    continue
+
+                try:
+                    new_boxes = self._detect_boxes_megadetector(path, conf_thresh=0.2)
+                    if new_boxes:
+                        self.db.set_boxes(pid, new_boxes)
+                        detected_count += len(new_boxes)
+                    processed += 1
+
+                    # Commit every 50 photos to avoid losing too much work
+                    if processed % 50 == 0:
+                        self.db.commit_transaction()
+                        self.db.begin_transaction()
+
+                except Exception as e:
+                    print(f"[AI] Error detecting boxes for {path}: {e}")
+                    errors += 1
+
+            # Final commit
+            self.db.commit_transaction()
+
+        except Exception as e:
+            logger.error(f"Batch operation failed: {e}")
+            self.db.rollback_transaction()
+            QMessageBox.critical(self, "Error", f"Batch operation failed: {e}\n\nChanges have been rolled back.")
+            progress.close()
+            return
+
+        progress.close()
+
+        # Refresh UI
+        self.photos = self._sorted_photos(self.db.get_all_photos())
+        self._populate_photo_list()
+        self.load_photo()
+
+        # Show results
+        msg = f"Processed {processed} photos.\n"
+        msg += f"Added {detected_count} detection boxes.\n"
+        if errors:
+            msg += f"Errors: {errors}"
+        QMessageBox.information(self, "Detect Boxes", msg)
 
     def run_ai_boxes_all(self):
         """Run detector across all photos in the database."""
@@ -13193,6 +14300,10 @@ class TrainerWindow(QMainWindow):
                 return
             data = item.data(Qt.ItemDataRole.UserRole)
             pid = data["photo"]["id"]
+            # Log the confirmation to audit trail
+            tags = self.db.get_tags(pid)
+            if tags:
+                self.db.log_tag_confirmation(pid, tags)
             session_reviewed.add(pid)
             print(f"[Mislabel] Added {pid} to session_reviewed, now {len(session_reviewed)} items")
             # Save immediately
@@ -13545,8 +14656,12 @@ class TrainerWindow(QMainWindow):
                                 continue
                             rect = QRectF(b["x1"] * w, b["y1"] * h, (b["x2"] - b["x1"]) * w, (b["y2"] - b["y1"]) * h)
                             lbl = b.get("label", "")
-                            if str(lbl).startswith("ai_"):
+                            if str(lbl) == "ai_deer_head":
+                                pen = QPen(Qt.GlobalColor.magenta)
+                            elif str(lbl).startswith("ai_"):
                                 pen = QPen(Qt.GlobalColor.yellow)
+                            elif str(lbl) == "deer_head":
+                                pen = QPen(Qt.GlobalColor.red)
                             else:
                                 pen = QPen(Qt.GlobalColor.green)
                             pen.setWidth(4)
@@ -13619,6 +14734,9 @@ class TrainerWindow(QMainWindow):
             tags = data.get("_tags", [])
             if not pid:
                 return
+            # Log the confirmation to audit trail
+            if tags:
+                self.db.log_tag_confirmation(pid, tags)
             self.db.set_suggested_tag(pid, None, None)
             self.db.mark_claude_reviewed(pid)
             tag_text = ", ".join(tags) if tags else "kept"
@@ -13698,27 +14816,8 @@ class TrainerWindow(QMainWindow):
         # Handle navigation to specific photo if Properties was clicked
         if navigate_to_photo[0]:
             target_pid = navigate_to_photo[0]
-            # Refresh photos from database INCLUDING archived (target may be archived)
-            self.photos = self._sorted_photos(self.db.search_photos(include_archived=True))
-            # Find the target photo index
-            target_index = None
-            for i, p in enumerate(self.photos):
-                if p.get("id") == target_pid:
-                    target_index = i
-                    break
-            if target_index is not None:
-                # Reset filters to ensure target photo is visible
-                self.collection_filter_combo.blockSignals(True)
-                self.collection_filter_combo.setCurrentIndex(0)  # "All Collections"
-                self.collection_filter_combo.blockSignals(False)
-                if hasattr(self.species_filter_combo, 'select_all'):
-                    self.species_filter_combo.select_all()
-                self.archive_filter_combo.setCurrentText("All Photos")
-                # Navigate to photo
-                self.current_index = target_index
-                self._rebuild_photo_list()
-                self._sync_list_selection()
-                self.load_photo()
+            # Use the dedicated navigation method
+            self._navigate_to_photo_by_id(target_pid)
 
     def open_stamp_reader(self):
         """Open the stamp reader for pattern-based OCR."""
