@@ -257,6 +257,37 @@ python training/export_to_app.py --detector outputs/detector.onnx --labels outpu
 
 ---
 
+## Data Architecture (Jan 26, 2026)
+
+### Species Labels vs AI Suggestions
+
+Labels and suggestions are stored at the **box level**, not photo level:
+
+| Column | Table | Purpose |
+|--------|-------|---------|
+| `species` | annotation_boxes | User-confirmed species label |
+| `ai_suggested_species` | annotation_boxes | AI prediction (separate from user label) |
+| `suggested_tag` | photos | Photo-level suggestion (backwards compat only) |
+
+**Important:** When running AI, predictions are made per-box and stored in `ai_suggested_species`. The `suggested_tag` on photos is also set for backwards compatibility but box-level is the source of truth.
+
+### Verification Photos
+
+Verification photos are small test shots taken by the camera to confirm operation:
+
+- **Detection:** File size < 50 KB AND taken at exactly 9:00:00 AM
+- **Handling:** Auto-labeled as species="Verification", subject boxes deleted
+- **Note:** Small files NOT at 9 AM are kept as regular photos (could be distant wildlife)
+
+### Database Indexes
+
+Critical indexes for performance:
+- `idx_boxes_photo_id` on annotation_boxes(photo_id) - speeds up box loading
+- `idx_boxes_label` on annotation_boxes(label)
+- `idx_photos_file_hash` on photos(file_hash)
+
+---
+
 ## Current State (Jan 7, 2026)
 
 **GitHub:** https://github.com/cabbp3/Trail-Camera-Software
@@ -319,7 +350,47 @@ When the user is looking for something to run overnight or while away:
 
 ---
 
-## Recent Session (Jan 19, 2026)
+## Recent Session (Jan 23-24, 2026)
+
+### Fixed Photo Timestamps (Android showing wrong times)
+
+**Problem:** Android app showed different times than desktop for the same photos. Desktop showed correct capture times, Android showed ~30 min off.
+
+**Root Cause:** GitHub workflow's EXIF extraction was failing to read `DateTimeOriginal` from the EXIF sub-IFD. It fell back to `DateTime` tag which contains upload/processing time, not capture time.
+
+**Fixes Applied:**
+
+1. **EXIF extraction fix** (`scripts/cuddelink_to_r2.py`, `image_processor.py`)
+   - Now properly accesses EXIF IFD using `get_ifd(0x8769)` to read `DateTimeOriginal`
+   - Falls back to `_getexif()` for older Pillow versions
+
+2. **Supabase save fix** (`scripts/cuddelink_to_r2.py`)
+   - Upsert with `on_conflict=file_hash` was silently failing (no unique constraint)
+   - Added unique constraint on `file_hash` in Supabase
+   - Restored upsert after constraint added
+
+3. **Backfilled all dates** - Ran script to update all 8324 photos in Supabase with correct dates from local SQLite
+
+**Files Changed:**
+- `scripts/cuddelink_to_r2.py` - EXIF fix + Supabase save fix
+- `image_processor.py` - EXIF fix for desktop consistency
+- `tools/fix_supabase_dates.py` - New utility script
+
+**Database Change:**
+```sql
+ALTER TABLE photos_sync ADD CONSTRAINT photos_sync_file_hash_unique UNIQUE (file_hash);
+```
+
+### Mobile App v1.0.5
+
+- Bumped version to 1.0.5+6
+- Built and sideloaded to phone
+- Built AAB for Google Play upload
+- Updated Data Safety form (Photos collected for app functionality)
+
+---
+
+## Session (Jan 19, 2026)
 
 ### Auto-Sync to Supabase with Offline Queueing
 
