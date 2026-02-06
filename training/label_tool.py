@@ -24,6 +24,8 @@ import updater
 import user_config
 from sync_manager import SyncManager
 from r2_upload_queue import R2UploadManager
+from speciesnet_wrapper import SpeciesNetWrapper
+from speciesnet_download_dialog import SpeciesNetDownloadDialog
 
 logger = logging.getLogger(__name__)
 
@@ -667,12 +669,12 @@ class AIWorker(QThread):
     finished_all = pyqtSignal(dict)  # counts dict with all stats
     error = pyqtSignal(str)  # error message
 
-    def __init__(self, photos: list, db, suggester, detector_getter, parent=None, options=None):
+    def __init__(self, photos: list, db, speciesnet_wrapper, buckdoe_suggester=None, parent=None, options=None):
         super().__init__(parent)
         self.photos = photos
         self.db = db
-        self.suggester = suggester
-        self._get_detector = detector_getter
+        self.speciesnet = speciesnet_wrapper
+        self.buckdoe_suggester = buckdoe_suggester
         self._cancelled = False
         # Options control which AI steps to run
         self.options = options or {
@@ -694,24 +696,14 @@ class AIWorker(QThread):
             self.error.emit(f"AI processing crashed: {e}")
 
     def _run_impl(self):
-        """Internal implementation of run()."""
+        """Internal implementation of run() — uses SpeciesNet for detection + classification."""
         total = len(self.photos)
         counts = {"detect": 0, "species": 0, "heads": 0, "sex": 0}
-
-        # Get detector if needed for any detection step
-        detector, names = None, None
-        if self.options.get("detect_boxes") or self.options.get("deer_head_boxes"):
-            try:
-                detector, names = self._get_detector()
-            except Exception as e:
-                self.error.emit(f"Failed to load detector: {e}")
-                return
 
         for i, p in enumerate(self.photos):
             if self._cancelled:
                 break
 
-            # Emit progress
             self.progress.emit(i, total, f"Processing {i + 1} of {total}...")
 
             result = {
@@ -726,103 +718,86 @@ class AIWorker(QThread):
 
             try:
                 pid = p.get("id")
-                crop = None
+                file_path = p.get("file_path")
 
                 # Step 0: Check if this is a verification photo (small file < 15 KB)
-                # Verification photos are test shots that shouldn't go through species ID
-                file_path = p.get("file_path")
                 if file_path and os.path.exists(file_path):
                     try:
                         size_kb = os.path.getsize(file_path) / 1024
-                        if size_kb < 15:  # Verification photos are typically 6-7 KB
+                        if size_kb < 15:
                             self.db.set_suggested_tag(pid, "Verification", 0.95)
                             result["species"] = "Verification"
                             result["species_conf"] = 0.95
                             counts["species"] += 1
                             self.photo_processed.emit(result)
-                            continue  # Skip remaining steps for verification photos
-                    except Exception:
-                        pass  # If we can't check size, continue with normal processing
-
-                # Step 1: Detect subject boxes (MegaDetector)
-                if self.options.get("detect_boxes"):
-                    if self._ensure_detection_boxes(p, detector, names):
-                        result["boxes_added"] = True
-                        counts["detect"] += 1
-
-                # Step 2: Species ID (per-box)
-                if self.options.get("species_id"):
-                    boxes = self.db.get_boxes(pid) if pid else []
-                    has_person = any(b.get("label") == "ai_person" for b in boxes)
-                    has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
-                    animal_boxes = [b for b in boxes if b.get("label") in ("ai_animal", "ai_subject", "subject")]
-
-                    label = None
-                    conf = None
-
-                    if has_person:
-                        label, conf = "Person", 0.95
-                    elif has_vehicle:
-                        label, conf = "Vehicle", 0.95
-                    elif animal_boxes:
-                        # Run species prediction on EACH animal box
-                        first_suggestion = None
-                        for box in animal_boxes:
-                            box_id = box.get("id")
-                            crop, pixel_area = self._crop_for_box(p, box)
-                            if crop and self.suggester:
-                                res = self.suggester.predict(str(crop), pixel_area=pixel_area)
-                                if res:
-                                    box_label, box_conf = res
-                                    if box_label in ("Empty", "Other"):
-                                        box_label = "Unknown"
-                                        box_conf = 0.5
-                                    # Store at box level
-                                    if box_id:
-                                        self.db.set_box_ai_suggestion(box_id, box_label, box_conf)
-                                    if first_suggestion is None:
-                                        first_suggestion = (box_label, box_conf)
-                                try:
-                                    Path(crop).unlink(missing_ok=True)
-                                except Exception:
-                                    pass
-                        if first_suggestion:
-                            label, conf = first_suggestion
-                    else:
-                        label, conf = "Empty", 0.95
-
-                    if label and pid:
-                        self.db.set_suggested_tag(pid, label, conf)
-                        result["species"] = label
-                        result["species_conf"] = conf
-                        counts["species"] += 1
-
-                        # Step 3 & 4: If Deer, handle head detection and buck/doe
-                        if label == "Deer":
-                            if self.options.get("deer_head_boxes"):
-                                if self._add_deer_head_boxes(p, detector, names):
-                                    result["heads_added"] = True
-                                    counts["heads"] += 1
-
-                            if self.options.get("buck_doe") and self.suggester and self.suggester.buckdoe_ready:
-                                # Predict buck/doe for each deer box
-                                sex_count = self._predict_sex_for_boxes(p)
-                                if sex_count > 0:
-                                    counts["sex"] += sex_count
-                                    result["sex"] = "predicted"
-                                    result["sex_conf"] = sex_count
-
-                # Clean up crop
-                if crop:
-                    try:
-                        Path(crop).unlink(missing_ok=True)
+                            continue
                     except Exception:
                         pass
+
+                if not file_path or not os.path.exists(file_path) or not self.speciesnet:
+                    self.photo_processed.emit(result)
+                    continue
+
+                # SpeciesNet: detection + classification in one call
+                sn_result = self.speciesnet.detect_and_classify(file_path)
+                boxes = sn_result.get("detections", [])
+                app_species = sn_result.get("app_species")
+                score = sn_result.get("prediction_score", 0)
+
+                # Store boxes if photo doesn't have any yet
+                has_existing_boxes = False
+                try:
+                    has_existing_boxes = self.db.has_detection_boxes(pid)
+                except Exception:
+                    pass
+
+                if not has_existing_boxes and boxes:
+                    self.db.set_boxes(pid, boxes)
+                    result["boxes_added"] = True
+                    counts["detect"] += 1
+
+                # Determine photo-level label from detections
+                check_boxes = self.db.get_boxes(pid) if pid else boxes
+                has_person = any(b.get("label") == "ai_person" for b in check_boxes)
+                has_vehicle = any(b.get("label") == "ai_vehicle" for b in check_boxes)
+                animal_boxes = [b for b in check_boxes if b.get("label") in ("ai_animal", "ai_subject", "subject")]
+
+                label, conf = None, None
+
+                if has_person:
+                    label, conf = "Person", 0.95
+                elif has_vehicle:
+                    label, conf = "Vehicle", 0.95
+                elif animal_boxes and app_species and app_species not in ("Empty",):
+                    label, conf = app_species, score
+                    # Set per-box species suggestion
+                    for box in animal_boxes:
+                        box_id = box.get("id")
+                        if box_id:
+                            self.db.set_box_ai_suggestion(box_id, app_species, score)
+                elif not check_boxes:
+                    label, conf = "Empty", 0.95
+                else:
+                    label, conf = app_species or "Empty", score or 0.95
+
+                if label and pid:
+                    self.db.set_suggested_tag(pid, label, conf)
+                    result["species"] = label
+                    result["species_conf"] = conf
+                    counts["species"] += 1
+
+                # Buck/doe for deer
+                if label == "Deer" and self.options.get("buck_doe"):
+                    if self.buckdoe_suggester and self.buckdoe_suggester.buckdoe_ready:
+                        sex_count = self._predict_sex_for_boxes(p)
+                        if sex_count > 0:
+                            counts["sex"] += sex_count
+                            result["sex"] = "predicted"
+                            result["sex_conf"] = sex_count
 
             except Exception as e:
                 logger.warning(f"AI processing failed for photo {p.get('id')}: {e}")
 
-            # Emit result for this photo
             self.photo_processed.emit(result)
 
         self.finished_all.emit(counts)
@@ -1031,7 +1006,7 @@ class AIWorker(QThread):
         Returns the number of boxes that got sex predictions.
         Stores predictions at box level using set_box_sex.
         """
-        if not self.suggester or not self.suggester.buckdoe_ready:
+        if not self.buckdoe_suggester or not self.buckdoe_suggester.buckdoe_ready:
             return 0
 
         pid = photo.get("id")
@@ -1114,7 +1089,7 @@ class AIWorker(QThread):
                     img.crop((x1, y1, x2, y2)).save(crop_path, "JPEG", quality=90)
 
                     # Run prediction
-                    sex_res = self.suggester.predict_sex(str(crop_path))
+                    sex_res = self.buckdoe_suggester.predict_sex(str(crop_path))
                     if sex_res:
                         sex_label, sex_conf = sex_res
                         self.db.set_box_sex(deer_box["id"], sex_label, sex_conf)
@@ -1461,6 +1436,10 @@ class TrainerWindow(QMainWindow):
         # Don't overwrite labels.txt - it should match the trained model's classes
         # self._write_species_labels_file()
         self.suggester = CombinedSuggester()
+        self.speciesnet_wrapper = SpeciesNetWrapper(
+            state=user_config.get_speciesnet_state(),
+            geofence=True,
+        )
         self.auto_enhance_all = True
         self.photos = self._sorted_photos(self.db.get_all_photos())
         # Start at most recent photo (photos are sorted oldest to newest)
@@ -2360,6 +2339,9 @@ class TrainerWindow(QMainWindow):
         settings_menu.addSeparator()
         auto_archive_action = settings_menu.addAction("Auto-Archive Settings...")
         auto_archive_action.triggered.connect(self._show_auto_archive_settings)
+        settings_menu.addSeparator()
+        ai_model_settings_action = settings_menu.addAction("AI Model Settings...")
+        ai_model_settings_action.triggered.connect(self._show_ai_model_settings)
         menubar.addMenu(settings_menu)
 
         # Help menu
@@ -3850,6 +3832,54 @@ class TrainerWindow(QMainWindow):
             "Startup preferences have been reset.\n\n"
             "The app will ask you about cloud sync and CuddeLink downloads next time."
         )
+
+    def _show_ai_model_settings(self):
+        """Show dialog for configuring AI model settings (SpeciesNet geofencing)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AI Model Settings")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+
+        # SpeciesNet status
+        status_text = "Loaded" if self.speciesnet_wrapper.is_available else "Not loaded"
+        if user_config.is_speciesnet_initialized():
+            status_text += " (models downloaded)"
+        else:
+            status_text += " (models not yet downloaded)"
+        status_label = QLabel(f"SpeciesNet Status: {status_text}")
+        layout.addWidget(status_label)
+
+        layout.addSpacing(10)
+
+        # US State for geofencing
+        state_label = QLabel("US State (for species geofencing):")
+        layout.addWidget(state_label)
+        state_desc = QLabel("Setting your state helps SpeciesNet avoid suggesting\n"
+                           "species not found in your region.")
+        state_desc.setStyleSheet("color: #888;")
+        layout.addWidget(state_desc)
+
+        state_combo = QComboBox()
+        state_combo.addItem("(None - no geofencing)", "")
+        current_state = user_config.get_speciesnet_state()
+        for name, abbr in sorted(user_config.US_STATES.items()):
+            state_combo.addItem(f"{name} ({abbr})", abbr)
+            if abbr == current_state:
+                state_combo.setCurrentIndex(state_combo.count() - 1)
+        layout.addWidget(state_combo)
+
+        layout.addSpacing(10)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_state = state_combo.currentData()
+            user_config.set_speciesnet_state(new_state)
+            self.speciesnet_wrapper.set_state(new_state)
 
     def _show_auto_archive_settings(self):
         """Show dialog for configuring auto-archive after sync."""
@@ -9599,10 +9629,20 @@ class TrainerWindow(QMainWindow):
             return
 
         # Check model availability for selected steps
-        if options["species_id"] and (not self.suggester or not self.suggester.ready):
-            QMessageBox.information(self, "AI Model Not Available",
-                "Species classifier not loaded. Uncheck 'Identify species' or add models/species.onnx")
-            return
+        if options["detect_boxes"] or options["species_id"]:
+            # Ensure SpeciesNet is initialized
+            if not self.speciesnet_wrapper.is_available:
+                if not user_config.is_speciesnet_initialized():
+                    dlg = SpeciesNetDownloadDialog(self.speciesnet_wrapper, parent=self)
+                    if dlg.exec() != QDialog.DialogCode.Accepted:
+                        return
+                    user_config.set_config_value("speciesnet_initialized", True)
+                else:
+                    self.speciesnet_wrapper.initialize()
+                if not self.speciesnet_wrapper.is_available:
+                    QMessageBox.warning(self, "AI Model Not Available",
+                        f"SpeciesNet could not be loaded:\n{self.speciesnet_wrapper.error_message}")
+                    return
 
         if options["buck_doe"] and (not self.suggester or not self.suggester.buckdoe_ready):
             QMessageBox.information(self, "AI Model Not Available",
@@ -9659,15 +9699,7 @@ class TrainerWindow(QMainWindow):
         progress.show()
         QApplication.processEvents()
 
-        # Load detector if needed
-        detector, names = None, None
-        if options["detect_boxes"] or options["deer_head_boxes"]:
-            try:
-                detector, names = self._get_detector_for_suggestions()
-            except Exception as e:
-                progress.close()
-                QMessageBox.warning(self, "AI Error", f"Failed to load detector: {e}")
-                return
+        # SpeciesNet handles detection + classification together
 
         # Set up queue mode for review after processing
         self.queue_mode = True
@@ -9727,80 +9759,79 @@ class TrainerWindow(QMainWindow):
                     except Exception:
                         pass  # If we can't check size, continue with normal processing
 
-                # Step 1: Detect subject boxes (MegaDetector)
-                if options["detect_boxes"] and detector:
-                    if self._ensure_detection_boxes(p, detector, names):
-                        counts["detect"] += 1
+                # Steps 1+2: SpeciesNet detection + classification
+                if (options["detect_boxes"] or options["species_id"]) and self.speciesnet_wrapper and self.speciesnet_wrapper.is_available:
+                    sn_result = self.speciesnet_wrapper.detect_and_classify(file_path)
+                    sn_boxes = sn_result.get("detections", [])
+                    app_species = sn_result.get("app_species")
+                    score = sn_result.get("prediction_score", 0)
 
-                # Step 2: Species ID
-                if options["species_id"]:
-                    boxes = self.db.get_boxes(pid) if pid else []
-                    has_person = any(b.get("label") == "ai_person" for b in boxes)
-                    has_vehicle = any(b.get("label") == "ai_vehicle" for b in boxes)
-                    has_animal = any(b.get("label") in ("ai_animal", "ai_subject", "subject") for b in boxes)
+                    # Store boxes if photo doesn't have any yet
+                    if options["detect_boxes"] and sn_boxes:
+                        has_existing = False
+                        try:
+                            has_existing = self.db.has_detection_boxes(pid)
+                        except Exception:
+                            pass
+                        if not has_existing:
+                            self.db.set_boxes(pid, sn_boxes)
+                            counts["detect"] += 1
 
-                    label = None
-                    conf = None
+                    if options["species_id"]:
+                        check_boxes = self.db.get_boxes(pid) if pid else sn_boxes
+                        has_person = any(b.get("label") == "ai_person" for b in check_boxes)
+                        has_vehicle = any(b.get("label") == "ai_vehicle" for b in check_boxes)
+                        animal_boxes = [b for b in check_boxes if b.get("label") in ("ai_animal", "ai_subject", "subject")]
 
-                    if has_person:
-                        label, conf = "Person", 0.95
-                    elif has_vehicle:
-                        label, conf = "Vehicle", 0.95
-                    elif has_animal:
-                        crop, pixel_area = self._best_crop_for_photo(p)
-                        path = str(crop) if crop else p.get("file_path")
-                        res = self.suggester.predict(path, pixel_area=pixel_area) if self.suggester else None
-                        if res:
-                            label, conf = res
-                            if label in ("Empty", "Other"):
-                                label = "Unknown"
-                                conf = 0.5
-                    else:
-                        label, conf = "Empty", 0.95
+                        label = None
+                        conf = None
 
-                    if label and pid:
-                        self.db.set_suggested_tag(pid, label, conf)
-                        counts["species"] += 1
+                        if has_person:
+                            label, conf = "Person", 0.95
+                        elif has_vehicle:
+                            label, conf = "Vehicle", 0.95
+                        elif animal_boxes and app_species and app_species not in ("Empty",):
+                            label, conf = app_species, score
+                            for box in animal_boxes:
+                                box_id = box.get("id")
+                                if box_id:
+                                    self.db.set_box_ai_suggestion(box_id, app_species, score)
+                        elif not check_boxes:
+                            label, conf = "Empty", 0.95
+                        else:
+                            label, conf = app_species or "Empty", score or 0.95
 
-                        # Add to queue for review
-                        if pid not in self.queue_photo_ids:
-                            self.queue_photo_ids.append(pid)
-                            self.queue_data[pid] = {
-                                "species": label,
-                                "conf": conf,
-                                "sex": None,
-                                "sex_conf": 0
-                            }
+                        if label and pid:
+                            self.db.set_suggested_tag(pid, label, conf)
+                            counts["species"] += 1
 
-                        # Step 3 & 4: If Deer, handle head detection and buck/doe
-                        if label == "Deer":
-                            if options["deer_head_boxes"] and detector:
-                                self._add_deer_head_boxes(p, detector, names)
-                                counts["heads"] += 1
+                            # Add to queue for review
+                            if pid not in self.queue_photo_ids:
+                                self.queue_photo_ids.append(pid)
+                                self.queue_data[pid] = {
+                                    "species": label,
+                                    "conf": conf,
+                                    "sex": None,
+                                    "sex_conf": 0
+                                }
 
-                            if options["buck_doe"] and self.suggester and self.suggester.buckdoe_ready:
-                                head_crop = self._best_head_crop_for_photo(p)
-                                if head_crop:
-                                    sex_res = self.suggester.predict_sex(str(head_crop))
-                                    if sex_res:
-                                        sex_label, sex_conf = sex_res
-                                        self.db.set_suggested_sex(pid, sex_label, sex_conf)
-                                        counts["sex"] += 1
-                                        # Update queue data
-                                        if pid in self.queue_data:
-                                            self.queue_data[pid]["sex"] = sex_label
-                                            self.queue_data[pid]["sex_conf"] = sex_conf
-                                    try:
-                                        Path(head_crop).unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
-
-                # Clean up crop
-                if crop:
-                    try:
-                        Path(crop).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                            # Buck/doe for deer
+                            if label == "Deer":
+                                if options["buck_doe"] and self.suggester and self.suggester.buckdoe_ready:
+                                    head_crop = self._best_head_crop_for_photo(p)
+                                    if head_crop:
+                                        sex_res = self.suggester.predict_sex(str(head_crop))
+                                        if sex_res:
+                                            sex_label, sex_conf = sex_res
+                                            self.db.set_suggested_sex(pid, sex_label, sex_conf)
+                                            counts["sex"] += 1
+                                            if pid in self.queue_data:
+                                                self.queue_data[pid]["sex"] = sex_label
+                                                self.queue_data[pid]["sex_conf"] = sex_conf
+                                        try:
+                                            Path(head_crop).unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
 
             except Exception as e:
                 logger.warning(f"AI processing failed for photo {p.get('id')}: {e}")
@@ -10591,9 +10622,20 @@ class TrainerWindow(QMainWindow):
             QMessageBox.information(self, "AI Processing", "AI processing is already running.")
             return
 
-        if not self.suggester or not self.suggester.ready:
-            QMessageBox.information(self, "AI Model Not Available", "AI model not loaded.")
-            return
+        # Ensure SpeciesNet is initialized (download models on first use)
+        if not self.speciesnet_wrapper.is_available:
+            if not user_config.is_speciesnet_initialized():
+                dlg = SpeciesNetDownloadDialog(self.speciesnet_wrapper, parent=self)
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    return
+                user_config.set_config_value("speciesnet_initialized", True)
+            else:
+                # Models downloaded previously, just need to load
+                self.speciesnet_wrapper.initialize()
+            if not self.speciesnet_wrapper.is_available:
+                QMessageBox.warning(self, "AI Model Not Available",
+                    f"SpeciesNet could not be loaded:\n{self.speciesnet_wrapper.error_message}")
+                return
 
         # Get unlabeled photos (skip Verification photos)
         unlabeled_photos = [p for p in self.photos
@@ -10636,8 +10678,8 @@ class TrainerWindow(QMainWindow):
         self.ai_worker = AIWorker(
             photos=unlabeled_photos,
             db=self.db,
-            suggester=self.suggester,
-            detector_getter=self._get_detector_for_suggestions,
+            speciesnet_wrapper=self.speciesnet_wrapper,
+            buckdoe_suggester=self.suggester,
             parent=self
         )
         self.ai_worker.progress.connect(self._on_ai_progress)

@@ -789,6 +789,14 @@ class TrailCamDatabase:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN sex TEXT")
         if "sex_conf" not in cols:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN sex_conf REAL")
+        # Per-box AI species suggestion (from SpeciesNet or ONNX classifier)
+        if "ai_suggested_species" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN ai_suggested_species TEXT")
+        # Per-box confirmed species and confidence
+        if "species" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN species TEXT")
+        if "species_conf" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN species_conf REAL")
         self.conn.commit()
 
     def _ensure_sync_tracking(self):

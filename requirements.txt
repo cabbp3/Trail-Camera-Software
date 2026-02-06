@@ -8,3 +8,4 @@ onnxruntime>=1.16.0
 pytesseract>=0.3.10
 # supabase package removed - using supabase_rest.py (REST API with requests only)
 boto3
+speciesnet>=5.0.0
