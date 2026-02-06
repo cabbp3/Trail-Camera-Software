@@ -13,7 +13,10 @@
 
 | ID | Task | Status | Started |
 |----|------|--------|---------|
-| M4X9 | Mobile app refactoring - split supabase_service.dart | In Progress | Jan 20 |
+| T4R2 | Species classifier training - paused at epoch 11/50 (93.8% best) | Paused | Jan 23 |
+
+*(Completed tasks moved to Recently Completed section)*
+
 
 ---
 
@@ -139,6 +142,20 @@ Comprehensive audit across desktop and mobile apps. Items below are prioritized 
 
 ## Recently Completed
 
+- **(Feb 2) CRITICAL: Fixed labels being lost** - Three bugs causing label loss: (1) `pull_from_supabase()` in database.py was overwriting local species/sex with NULL from cloud - fixed with COALESCE; (2) Buck/doe queue coordinate matching failed after `set_boxes()` reassigned IDs - fixed fallback logic in 4 functions; (3) Box labels weren't creating photo tags - synced 2,300+ missing Deer tags and 3,000+ Buck/Doe tags. Labels now persist through sync.
+- (Feb 2) Tagged all 288 photos at exactly 9:00 AM as "Verification" (camera test shots)
+- (Jan 26) Database duplicate cleanup - migrated 125 deer_metadata + 3 boxes + 1 tag, deleted 171 duplicate photos and 85 orphaned `.cuddelink_tmp` records. Fixed imports to skip temp folders (`_find_image_files()`, `scan_folders()`). Freed 14 MB.
+- (Jan 26) Cloud sync SQL fix - `since_clause()` was returning tuple but used directly in f-strings at 4 locations in `database.py`. Fixed to properly unpack `(clause, params)`.
+- (Jan 26) Mobile app landing page - added bottom navigation (Photos, Account, Settings), updated splash_screen.dart to navigate to HomeScreen
+- (Jan 26) Individual buck identification roadmap - created `docs/individual_buck_identification.md` documenting multi-feature discrimination approach, annotation strategy, data model, ML architecture for long-term individual deer tracking
+- (Jan 26) Cloud sync fixes - fixed incremental pull (added .gt() method to supabase_rest.py), fixed timezone format (+00:00 suffix), added deletion sync, added full photo download option on startup
+- (Jan 26) [B7X4] Box-level species suggestions architecture fix - AI pipeline was storing suggestions at photo level instead of per-box. Fixed AIWorker, rerun_ai_current_photo, and rerun_ai_on_selection to store `ai_suggested_species` on each annotation_box. Added `db.set_box_ai_suggestion()` method. Re-ran AI on 3,575 boxes without labels. Added missing indexes (idx_boxes_photo_id, idx_boxes_label, idx_photos_file_hash).
+- (Jan 26) [B7X4] Verification photo detection - small files (<50KB) taken at exactly 9:00:00 AM are camera test shots. Auto-labeled 266 as "Verification" and deleted their subject boxes. Non-9AM small files kept as regular photos with species suggestions.
+- (Jan 22) [D8K3] Desktop cleanup + database audit - deleted site_clustering.py (568 lines dead code), updated requirements.txt (removed openpyxl, added pytesseract), converted print() to logger in 4 utility files. Database audit: integrity checks passed, cleaned 38 orphaned records via WAL checkpoint, verified audit log matches DB (99.88% accuracy, 11 unlogged tags from Supabase sync).
+- (Jan 22) [P2K7] Pixel area confidence scaling - trained species model v5.0 (92.8% test accuracy), added pixel area logging during training, wired up confidence scaling in ai_suggester.py and label_tool.py. Small detection boxes now get reduced confidence scores.
+- (Jan 22) [X7MD] Fixed MegaDetector disappearing - fixed broken venv activate script (folder was renamed), moved model to persistent `~/.trailcam/md_v5a.0.1.pt` instead of temp folder, added error tracking with `is_available` and `error_message` properties.
+- (Jan 21) [C3H0] Auto-archive feature - Settings → Auto-Archive in desktop (Settings menu) and mobile (gear icon). Archives photos after sync that don't match selected species (Bucks Only or custom). Favorites and unlabeled photos always kept.
+- (Jan 20) [M4X9] Mobile app refactoring - split supabase_service.dart (1,363 lines) into deer_service.dart (280 lines) and label_service.dart (340 lines), now 655 lines
 - (Jan 20) [K7P2] Desktop auto-pull from cloud - checks for new photos in Supabase on startup, prompts user to download thumbnails from R2 with progress bar, menu option under Tools > Cloud Sync
 - (Jan 20) [C3H0] Fixed annotation_boxes sync in database.py
 - (Jan 20) Comprehensive code audit across desktop and mobile apps - no changes made, findings documented above

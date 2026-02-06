@@ -162,15 +162,16 @@ cd /Users/brookebratcher/Desktop/trailcam_mobile
 
 ## Mobile App TODO
 
-### Offline Mode
-- Cache photos locally for viewing without internet
-- Download photos on demand or in bulk
-- Sync labels/changes when back online
+### Offline Mode - DONE (Jan 22, 2026)
+- ✅ Cache photos locally for viewing without internet
+- ✅ Download photos on demand (pin icon on individual photos)
+- ✅ Toggle offline mode (cloud icon in app bar)
+- ✅ Load cached photos when offline
 
-### Upload Photos from Phone
-- Allow taking photos with phone camera or selecting from gallery
-- Upload directly to R2 with metadata
-- Useful for photos not from trail cameras (scouting, food plots, etc.)
+### Upload Photos from Phone - DONE (Jan 22, 2026)
+- ✅ Select photos from gallery (no camera access needed)
+- ✅ Upload directly to R2 with metadata
+- ✅ Single or multiple photo selection
 
 ### Desktop Auto-Sync from Cloud
 - Merge "Pull labels" and "Pull photos" into single auto-sync on app open
@@ -178,3 +179,79 @@ cd /Users/brookebratcher/Desktop/trailcam_mobile
 - Pull new photo records from Supabase that don't exist locally
 - Download thumbnails from R2 for cloud-only photos
 - Should be fast/silent if nothing changed
+
+---
+
+## Future: Crowdsourced AI Improvement (Opt-In)
+
+**Goal:** Allow users to optionally contribute data to improve AI models for everyone.
+
+### Features (All Opt-In)
+
+| Feature | What Gets Sent | Benefit |
+|---------|----------------|---------|
+| **Model Training** | Cropped animal images + confirmed labels | Better species/sex detection |
+| **Low Confidence Review** | AI-uncertain crops for user confirmation | Active learning, faster improvement |
+| **Movement Trends** | Anonymized timestamp + region data | Aggregate deer activity patterns |
+
+### Privacy Requirements
+
+1. **Explicit opt-in** - Toggle in Settings: "Help improve AI"
+2. **On-install prompt** - Optional, explains benefits, defaults to OFF
+3. **Granular control** - User can opt into some features but not others
+4. **Anonymization** - No full photos, no exact GPS, no personal info
+5. **Transparency** - Show what data has been contributed
+
+### What Gets Sent (If Opted In)
+
+- Cropped animal images (NOT full photos)
+- User-confirmed species/sex labels
+- Timestamp (date only, not exact time)
+- General region (state/province level, not exact location)
+- Camera site name (optional)
+
+### What NEVER Gets Sent
+
+- Full photos
+- Exact GPS coordinates
+- User identity or account info
+- Photos user hasn't explicitly labeled/confirmed
+
+### Implementation Steps
+
+1. **Phase 1: Backend**
+   - Create `contributions` table in Supabase
+   - API endpoint to receive anonymized crops
+   - Storage for contributed training data
+
+2. **Phase 2: Mobile App**
+   - Settings toggle: "Help improve AI"
+   - On low-confidence prediction: "Is this correct?" prompt
+   - Background upload of confirmed crops (Wi-Fi only)
+
+3. **Phase 3: Desktop App**
+   - Same opt-in toggle
+   - Batch contribution option for confirmed labels
+
+4. **Phase 4: Analytics Dashboard**
+   - Aggregate movement trends (opt-in users only)
+   - Regional activity patterns
+   - Seasonal trends
+
+### Privacy Policy Updates (When Implemented)
+
+Add to privacy policy:
+> **Optional AI Improvement Program**
+>
+> You may opt in to help improve our AI models. If enabled:
+> - Cropped animal images (not full photos) and your confirmed labels are sent to our servers
+> - Data is anonymized - no personal information or exact locations are included
+> - Contributed data may be used to train improved AI models shared with all users
+> - You can opt out anytime in Settings
+> - You can request deletion of your contributed data
+
+### Google Play Data Safety (When Implemented)
+
+Update declaration:
+- Photos: Collected (if opted in), Used for AI improvement
+- Location: Collected (approximate region only, if opted in), Used for aggregate trends

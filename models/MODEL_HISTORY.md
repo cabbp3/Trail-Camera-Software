@@ -8,8 +8,8 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 
 | Model | Version | File | Last Updated |
 |-------|---------|------|--------------|
-| Species Classifier | 4.0 | species.onnx | Jan 1, 2026 |
-| Buck/Doe Classifier | 1.0 | buckdoe.onnx | Dec 2024 |
+| Species Classifier | 6.0 | species.onnx | Jan 27, 2026 |
+| Buck/Doe Classifier | 2.0 | buckdoe.onnx | Jan 26, 2026 |
 | Object Detector | 1.0 | detector.onnx | Dec 2024 |
 
 ---
@@ -17,6 +17,58 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 ## Version History
 
 ### Species Classifier (species.onnx)
+
+#### v6.0 (January 27, 2026)
+- **Training data**: 4,595 detection box crops (after overlap filtering)
+  - Deer: 2,745, Turkey: 1,098, Squirrel: 355, Opossum: 133, Raccoon: 131
+  - Rabbit: 71, Coyote: 28, Bobcat: 20, Fox: 11, House Cat: 3
+- **Split**: 3,521 train / 617 val / 457 test (stratified)
+- **Architecture**: EfficientNet-B2 (upgraded from ResNet18)
+- **Training**: 50 epochs, LR 5e-4, cosine schedule, square-root class weighting
+- **Augmentation**: Horizontal flip, rotation 20°, color jitter, grayscale 25%, random erasing 15%
+- **Accuracy**:
+  - **Test overall: 97.2%** (up from 92.8%)
+  - Deer: 98%, Turkey: 99%, Squirrel: 94%, Raccoon: 100%, Rabbit: 100%
+  - Opossum: 92%, Coyote: 50%, Bobcat: 50%
+  - Fox: 0%, House Cat: 0% (only 1 test sample each - not meaningful)
+- **Key improvements over v5.0**:
+  - Squirrel: 43% → 94% (+51%)
+  - Turkey: 79% → 99% (+20%)
+  - Coyote: 25% → 50% (+25%)
+- **Notes**: Backed up v5.0 as species.onnx.backup_v5
+
+#### v5.0 (January 22, 2026)
+- **Training data**: 5,315 samples (4,073 train / 714 val / 528 test) with bounding boxes, crops extracted on-the-fly
+- **Boxes filtered**: 5,324 → 5,315 (9 removed for IoU > 0.5 overlap)
+- **Classes**: 8 species - Bobcat, Coyote, Deer, Opossum, Rabbit, Raccoon, Squirrel, Turkey
+- **Per-species counts**:
+  - Deer: 4,265
+  - Turkey: 786
+  - Squirrel: 77
+  - Raccoon: 69
+  - Rabbit: 44
+  - Coyote: 42
+  - Bobcat: 21
+  - Opossum: 11
+- **Architecture**: ResNet18 pretrained, fine-tuned, 50 epochs, square-root class weighting
+- **Accuracy**:
+  - Validation: 95.0%
+  - **Test: 92.8%** (held-out data never seen during training)
+- **Per-class TEST accuracy**:
+  - Opossum: 100% (1 test sample)
+  - Rabbit: 100% (4 test samples)
+  - Raccoon: 100% (6 test samples)
+  - Deer: 97%
+  - Turkey: 79%
+  - Bobcat: 50% (2 test samples)
+  - Squirrel: 43%
+  - Coyote: 25% (4 test samples)
+- **Changes from v4.0**:
+  - Removed Fox and House Cat (merged into rare species, not enough samples)
+  - Added pixel area logging during training (median box: 106k px, range: 784 - 15.5M px)
+  - Added pixel area confidence scaling infrastructure to ai_suggester.py (not yet wired up in app)
+  - Stratified train/val/test split ensures each species represented proportionally
+- **Notes**: Rare species (Coyote, Bobcat) have poor accuracy due to limited training data. Consider sourcing additional data from LILA datasets.
 
 #### v4.0 (January 1, 2026)
 - **Training data**: 4,100 samples (3,485 train + 615 val) with bounding boxes, crops extracted on-the-fly
@@ -62,11 +114,32 @@ This file tracks the version history of AI models used in the Trail Camera Softw
 
 ### Buck/Doe Classifier (buckdoe.onnx)
 
+#### v2.0 (January 26, 2026)
+- **Training data**: 1,611 detection box crops (after overlap filtering)
+  - Buck: 1,143 samples
+  - Doe: 468 samples
+  - Class imbalance ratio: 2.4:1
+- **Split**: 1,234 train / 217 val / 160 test (stratified)
+- **Architecture**: EfficientNet-B2 (pretrained, fine-tuned)
+- **Class balancing**:
+  - Inverse frequency weighted sampling
+  - Class-weighted cross-entropy loss
+- **Training**: 50 epochs, cosine LR schedule, heavy augmentation (grayscale 20%, random erasing 10%)
+- **Accuracy**:
+  - **Test overall: 91.9%**
+  - **Test balanced: 92.4%**
+  - Buck: 91.2%
+  - Doe: 93.5%
+- **Improvement over v1.0**: Fixed severe class bias (v1 predicted Buck 97% of time). Now balanced predictions.
+- **Key change**: Trained on MegaDetector detection crops instead of whole photos/head crops
+- **Notes**: Backed up v1.0 as buckdoe.onnx.backup_v1
+
 #### v1.0 (December 2024)
 - **Training data**: Deer head crops from labeled photos
 - **Classes**: Buck, Doe
 - **Architecture**: ResNet18
-- **Notes**: Initial production model
+- **Accuracy**: 84% overall, heavily biased (97% Buck predictions)
+- **Notes**: Initial production model - replaced due to class imbalance issues
 
 ---
 

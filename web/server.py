@@ -374,16 +374,26 @@ class TrailCamHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(404, 'photos.json not found')
             return
 
-        # Serve photos from TrailCamLibrary
+        # Serve photos from TrailCamLibrary (with path traversal protection)
         if path.startswith('/photos/'):
-            photo_path = str(get_library_path()) + path[7:]
-            self.serve_file(photo_path, 'image/jpeg')
+            base_path = get_library_path()
+            requested_path = (base_path / path[8:].lstrip('/')).resolve()
+            # Ensure the resolved path is within the library directory
+            if str(requested_path).startswith(str(base_path.resolve())):
+                self.serve_file(str(requested_path), 'image/jpeg')
+            else:
+                self.send_error(403, 'Access denied')
             return
 
-        # Serve thumbnails
+        # Serve thumbnails (with path traversal protection)
         if path.startswith('/thumbnails/'):
-            thumb_path = str(get_library_path() / '.thumbnails') + path[11:]
-            self.serve_file(thumb_path, 'image/jpeg')
+            base_path = get_library_path() / '.thumbnails'
+            requested_path = (base_path / path[12:].lstrip('/')).resolve()
+            # Ensure the resolved path is within the thumbnails directory
+            if str(requested_path).startswith(str(base_path.resolve())):
+                self.serve_file(str(requested_path), 'image/jpeg')
+            else:
+                self.send_error(403, 'Access denied')
             return
 
         # Default handler

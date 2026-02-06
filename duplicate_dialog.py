@@ -1,11 +1,14 @@
 """
 Dialog for finding and removing duplicate photos.
 """
+import logging
 import os
 import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict
+
+logger = logging.getLogger(__name__)
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QScrollArea, QWidget, QGridLayout, QCheckBox, QGroupBox,
@@ -123,7 +126,7 @@ class DuplicateThumbnailWidget(QWidget):
                                       Qt.TransformationMode.SmoothTransformation)
                 self.image_label.setPixmap(scaled)
         except Exception as e:
-            print(f"Error loading thumbnail: {e}")
+            logger.warning(f"Error loading thumbnail: {e}")
 
 
 class DuplicateDialog(QDialog):
@@ -335,7 +338,7 @@ class DuplicateDialog(QDialog):
                 
             except Exception as e:
                 error_count += 1
-                print(f"Error deleting {photo.get('file_path', 'unknown')}: {e}")
+                logger.error(f"Error deleting {photo.get('file_path', 'unknown')}: {e}")
         
         # Show result
         if error_count > 0:

@@ -1,8 +1,11 @@
 """
 Preview window for viewing and tagging individual photos — PyQt6 version (FINAL)
 """
+import logging
 import os
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -1282,5 +1285,5 @@ class PreviewWindow(QDialog):
                 qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGB888)
                 return QPixmap.fromImage(qimg)
         except Exception as exc:
-            print(f"Auto-enhance failed for {path}: {exc}")
+            logger.warning(f"Auto-enhance failed for {path}: {exc}")
             return QPixmap(path)

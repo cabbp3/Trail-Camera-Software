@@ -9,6 +9,7 @@ Quick reference to find information across all documentation files.
 | File | Purpose | When to Read |
 |------|---------|--------------|
 | `TASKS.md` | **Active work handoff between Claudes** | **First - see what's in progress** |
+| `HANDOFF.md` | System state, known issues, session notes | **Second - current issues & status** |
 | `PLAN.md` | Product roadmap, pending tasks | Planning what to work on |
 | `CLAUDE.md` | Developer commands, architecture | Starting a coding session |
 | `TECHNICAL_AUDIT.md` | System audit, tech debt, bugs | Debugging, scaling, cleanup |
@@ -41,6 +42,7 @@ Quick reference to find information across all documentation files.
 - Species classifier: `AI_REFINEMENT_PLAN.md` → "Stage 2"
 - Buck/doe classifier: `AI_REFINEMENT_PLAN.md` → "Stage 4"
 - Deer head detection: `AI_REFINEMENT_PLAN.md` → "Stage 3"
+- **Individual buck ID**: `docs/individual_buck_identification.md` (long-term roadmap)
 - **Site identification**: `CLAUDE.md` → "Site Identification - Hybrid OCR + Visual Approach"
 - Augmentation experiment: `AI_REFINEMENT_PLAN.md` → "Augmentation Experiment"
 - Future AI ideas: `AI_REFINEMENT_PLAN.md` → "Future AI Ideas"
@@ -98,9 +100,11 @@ done
 | File | Lines | Notes |
 |------|-------|-------|
 | `TASKS.md` | ~25 | **Read first** - active work handoff |
+| `HANDOFF.md` | ~90 | **Read second** - system state & issues |
 | `INDEX.md` | ~100 | Topic index |
 | `PLAN.md` | ~160 | Product roadmap |
 | `README.md` | ~80 | Public-facing only |
 | `AI_REFINEMENT_PLAN.md` | ~400 | AI model details |
 | `CLAUDE.md` | ~900 | Dev context & commands |
 | `TECHNICAL_AUDIT.md` | ~1000 | Deep technical audit |
+| `docs/individual_buck_identification.md` | ~400 | Individual deer ID roadmap |

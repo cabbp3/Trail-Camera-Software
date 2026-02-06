@@ -63,3 +63,4 @@ archive/
 # Cloud credentials (never commit)
 cloud_config.json
 TrailCamOrganizer-Windows.zip
+node_modules/

@@ -20,6 +20,8 @@ def get_resource_path(relative_path: str) -> str:
     # Running in development
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
+import math
+
 try:
     import onnxruntime as ort
     import numpy as np
@@ -30,6 +32,30 @@ except ImportError:
     ort = None
     np = None
     Image = None
+
+# Pixel area quality scaling
+# Boxes smaller than this threshold get reduced confidence
+# Threshold is roughly 224x224 = 50,176 pixels (the training input size)
+QUALITY_PIXEL_THRESHOLD = 50000
+
+
+def pixel_area_quality(pixel_area: int) -> float:
+    """
+    Compute quality factor based on detection box pixel area.
+
+    Returns 1.0 for boxes >= threshold, diminishing sqrt curve for smaller boxes.
+    Smaller boxes have less visual information, so predictions are less reliable.
+
+    Examples:
+        - 50,000 px (224x224): quality = 1.0
+        - 12,500 px (112x112): quality = 0.5
+        - 5,000 px (70x70): quality = 0.32
+    """
+    if pixel_area is None or pixel_area <= 0:
+        return 1.0  # No scaling if area unknown
+    if pixel_area >= QUALITY_PIXEL_THRESHOLD:
+        return 1.0
+    return math.sqrt(pixel_area / QUALITY_PIXEL_THRESHOLD)
 
 # Master list of valid species labels - predictions outside this set are rejected
 # Must match SPECIES_OPTIONS in training/label_tool.py (alphabetized, admin-only changes)
@@ -85,12 +111,26 @@ class SpeciesSuggester:
     def ready(self) -> bool:
         return self._ready
 
-    def predict(self, image_path: str) -> Optional[Tuple[str, float]]:
-        """Predict species from an image. Returns (label, confidence) or None."""
-        if not self.ready or not os.path.exists(image_path):
+    def predict(self, image_or_path, pixel_area: int = None) -> Optional[Tuple[str, float]]:
+        """
+        Predict species from an image. Returns (label, confidence) or None.
+
+        Args:
+            image_or_path: Path to the image file, or a PIL Image object
+            pixel_area: Optional pixel area of the detection box. If provided,
+                       confidence is scaled down for small boxes (less reliable).
+        """
+        if not self.ready:
             return None
         try:
-            img = Image.open(image_path).convert("RGB")
+            # Handle both file paths and PIL Image objects
+            if isinstance(image_or_path, str):
+                if not os.path.exists(image_or_path):
+                    return None
+                img = Image.open(image_or_path).convert("RGB")
+            else:
+                # Assume it's a PIL Image
+                img = image_or_path.convert("RGB") if hasattr(image_or_path, 'convert') else image_or_path
             img = img.resize(self.input_size)
             arr = np.array(img).astype("float32") / 255.0
             # Apply ImageNet normalization (same as training)
@@ -110,6 +150,12 @@ class SpeciesSuggester:
                 print(f"[AI] Rejected invalid prediction: {label}")
                 return None
             conf = float(probs[idx])
+
+            # Scale confidence by pixel area quality factor
+            if pixel_area is not None:
+                quality = pixel_area_quality(pixel_area)
+                conf = conf * quality
+
             return label, conf
         except Exception as exc:
             print(f"[AI] Species prediction failed for {image_path}: {exc}")
@@ -150,12 +196,19 @@ class BuckDoeSuggester:
     def ready(self) -> bool:
         return self._ready
 
-    def predict(self, image_path: str) -> Optional[Tuple[str, float]]:
+    def predict(self, image_or_path, pixel_area: int = None) -> Optional[Tuple[str, float]]:
         """Predict buck or doe from a deer image (preferably head crop)."""
-        if not self.ready or not os.path.exists(image_path):
+        if not self.ready:
             return None
         try:
-            img = Image.open(image_path).convert("RGB")
+            # Handle both file paths and PIL Image objects
+            if isinstance(image_or_path, str):
+                if not os.path.exists(image_or_path):
+                    return None
+                img = Image.open(image_or_path).convert("RGB")
+            else:
+                # Assume it's a PIL Image
+                img = image_or_path.convert("RGB") if hasattr(image_or_path, 'convert') else image_or_path
             img = img.resize(self.input_size)
             arr = np.array(img).astype("float32") / 255.0
             mean = np.array([0.485, 0.456, 0.406], dtype="float32")
@@ -171,6 +224,12 @@ class BuckDoeSuggester:
             idx = int(np.argmax(probs))
             label = self.labels[idx] if idx < len(self.labels) else str(idx)
             conf = float(probs[idx])
+
+            # Scale confidence by pixel area quality factor
+            if pixel_area is not None:
+                quality = pixel_area_quality(pixel_area)
+                conf = conf * quality
+
             return label, conf
         except Exception as exc:
             print(f"[AI] Buck/doe prediction failed for {image_path}: {exc}")
@@ -249,13 +308,13 @@ class CombinedSuggester:
     def reid_ready(self) -> bool:
         return self.reid.ready
 
-    def predict(self, image_path: str) -> Optional[Tuple[str, float]]:
+    def predict(self, image_path: str, pixel_area: int = None) -> Optional[Tuple[str, float]]:
         """Predict species from an image."""
-        return self.species.predict(image_path)
+        return self.species.predict(image_path, pixel_area=pixel_area)
 
-    def predict_sex(self, image_path: str) -> Optional[Tuple[str, float]]:
+    def predict_sex(self, image_path: str, pixel_area: int = None) -> Optional[Tuple[str, float]]:
         """Predict buck or doe from a deer image (preferably head crop)."""
-        return self.buckdoe.predict(image_path)
+        return self.buckdoe.predict(image_path, pixel_area=pixel_area)
 
     def embed_deer(self, image_path: str) -> Optional[List[float]]:
         """Get embedding for deer re-ID."""

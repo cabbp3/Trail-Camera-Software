@@ -62,6 +62,7 @@ class SyncManager(QObject):
 
     # Configuration
     DEBOUNCE_DELAY = 30000  # 30 seconds in milliseconds
+    PERIODIC_SYNC_INTERVAL = 120000  # 2 minutes - regular sync to catch all changes
     QUEUE_FILE = Path.home() / ".trailcam" / "pending_sync.json"
     MAX_RETRIES = 5
     RETRY_DELAYS = [30000, 60000, 120000, 300000, 600000]  # 30s, 1m, 2m, 5m, 10m
@@ -97,6 +98,12 @@ class SyncManager(QObject):
         # Network check timer (periodic when offline)
         self._network_timer = QTimer(self)
         self._network_timer.timeout.connect(self._check_and_sync)
+
+        # Periodic sync timer - DISABLED for now due to potential threading issues
+        # self._periodic_timer = QTimer(self)
+        # self._periodic_timer.timeout.connect(self._periodic_sync)
+        # self._periodic_timer.start(self.PERIODIC_SYNC_INTERVAL)
+        # logger.info(f"Periodic sync enabled: every {self.PERIODIC_SYNC_INTERVAL // 1000} seconds")
 
         # Load any pending state from previous session
         self._load_queue()
@@ -136,6 +143,21 @@ class SyncManager(QObject):
 
     def _on_debounce_timeout(self):
         """Called when debounce timer expires."""
+        self._attempt_sync()
+
+    def _periodic_sync(self):
+        """Called every 2 minutes to ensure data is regularly pushed.
+
+        This catches any changes that weren't properly queued via queue_change().
+        Uses incremental sync based on updated_at timestamps.
+        """
+        # Don't run if already syncing or offline
+        if self._status == 'syncing':
+            return
+
+        # Always mark pending to ensure we push any missed changes
+        self._pending = True
+        logger.debug("Periodic sync triggered")
         self._attempt_sync()
 
     def _check_network(self) -> bool:

@@ -7,6 +7,7 @@ the /photos page, requests a download bundle, then pulls the zip via the GUID.
 It returns a list of extracted image file paths (caller handles importing).
 """
 import json
+import logging
 import os
 import re
 import tempfile
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import List, Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 # Retry configuration
@@ -39,7 +42,7 @@ def _retry_request(func, *args, max_retries=MAX_RETRIES, **kwargs):
             # Check for retryable status codes
             if response.status_code in RETRYABLE_STATUS_CODES:
                 if attempt < max_retries:
-                    print(f"[CuddeLink] Server error {response.status_code}, retrying in {delay}s... (attempt {attempt + 1}/{max_retries + 1})")
+                    logger.info(f"[CuddeLink] Server error {response.status_code}, retrying in {delay}s... (attempt {attempt + 1}/{max_retries + 1})")
                     time.sleep(delay)
                     delay *= 2
                     continue
@@ -49,7 +52,7 @@ def _retry_request(func, *args, max_retries=MAX_RETRIES, **kwargs):
         except requests.exceptions.ConnectionError as e:
             last_error = e
             if attempt < max_retries:
-                print(f"[CuddeLink] Connection error, retrying in {delay}s... (attempt {attempt + 1}/{max_retries + 1})")
+                logger.info(f"[CuddeLink] Connection error, retrying in {delay}s... (attempt {attempt + 1}/{max_retries + 1})")
                 time.sleep(delay)
                 delay *= 2
             else:
@@ -57,7 +60,7 @@ def _retry_request(func, *args, max_retries=MAX_RETRIES, **kwargs):
         except requests.exceptions.Timeout as e:
             last_error = e
             if attempt < max_retries:
-                print(f"[CuddeLink] Timeout, retrying in {delay}s... (attempt {attempt + 1}/{max_retries + 1})")
+                logger.info(f"[CuddeLink] Timeout, retrying in {delay}s... (attempt {attempt + 1}/{max_retries + 1})")
                 time.sleep(delay)
                 delay *= 2
             else:
@@ -113,12 +116,12 @@ def _login(session: requests.Session, user: str, password: str) -> None:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
-    print(f"[CuddeLink] Getting login page: {LOGIN_URL}")
+    logger.info(f"[CuddeLink] Getting login page: {LOGIN_URL}")
     resp = session.get(LOGIN_URL, timeout=20)
-    print(f"[CuddeLink] Login page status: {resp.status_code}")
+    logger.info(f"[CuddeLink] Login page status: {resp.status_code}")
     resp.raise_for_status()
     token = _extract_verification_token(resp.text)
-    print(f"[CuddeLink] Token found: {'Yes' if token else 'No'}")
+    logger.info(f"[CuddeLink] Token found: {'Yes' if token else 'No'}")
 
     payload = {
         "Input.Email": user,
@@ -134,9 +137,9 @@ def _login(session: requests.Session, user: str, password: str) -> None:
         "Referer": LOGIN_URL,
     }
 
-    print(f"[CuddeLink] Posting login...")
+    logger.info(f"[CuddeLink] Posting login...")
     post = session.post(LOGIN_URL, data=payload, headers=headers, timeout=20, allow_redirects=True)
-    print(f"[CuddeLink] Post status: {post.status_code}, URL: {post.url}")
+    logger.info(f"[CuddeLink] Post status: {post.status_code}, URL: {post.url}")
 
     if post.status_code >= 400:
         snippet = post.text[:500].strip().replace("\n", " ")
@@ -147,9 +150,9 @@ def _login(session: requests.Session, user: str, password: str) -> None:
         raise requests.HTTPError("Invalid email or password. Please check your credentials.")
 
     # Verify we can access the photos page (proves login succeeded)
-    print(f"[CuddeLink] Checking photos page...")
+    logger.info(f"[CuddeLink] Checking photos page...")
     photos_check = session.get(PHOTOS_URL, timeout=20, allow_redirects=True)
-    print(f"[CuddeLink] Photos status: {photos_check.status_code}, URL: {photos_check.url}")
+    logger.info(f"[CuddeLink] Photos status: {photos_check.status_code}, URL: {photos_check.url}")
     if "login" in photos_check.url.lower():
         raise requests.HTTPError("Login appeared to succeed but session not authenticated. Please try again.")
 
@@ -162,7 +165,7 @@ def _apply_date_filter(session: requests.Session, start_date: str, end_date: str
         "X-Requested-With": "XMLHttpRequest",
         "Referer": PHOTOS_URL,
     }
-    print(f"[CuddeLink] Applying date filter: {start_date} to {end_date}")
+    logger.info(f"[CuddeLink] Applying date filter: {start_date} to {end_date}")
     resp = session.post(APPLY_FILTER_URL, data={"filter": filter_value}, headers=headers, timeout=30)
     resp.raise_for_status()
 
@@ -185,7 +188,7 @@ def _request_download_guid(session: requests.Session, photo_ids: List[str]) -> s
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
-    print(f"[CuddeLink] Requesting download for {len(photo_ids)} photos...")
+    logger.info(f"[CuddeLink] Requesting download for {len(photo_ids)} photos...")
     resp = _retry_request(
         session.post,
         DOWNLOAD_VIEW_URL,
@@ -213,7 +216,7 @@ def _download_zip(session: requests.Session, guid: str, progress_callback=None) 
     if zip_path.exists():
         return zip_path
     params = {"fileGuid": guid, "filename": "CuddebackPhotos"}
-    print(f"[CuddeLink] Downloading zip file (this may take a while)...")
+    logger.info(f"[CuddeLink] Downloading zip file (this may take a while)...")
 
     # Stream the download to report progress
     resp = _retry_request(
@@ -348,10 +351,10 @@ def _download_single_day(session: requests.Session, destination: Path, day_str: 
     """Download photos for a single day. Returns list of extracted paths."""
     temp_extract = destination / ".cuddelink_tmp"
 
-    print(f"[CuddeLink] Downloading photos for {day_str}...")
+    logger.info(f"[CuddeLink] Downloading photos for {day_str}...")
     _apply_date_filter(session, day_str, day_str)
     photo_ids = _fetch_photo_ids(session)
-    print(f"[CuddeLink]   Found {len(photo_ids)} photos for {day_str}")
+    logger.info(f"[CuddeLink]   Found {len(photo_ids)} photos for {day_str}")
 
     if not photo_ids:
         return []
@@ -359,7 +362,7 @@ def _download_single_day(session: requests.Session, destination: Path, day_str: 
     guid = _request_download_guid(session, photo_ids)
     zip_path = _download_zip(session, guid, progress_callback)
     extracted = _extract_images(zip_path, temp_extract)
-    print(f"[CuddeLink]   Extracted {len(extracted)} images for {day_str}")
+    logger.info(f"[CuddeLink]   Extracted {len(extracted)} images for {day_str}")
 
     try:
         zip_path.unlink()
@@ -409,7 +412,7 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
     num_days = (end_dt - start_dt).days + 1
 
-    print(f"[CuddeLink] Starting download for {num_days} day(s): {start_date} to {end_date}")
+    logger.info(f"[CuddeLink] Starting download for {num_days} day(s): {start_date} to {end_date}")
     session = requests.Session()
     # Use browser-like headers to avoid being blocked
     session.headers.update({
@@ -433,7 +436,7 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
         while current_dt <= end_dt:
             day_num += 1
             day_str = current_dt.strftime("%Y-%m-%d")
-            print(f"[CuddeLink] Day {day_num}/{num_days}: {day_str}")
+            logger.info(f"[CuddeLink] Day {day_num}/{num_days}: {day_str}")
 
             if progress_callback:
                 progress_callback(day_num, num_days, "day", f"Day {day_num}/{num_days}: {day_str}")
@@ -447,7 +450,7 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
                 day_photos = _download_single_day(session, destination, day_str, day_download_callback)
                 all_extracted.extend(day_photos)
             except Exception as e:
-                print(f"[CuddeLink] Warning: Failed to download {day_str}: {e}")
+                logger.info(f"[CuddeLink] Warning: Failed to download {day_str}: {e}")
                 # Continue with next day instead of failing completely
 
             current_dt += timedelta(days=1)
@@ -456,7 +459,7 @@ def download_new_photos(destination: Path, user: str = None, password: str = Non
             if current_dt <= end_dt:
                 time.sleep(1)
 
-        print(f"[CuddeLink] Done! Total extracted: {len(all_extracted)} images")
+        logger.info(f"[CuddeLink] Done! Total extracted: {len(all_extracted)} images")
         if progress_callback:
             progress_callback(num_days, num_days, "done", f"Done! {len(all_extracted)} photos extracted")
         return all_extracted

@@ -530,8 +530,8 @@ def install_update(update_file: Path) -> bool:
                 return _install_macos(extract_dir)
 
         elif update_file.suffix.lower() == '.exe':
-            # Windows installer - just run it
-            subprocess.Popen([str(update_file)], shell=True)
+            # Windows installer - just run it (shell=False for security)
+            subprocess.Popen([str(update_file)])
             return True
 
         elif update_file.suffix.lower() == '.dmg':

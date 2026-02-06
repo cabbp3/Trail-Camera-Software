@@ -1936,6 +1936,16 @@ class TrailCamDatabase:
             )
             self.conn.commit()
 
+    def set_box_ai_suggestion(self, box_id: int, species: str, confidence: float = None):
+        """Set AI-suggested species for a specific box (separate from user label)."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE annotation_boxes SET ai_suggested_species = ? WHERE id = ?",
+                (species, box_id)
+            )
+            self.conn.commit()
+
     def set_box_head_line(self, box_id: int, x1: float, y1: float, x2: float, y2: float, notes: str = None):
         """Set head direction line for a specific box.
 
@@ -2757,12 +2767,13 @@ class TrailCamDatabase:
 
             # Push tags
             report(2, "Syncing tags...")
+            tag_clause, tag_params = since_clause('t')
             cursor.execute(f"""
                 SELECT t.tag_name, t.updated_at, p.original_name, p.date_taken, p.camera_model, p.file_hash
                 FROM tags t
                 JOIN photos p ON t.photo_id = p.id
-                WHERE 1=1 {since_clause('t')}
-            """)
+                WHERE 1=1 {tag_clause}
+            """, tag_params)
             tags_data = []
             for row in cursor.fetchall():
                 photo_key = f"{row['original_name']}|{row['date_taken']}|{row['camera_model']}"
@@ -2810,12 +2821,13 @@ class TrailCamDatabase:
 
             # Push deer_metadata
             report(3, "Syncing deer metadata...")
+            deer_clause, deer_params = since_clause('d')
             cursor.execute(f"""
                 SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
                 FROM deer_metadata d
                 JOIN photos p ON d.photo_id = p.id
-                WHERE 1=1 {since_clause('d')}
-            """)
+                WHERE 1=1 {deer_clause}
+            """, deer_params)
             deer_meta_data = []
             for row in cursor.fetchall():
                 d = dict(row)
@@ -2846,12 +2858,13 @@ class TrailCamDatabase:
 
             # Push deer_additional
             report(4, "Syncing additional deer...")
+            deer_add_clause, deer_add_params = since_clause('d')
             cursor.execute(f"""
                 SELECT d.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
                 FROM deer_additional d
                 JOIN photos p ON d.photo_id = p.id
-                WHERE 1=1 {since_clause('d')}
-            """)
+                WHERE 1=1 {deer_add_clause}
+            """, deer_add_params)
             deer_add_data = []
             for row in cursor.fetchall():
                 d = dict(row)
@@ -2950,13 +2963,16 @@ class TrailCamDatabase:
                 if force_full_sync:
                     print(f"  Cloud annotation_boxes is empty but local has {local_box_count} - doing full sync")
 
-                box_filter = "" if force_full_sync else since_clause('b')
+                if force_full_sync:
+                    box_filter, box_params = "", ()
+                else:
+                    box_filter, box_params = since_clause('b')
                 cursor.execute(f"""
                     SELECT b.*, p.original_name, p.date_taken, p.camera_model, p.file_hash
                     FROM annotation_boxes b
                     JOIN photos p ON b.photo_id = p.id
                     WHERE 1=1 {box_filter}
-                """)
+                """, box_params)
                 boxes_data = []
                 for row in cursor.fetchall():
                     d = dict(row)
@@ -3205,12 +3221,20 @@ class TrailCamDatabase:
                 existing = cursor.fetchone()
 
                 if existing:
-                    # Update existing box
+                    # Update existing box - PRESERVE local labels if cloud is null
+                    # Use COALESCE to keep local value when cloud value is null
                     cursor.execute("""
                         UPDATE annotation_boxes SET
-                            confidence = ?, species = ?, species_conf = ?,
-                            sex = ?, sex_conf = ?,
-                            head_x1 = ?, head_y1 = ?, head_x2 = ?, head_y2 = ?, head_notes = ?
+                            confidence = COALESCE(?, confidence),
+                            species = COALESCE(?, species),
+                            species_conf = COALESCE(?, species_conf),
+                            sex = COALESCE(?, sex),
+                            sex_conf = COALESCE(?, sex_conf),
+                            head_x1 = COALESCE(?, head_x1),
+                            head_y1 = COALESCE(?, head_y1),
+                            head_x2 = COALESCE(?, head_x2),
+                            head_y2 = COALESCE(?, head_y2),
+                            head_notes = COALESCE(?, head_notes)
                         WHERE id = ?
                     """, (safe_float(row.get("confidence")), row.get("species"), safe_float(row.get("species_conf")),
                           row.get("sex"), safe_float(row.get("sex_conf")),
@@ -3233,9 +3257,14 @@ class TrailCamDatabase:
                           row.get("head_notes")))
                 counts["annotation_boxes"] += 1
 
+        # NOTE: Push-before-pull disabled due to potential recursion/threading issues
+        # The proper fix is to ensure sync happens regularly (on close, manual sync)
+        # rather than trying to push during every pull
+        report(8, "Preparing deletion sync...")
+
         # Sync deletions: Remove local records that were deleted from cloud
         # This is critical for keeping devices in sync when records are removed
-        report(8, "Checking for deleted records...")
+        report(9, "Checking for deleted records...")
         counts["tags_deleted"] = 0
 
         try:

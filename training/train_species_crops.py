@@ -158,6 +158,26 @@ def main():
 
         return keep
 
+    # Cache image dimensions to avoid repeated file reads
+    image_dimensions_cache = {}
+
+    def get_image_dimensions(file_path):
+        """Get image width and height, with caching."""
+        if file_path not in image_dimensions_cache:
+            try:
+                img = Image.open(file_path)
+                image_dimensions_cache[file_path] = img.size  # (width, height)
+                img.close()
+            except Exception:
+                image_dimensions_cache[file_path] = (1920, 1080)  # fallback
+        return image_dimensions_cache[file_path]
+
+    def calc_pixel_area(box, img_width, img_height):
+        """Calculate pixel area of a normalized bounding box."""
+        box_w = (box["x2"] - box["x1"]) * img_width
+        box_h = (box["y2"] - box["y1"]) * img_height
+        return int(box_w * box_h)
+
     samples = []
     boxes_before = 0
     boxes_after = 0
@@ -171,13 +191,18 @@ def main():
         boxes = filter_overlapping_boxes(boxes, iou_threshold=0.5)
         boxes_after += len(boxes)
 
+        # Get image dimensions for pixel area calculation
+        img_w, img_h = get_image_dimensions(data["file_path"])
+
         # Add each non-overlapping box as a training sample
         for box in boxes:
+            pixel_area = calc_pixel_area(box, img_w, img_h)
             samples.append({
                 "photo_id": photo_id,
                 "file_path": data["file_path"],
                 "species": data["species"],
-                "box": box
+                "box": box,
+                "pixel_area": pixel_area
             })
 
     print(f"[train] Filtered overlapping boxes: {boxes_before} -> {boxes_after} ({boxes_before - boxes_after} removed)", flush=True)
@@ -193,6 +218,34 @@ def main():
     print(f"\n[train] Found {len(samples)} samples with boxes:", flush=True)
     for species, count in sorted(species_counts.items(), key=lambda x: -x[1]):
         print(f"  {species}: {count}", flush=True)
+
+    # Log pixel area statistics
+    all_pixel_areas = [s["pixel_area"] for s in samples]
+    all_pixel_areas.sort()
+    n = len(all_pixel_areas)
+    print(f"\n[train] === PIXEL AREA STATISTICS ===", flush=True)
+    print(f"  Min:    {all_pixel_areas[0]:,} px ({int(all_pixel_areas[0]**0.5)}x{int(all_pixel_areas[0]**0.5)} equiv)", flush=True)
+    print(f"  5th %:  {all_pixel_areas[int(n*0.05)]:,} px", flush=True)
+    print(f"  25th %: {all_pixel_areas[int(n*0.25)]:,} px", flush=True)
+    print(f"  Median: {all_pixel_areas[int(n*0.50)]:,} px ({int(all_pixel_areas[int(n*0.50)]**0.5)}x{int(all_pixel_areas[int(n*0.50)]**0.5)} equiv)", flush=True)
+    print(f"  75th %: {all_pixel_areas[int(n*0.75)]:,} px", flush=True)
+    print(f"  95th %: {all_pixel_areas[int(n*0.95)]:,} px", flush=True)
+    print(f"  Max:    {all_pixel_areas[-1]:,} px ({int(all_pixel_areas[-1]**0.5)}x{int(all_pixel_areas[-1]**0.5)} equiv)", flush=True)
+
+    # Per-species pixel area stats
+    print(f"\n[train] Pixel area by species (median):", flush=True)
+    species_pixel_areas = {}
+    for s in samples:
+        species = s["species"]
+        if species not in species_pixel_areas:
+            species_pixel_areas[species] = []
+        species_pixel_areas[species].append(s["pixel_area"])
+    for species in sorted(species_pixel_areas.keys()):
+        areas = sorted(species_pixel_areas[species])
+        median = areas[len(areas)//2]
+        min_area = areas[0]
+        max_area = areas[-1]
+        print(f"  {species}: median={median:,} px, range={min_area:,}-{max_area:,}", flush=True)
 
     # Build class list
     classes = sorted(species_counts.keys())

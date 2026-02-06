@@ -107,19 +107,19 @@ class SiteDetector:
         Most trail cameras put text at the bottom of the image.
         Some use the top. We check both.
         """
-        img = Image.open(image_path)
-        w, h = img.size
+        with Image.open(image_path) as img:
+            w, h = img.size
 
-        # Try bottom 12% first (most common location)
-        bottom = img.crop((0, int(h * 0.88), w, h))
-        text = pytesseract.image_to_string(bottom, config='--psm 6')
+            # Try bottom 12% first (most common location)
+            bottom = img.crop((0, int(h * 0.88), w, h))
+            text = pytesseract.image_to_string(bottom, config='--psm 6')
 
-        # If no good text, try top 12%
-        if not self._has_site_hint(text):
-            top = img.crop((0, 0, w, int(h * 0.12)))
-            top_text = pytesseract.image_to_string(top, config='--psm 6')
-            if self._has_site_hint(top_text):
-                text = top_text
+            # If no good text, try top 12%
+            if not self._has_site_hint(text):
+                top = img.crop((0, 0, w, int(h * 0.12)))
+                top_text = pytesseract.image_to_string(top, config='--psm 6')
+                if self._has_site_hint(top_text):
+                    text = top_text
 
         return text.strip()
 

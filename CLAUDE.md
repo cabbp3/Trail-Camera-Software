@@ -350,6 +350,85 @@ When the user is looking for something to run overnight or while away:
 
 ---
 
+## Recent Session (Jan 26, 2026 - Evening)
+
+### Database Duplicate Cleanup
+
+**Problem:** 171 duplicate photos in database - same photos existed in both `.cuddelink_tmp/` and organized `2026/01/` folders.
+
+**Root Cause:** CuddeLink downloads to temp folder, organizes to dated folder, but temp files weren't being skipped during imports.
+
+**Fixes Applied:**
+
+1. **Migrated orphaned data** before cleanup:
+   - 125 deer_metadata records
+   - 3 annotation_boxes
+   - 1 tag
+
+2. **Deleted duplicates:**
+   - 171 duplicate photo records
+   - 85 orphaned `.cuddelink_tmp` records (files deleted, no organized copies)
+   - Cleaned up `.cuddelink_tmp` folder (14 MB freed)
+
+3. **Fixed imports to skip temp folders** (`training/label_tool.py`):
+   - `_find_image_files()` now excludes `.cuddelink_tmp` and `.thumbnails`
+   - `scan_folders()` also skips these folders
+
+### Cloud Sync SQL Fix
+
+**Problem:** "near '(': syntax error" when pushing to cloud.
+
+**Root Cause:** `since_clause()` function returns `(clause, params)` tuple, but was being used directly in f-strings at 4 locations in `database.py`.
+
+**Fixes Applied:** Fixed all 4 occurrences to properly unpack tuple:
+- Line 2770: tags query
+- Line 2824: deer_metadata query
+- Line 2861: deer_additional query
+- Line 2966: annotation_boxes query
+
+**Result:** Database now at 8,157 photos, syncing properly to cloud.
+
+---
+
+## Recent Session (Jan 26, 2026)
+
+### Mobile App Landing Page
+
+Added bottom navigation structure to Flutter mobile app:
+- `home_screen.dart` - New landing page with NavigationBar (Photos, Account, Settings)
+- `account_screen.dart` - Profile, hunting club selection, stats placeholder, app info
+- `settings_screen.dart` - Already existed (hunting clubs filter, auto-archive)
+- Updated `splash_screen.dart` to navigate to HomeScreen instead of PhotoGridScreen
+
+Uses `IndexedStack` for tab persistence when switching.
+
+### Individual Buck Identification Roadmap
+
+**New documentation:** `docs/individual_buck_identification.md`
+
+Long-term feature planning for identifying and tracking individual bucks across trail camera photos using multi-feature discrimination (not single "fingerprint").
+
+**Current State:**
+- ~100 head annotations completed (bounding box + direction)
+- Several thousand deer photos available for annotation
+- Species detection working (MegaDetector)
+
+**Progression:**
+```
+Species Detection       ✓ DONE
+Head Detection/Direction  ← IN PROGRESS (~100 annotations)
+Head Features             (facial mask, ears, nose)
+Body Detection/Direction
+Body Features             (tail color, throat patch, build)
+Feature Fusion → Individual ID
+```
+
+**Key Insight:** Use multiple stable features to RULE OUT non-matches rather than trying to find one definitive identifier. Mirrors how experienced hunters ID deer.
+
+**Bootstrap Strategy:** Train model on 100 annotations → auto-annotate 1000 → human corrects → repeat. Correcting is 3x faster than annotating from scratch.
+
+---
+
 ## Recent Session (Jan 23-24, 2026)
 
 ### Fixed Photo Timestamps (Android showing wrong times)
