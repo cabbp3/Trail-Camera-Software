@@ -769,10 +769,24 @@ class AIWorker(QThread):
                 elif has_vehicle:
                     label, conf = "Vehicle", 0.95
                 elif animal_boxes and app_species and app_species not in ("Empty",):
-                    label, conf = app_species, score
-                    # Set per-box species suggestion
-                    for box in animal_boxes:
-                        box_id = box.get("id")
+                    if len(animal_boxes) > 1:
+                        # Multiple animal boxes: classify each box individually
+                        per_box = self.speciesnet.classify_per_box(file_path, animal_boxes)
+                        best_species, best_conf = None, 0
+                        for box, box_pred in zip(animal_boxes, per_box):
+                            box_id = box.get("id")
+                            box_sp = box_pred.get("app_species")
+                            box_sc = box_pred.get("prediction_score", 0)
+                            if box_id and box_sp:
+                                self.db.set_box_ai_suggestion(box_id, box_sp, box_sc)
+                            if box_sc > best_conf and box_sp:
+                                best_species, best_conf = box_sp, box_sc
+                        label = best_species or app_species
+                        conf = best_conf or score
+                    else:
+                        # Single animal box: use whole-image prediction
+                        label, conf = app_species, score
+                        box_id = animal_boxes[0].get("id")
                         if box_id:
                             self.db.set_box_ai_suggestion(box_id, app_species, score)
                 elif not check_boxes:

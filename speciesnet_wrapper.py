@@ -106,6 +106,9 @@ class SpeciesNetWrapper:
     (MegaDetector detection + EfficientNet V2 M classification) in one call.
     """
 
+    # SpeciesNet uses 0.01 internally; we filter to reduce false detections
+    DETECTION_CONF_THRESHOLD = 0.15
+
     def __init__(self, state: str = "", geofence: bool = True):
         self._model = None
         self._available = False
@@ -198,10 +201,13 @@ class SpeciesNetWrapper:
 
             pred = predictions[0]
 
-            # Convert detections to app box format
+            # Convert detections to app box format, filtering low confidence
             raw_detections = pred.get("detections", [])
             boxes = []
             for det in raw_detections:
+                conf = det.get("conf", 0)
+                if conf < self.DETECTION_CONF_THRESHOLD:
+                    continue
                 cat = str(det.get("category", "1"))
                 label = DETECTION_CATEGORY_MAP.get(cat, "ai_animal")
                 bbox = det.get("bbox", [0, 0, 0, 0])
@@ -213,8 +219,9 @@ class SpeciesNetWrapper:
                     "y1": y,
                     "x2": x + w,
                     "y2": y + h,
-                    "confidence": det.get("conf", 0),
+                    "confidence": conf,
                 })
+
 
             raw_label = pred.get("prediction", "")
             app_species = self._map_species(raw_label)
@@ -235,6 +242,69 @@ class SpeciesNetWrapper:
                 "prediction_score": 0,
                 "raw_prediction": None,
             }
+
+    def classify_per_box(self, image_path: str, boxes: list) -> list:
+        """Run classifier on each detection box individually.
+
+        For multi-box photos, crops to each box and classifies separately
+        so each animal gets its own species prediction.
+
+        Args:
+            image_path: Path to the image file.
+            boxes: List of box dicts with x1, y1, x2, y2 (normalized 0-1).
+
+        Returns:
+            List of dicts matching box order:
+            [{"app_species": str, "prediction_score": float, "raw_prediction": str}, ...]
+        """
+        if not self._available or self._model is None:
+            return [{"app_species": None, "prediction_score": 0, "raw_prediction": None}
+                    for _ in boxes]
+
+        try:
+            from speciesnet.utils import BBox
+            import PIL.Image
+
+            img = PIL.Image.open(image_path).convert("RGB")
+            classifier = self._model.classifier
+            results = []
+
+            for box in boxes:
+                x1 = box.get("x1", 0)
+                y1 = box.get("y1", 0)
+                x2 = box.get("x2", 0)
+                y2 = box.get("y2", 0)
+                bbox = BBox(xmin=x1, ymin=y1, width=x2 - x1, height=y2 - y1)
+
+                preprocessed = classifier.preprocess(img, bboxes=[bbox])
+                pred = classifier.predict(image_path, preprocessed)
+
+                classifications = pred.get("classifications", {})
+                classes = classifications.get("classes", [])
+                scores = classifications.get("scores", [])
+
+                if classes and scores:
+                    raw_label = classes[0]
+                    score = scores[0]
+                    app_species = self._map_species(raw_label)
+                    results.append({
+                        "app_species": app_species,
+                        "prediction_score": score,
+                        "raw_prediction": raw_label,
+                    })
+                else:
+                    results.append({
+                        "app_species": None,
+                        "prediction_score": 0,
+                        "raw_prediction": None,
+                    })
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Per-box classification failed for {image_path}: {e}")
+            return [{"app_species": None, "prediction_score": 0, "raw_prediction": None}
+                    for _ in boxes]
 
     def _map_species(self, speciesnet_label: str) -> str:
         """Map a SpeciesNet label to the app's VALID_SPECIES set.
