@@ -1905,7 +1905,8 @@ class TrailCamDatabase:
             cursor = self.conn.cursor()
             cursor.execute("""
                 SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf,
-                       head_x1, head_y1, head_x2, head_y2, head_notes, sex, sex_conf
+                       head_x1, head_y1, head_x2, head_y2, head_notes, sex, sex_conf,
+                       ai_suggested_species
                 FROM annotation_boxes WHERE photo_id = ?
             """, (photo_id,))
             out = []
@@ -1930,6 +1931,8 @@ class TrailCamDatabase:
                     box["sex"] = row[14]
                 if row[15] is not None:
                     box["sex_conf"] = row[15]
+                if row[16]:
+                    box["ai_suggested_species"] = row[16]
                 out.append(box)
             return out
 
