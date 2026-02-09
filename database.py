@@ -2737,7 +2737,7 @@ class TrailCamDatabase:
 
             # Build WHERE clause for incremental sync (parameterized to prevent SQL injection)
             # Normalize last_sync to match SQLite datetime format (space instead of T)
-            normalized_sync = last_sync.replace('T', ' ') if last_sync else None
+            normalized_sync = last_sync.replace('T', ' ').replace('+00:00', '') if last_sync else None
 
             def since_clause(table_alias=""):
                 """Returns (clause_string, params_tuple) for parameterized query."""
