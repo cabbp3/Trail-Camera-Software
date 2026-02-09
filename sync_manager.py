@@ -163,9 +163,17 @@ class SyncManager(QObject):
     def _check_network(self) -> bool:
         """Check if we can reach the Supabase server."""
         try:
-            # Quick socket check to Supabase
-            sock = socket.create_connection(("iwvehmthbjcvdqjqxtty.supabase.co", 443), timeout=5)
-            sock.close()  # Close socket to prevent resource leak
+            from PyQt6.QtCore import QSettings
+            settings = QSettings("TrailCam", "Trainer")
+            url = settings.value("supabase_url", "")
+            if url:
+                # Extract host from configured Supabase URL
+                host = url.replace("https://", "").replace("http://", "").split("/")[0]
+            else:
+                # Fallback: just check general internet connectivity
+                host = "1.1.1.1"
+            sock = socket.create_connection((host, 443), timeout=5)
+            sock.close()
             return True
         except (socket.timeout, socket.error, OSError):
             return False
@@ -221,6 +229,7 @@ class SyncManager(QObject):
     def _on_sync_failed(self, error: str):
         """Handle sync failure."""
         logger.error(f"Sync failed: {error}")
+        self._set_status('pending')
         self.sync_failed.emit(error)
         self._schedule_retry()
 

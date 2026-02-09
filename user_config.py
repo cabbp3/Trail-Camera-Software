@@ -220,6 +220,28 @@ def is_speciesnet_initialized() -> bool:
     return config.get("speciesnet_initialized", False)
 
 
+def get_detector_choice() -> str:
+    """Get which detector to use: 'speciesnet' or 'megadetector'."""
+    config = get_config()
+    return config.get("detector_choice", "speciesnet")
+
+
+def set_detector_choice(choice: str) -> bool:
+    """Set which detector to use: 'speciesnet' or 'megadetector'."""
+    return set_config_value("detector_choice", choice)
+
+
+def get_classifier_choice() -> str:
+    """Get which classifier to use: 'speciesnet' or 'custom'."""
+    config = get_config()
+    return config.get("classifier_choice", "speciesnet")
+
+
+def set_classifier_choice(choice: str) -> bool:
+    """Set which classifier to use: 'speciesnet' or 'custom'."""
+    return set_config_value("classifier_choice", choice)
+
+
 if __name__ == "__main__":
     # Test
     current = get_username()

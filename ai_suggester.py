@@ -93,11 +93,12 @@ class SpeciesSuggester:
             if os.path.exists(self.labels_path):
                 with open(self.labels_path, "r", encoding="utf-8") as f:
                     raw_labels = [line.strip() for line in f if line.strip()]
-                # Only keep labels that are in VALID_SPECIES
-                self.labels = [lbl for lbl in raw_labels if lbl in VALID_SPECIES]
-                if len(self.labels) != len(raw_labels):
-                    invalid = [lbl for lbl in raw_labels if lbl not in VALID_SPECIES]
-                    print(f"[AI] Warning: Filtered out invalid labels: {invalid}")
+                # Keep full label list to preserve index alignment with model outputs.
+                # Invalid labels are rejected at inference time, not at load time.
+                self.labels = raw_labels
+                invalid = [lbl for lbl in raw_labels if lbl not in VALID_SPECIES]
+                if invalid:
+                    print(f"[AI] Warning: labels.txt contains non-VALID_SPECIES entries (will be rejected at inference): {invalid}")
             if not self.labels:
                 self.labels = ["Deer", "Turkey", "Coyote", "Raccoon", "Person", "Vehicle", "Empty"]
             self._ready = True
@@ -158,7 +159,7 @@ class SpeciesSuggester:
 
             return label, conf
         except Exception as exc:
-            print(f"[AI] Species prediction failed for {image_path}: {exc}")
+            print(f"[AI] Species prediction failed for {image_or_path}: {exc}")
             return None
 
 
@@ -232,7 +233,7 @@ class BuckDoeSuggester:
 
             return label, conf
         except Exception as exc:
-            print(f"[AI] Buck/doe prediction failed for {image_path}: {exc}")
+            print(f"[AI] Buck/doe prediction failed for {image_or_path}: {exc}")
             return None
 
 

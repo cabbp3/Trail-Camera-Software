@@ -63,6 +63,10 @@ class R2UploadWorker(QThread):
                     if not self.storage.upload_file(file_path, photo_key):
                         success = False
                         logger.error(f"Failed to upload photo: {photo_key}")
+            elif file_path:
+                # File was moved or deleted before upload
+                success = False
+                logger.warning(f"File missing, skipping upload: {file_path}")
 
             if success:
                 uploaded += 1

@@ -40,6 +40,8 @@ class TrailCamDatabase:
         self.conn.row_factory = sqlite3.Row
         # Enable WAL mode for better concurrent access and performance
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # Enable foreign key enforcement (SQLite has it off by default)
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self._init_database()
 
         # Set crash flag - will be removed on clean exit
@@ -1871,6 +1873,7 @@ class TrailCamDatabase:
                 species_conf = b.get("species_conf")
                 sex = b.get("sex", "")
                 sex_conf = b.get("sex_conf")
+                ai_suggested = b.get("ai_suggested_species", "")
                 to_insert.append((
                     photo_id,
                     b.get("label", ""),
@@ -1882,11 +1885,17 @@ class TrailCamDatabase:
                     species if species else None,
                     float(species_conf) if species_conf is not None else None,
                     sex if sex else None,
-                    float(sex_conf) if sex_conf is not None else None
+                    float(sex_conf) if sex_conf is not None else None,
+                    b.get("head_x1"),
+                    b.get("head_y1"),
+                    b.get("head_x2"),
+                    b.get("head_y2"),
+                    b.get("head_notes") or None,
+                    ai_suggested if ai_suggested else None,
                 ))
             if to_insert:
                 cursor.executemany(
-                    "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf, sex, sex_conf) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf, sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes, ai_suggested_species) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     to_insert,
                 )
             self.conn.commit()
@@ -2719,7 +2728,8 @@ class TrailCamDatabase:
         try:
             cursor = sync_conn.cursor()
             # Use ISO format with UTC timezone suffix to match Supabase TIMESTAMPTZ
-            now = datetime.utcnow().isoformat() + "+00:00"
+            # Use space-separated format without timezone to match SQLite's datetime('now')
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             BATCH_SIZE = 500  # Supabase handles batches well
 
             # Build WHERE clause for incremental sync (parameterized to prevent SQL injection)
