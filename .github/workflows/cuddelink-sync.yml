@@ -34,7 +34,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests boto3 Pillow
+          # xvfb provides a virtual display for headed Chrome (Blazor
+          # misbehaves in true headless mode)
+          sudo apt-get update && sudo apt-get install -y xvfb
+          pip install playwright boto3 Pillow requests
+          # Install Chrome (not Chromium) — Blazor SPA crashes in Playwright's
+          # bundled Chromium headless shell but works fine in real Chrome
+          playwright install chrome --with-deps
 
       - name: Run CuddeLink to R2 sync
         env:
@@ -47,4 +53,14 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          python scripts/cuddelink_to_r2.py --days-back ${{ github.event.inputs.days_back || '1' }}
+          # Run headed via xvfb virtual display — Blazor needs a real
+          # rendering context to bootstrap reliably
+          xvfb-run --auto-servernum python scripts/cuddelink_to_r2.py --days-back ${{ github.event.inputs.days_back || '1' }}
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuddelink-debug-${{ github.run_number }}
+          path: /tmp/cuddelink_failure_*
+          retention-days: 7

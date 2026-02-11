@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-CuddeLink to R2 Sync Script
+CuddeLink to R2 Sync Script (Playwright version)
 
 Downloads photos from CuddeLink and uploads them to Cloudflare R2.
 Designed to run via GitHub Actions on a schedule.
+
+Uses Playwright headless browser because CuddeLink redesigned their site
+as a Blazor WebSocket SPA (Feb 2026). No REST API available.
 
 Environment variables required:
   CUDDELINK_EMAIL, CUDDELINK_PASSWORD
@@ -12,36 +15,31 @@ Environment variables required:
 """
 
 import argparse
+import asyncio
 import hashlib
 import io
 import json
 import os
+import random
 import re
+import shutil
 import tempfile
-import zipfile
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import boto3
 import requests
 from botocore.config import Config
 from PIL import Image
 
-# CuddeLink URLs
 BASE_URL = "https://camp.cuddeback.com"
-LOGIN_URL = f"{BASE_URL}/Identity/Account/Login"
-PHOTOS_URL = f"{BASE_URL}/photos"
-APPLY_FILTER_URL = f"{BASE_URL}/photos/applyFilter"
-DOWNLOAD_VIEW_URL = f"{BASE_URL}/photos/downloadphotoview"
-DOWNLOAD_FILE_URL = f"{BASE_URL}/photos/Download"
 
-# Browser-like headers
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
 
+# ============================================================
+# Utility functions
+# ============================================================
 
 def get_env(name: str) -> str:
     """Get required environment variable."""
@@ -51,146 +49,46 @@ def get_env(name: str) -> str:
     return value
 
 
-def extract_verification_token(html: str) -> str | None:
-    """Extract CSRF token from login page."""
-    patterns = [
-        r'name="__RequestVerificationToken"[^>]*value="([^"]+)"',
-        r"name='__RequestVerificationToken'[^>]*value='([^']+)'",
-        r'value="([^"]+)"[^>]*name="__RequestVerificationToken"',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return None
+def safe_url(url: str) -> str:
+    """Strip query params from URL for safe logging (no tokens/signatures)."""
+    return url.split("?")[0]
 
 
-def extract_photo_ids(html: str) -> list[str]:
-    """Extract photo IDs from photos page HTML."""
-    ids = set()
-    patterns = [
-        r'id="photoId\d+"\s+value="([^"]+)"',
-        r'value="([^"]+)"\s+id="photoId\d+"',
-        r'data-photo-id=["\']([^"\']+)',
-    ]
-    for pattern in patterns:
-        for match in re.finditer(pattern, html, re.IGNORECASE):
-            ids.add(match.group(1))
-    return list(ids)
+async def rate_limit(seconds: float = 1.5):
+    """Central throttle between page interactions."""
+    await asyncio.sleep(seconds)
 
 
-def cuddelink_login(session: requests.Session, email: str, password: str) -> None:
-    """Login to CuddeLink."""
-    print("[CuddeLink] Fetching login page...")
-    resp = session.get(LOGIN_URL, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
+async def capture_failure(page, step_name: str):
+    """Screenshot + HTML + metadata dump on failure.
 
-    token = extract_verification_token(resp.text)
-
-    payload = {
-        "Input.Email": email,
-        "Input.Password": password,
-        "Input.RememberMe": "false",
-    }
-    if token:
-        payload["__RequestVerificationToken"] = token
-
-    print("[CuddeLink] Logging in...")
-    login_headers = {
-        **HEADERS,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": BASE_URL,
-        "Referer": LOGIN_URL,
-    }
-    resp = session.post(LOGIN_URL, data=payload, headers=login_headers, timeout=20)
-
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Login failed: {resp.status_code}")
-
-    # Verify login by accessing photos page
-    resp = session.get(PHOTOS_URL, headers=HEADERS, timeout=20)
-    if "login" in resp.url.lower():
-        raise RuntimeError("Login failed - redirected back to login page")
-
-    print("[CuddeLink] Login successful!")
+    HTML is redacted during login-related failures to prevent
+    credentials from leaking into CI artifacts.
+    """
+    ts = datetime.now().strftime("%H%M%S")
+    prefix = f"/tmp/cuddelink_failure_{step_name}_{ts}"
+    current_url = safe_url(page.url)
+    try:
+        await page.screenshot(path=f"{prefix}.png", timeout=5000)
+    except Exception:
+        pass
+    try:
+        html = await page.content()
+        # Redact credentials from HTML if on login page
+        if "login" in step_name.lower() or "bootstrap" in step_name.lower() or "/Account/Login" in page.url:
+            html = re.sub(r'(current-value|value)="[^"]*"', r'\1="[REDACTED]"', html)
+        with open(f"{prefix}.html", "w") as f:
+            f.write(html)
+    except Exception:
+        pass
+    with open(f"{prefix}.meta.txt", "w") as f:
+        f.write(f"step: {step_name}\nurl: {current_url}\ntime: {ts}\n")
+    print(f"[FAIL] {step_name} at {current_url} — saved to {prefix}.*")
 
 
-def apply_date_filter(session: requests.Session, start_date: str, end_date: str) -> None:
-    """Apply date filter to photos page."""
-    filter_value = f"date;{start_date};{end_date}"
-    headers = {
-        **HEADERS,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": PHOTOS_URL,
-    }
-    print(f"[CuddeLink] Applying date filter: {start_date} to {end_date}")
-    resp = session.post(APPLY_FILTER_URL, data={"filter": filter_value}, headers=headers, timeout=30)
-    resp.raise_for_status()
-
-
-def fetch_photo_ids(session: requests.Session) -> list[str]:
-    """Get photo IDs from current filtered view."""
-    resp = session.get(PHOTOS_URL, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return extract_photo_ids(resp.text)
-
-
-def download_photos_zip(session: requests.Session, photo_ids: list[str], dest_dir: Path) -> Path:
-    """Request and download zip file of photos."""
-    print(f"[CuddeLink] Requesting download for {len(photo_ids)} photos...")
-
-    payload = {"photoIds": json.dumps(photo_ids)}
-    headers = {
-        **HEADERS,
-        "Referer": PHOTOS_URL,
-        "Origin": BASE_URL,
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    }
-
-    resp = session.post(DOWNLOAD_VIEW_URL, data=payload, headers=headers, timeout=120)
-    resp.raise_for_status()
-
-    # Check if direct zip response
-    if "application/zip" in resp.headers.get("Content-Type", ""):
-        zip_path = dest_dir / "photos.zip"
-        zip_path.write_bytes(resp.content)
-        return zip_path
-
-    # Otherwise we get a GUID
-    guid = resp.text.strip().strip('"')
-    if not guid:
-        raise RuntimeError("Empty download GUID received")
-
-    # Download zip using GUID
-    print(f"[CuddeLink] Downloading zip file...")
-    download_url = f"{DOWNLOAD_FILE_URL}?fileGuid={guid}&filename=CuddebackPhotos"
-    resp = session.get(download_url, headers=HEADERS, timeout=600, stream=True)
-    resp.raise_for_status()
-
-    zip_path = dest_dir / "photos.zip"
-    with open(zip_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-    print(f"[CuddeLink] Downloaded {zip_path.stat().st_size / 1024 / 1024:.1f} MB")
-    return zip_path
-
-
-def extract_images(zip_path: Path, dest_dir: Path) -> list[Path]:
-    """Extract image files from zip."""
-    images = []
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        for name in zf.namelist():
-            lower = name.lower()
-            if lower.endswith((".jpg", ".jpeg", ".png")):
-                zf.extract(name, dest_dir)
-                images.append(dest_dir / name)
-    print(f"[CuddeLink] Extracted {len(images)} images")
-    return images
-
+# ============================================================
+# R2 / Supabase functions (preserved from original)
+# ============================================================
 
 def check_photo_exists(supabase_url: str, supabase_key: str, file_hash: str) -> bool:
     """Check if photo hash already exists in Supabase."""
@@ -214,18 +112,11 @@ def check_photo_exists(supabase_url: str, supabase_key: str, file_hash: str) -> 
 def create_thumbnail(image_path: Path, max_size: int = 400) -> bytes:
     """Create a thumbnail from an image. Returns JPEG bytes."""
     with Image.open(image_path) as img:
-        # Convert to RGB if necessary (handles RGBA, etc.)
         if img.mode in ('RGBA', 'LA', 'P'):
             img = img.convert('RGB')
-
-        # Calculate new size maintaining aspect ratio
         ratio = min(max_size / img.width, max_size / img.height)
         new_size = (int(img.width * ratio), int(img.height * ratio))
-
-        # Resize with high quality
         img = img.resize(new_size, Image.Resampling.LANCZOS)
-
-        # Save to bytes
         buffer = io.BytesIO()
         img.save(buffer, format='JPEG', quality=75, optimize=True)
         return buffer.getvalue()
@@ -246,7 +137,6 @@ def get_exif_datetime(image_path: Path):
 
         timestamp = None
 
-        # Method 1: Try Pillow getexif() with proper EXIF IFD access (Pillow 10+)
         with Image.open(image_path) as img:
             datetime_original = None
             datetime_tag = None
@@ -254,23 +144,18 @@ def get_exif_datetime(image_path: Path):
             try:
                 exif_obj = img.getexif()
                 if exif_obj:
-                    # DateTime (tag 306) is in IFD0 (main EXIF)
                     datetime_tag = exif_obj.get(306)
-
-                    # DateTimeOriginal (tag 36867) is in the EXIF sub-IFD (0x8769)
-                    # This is where the ACTUAL capture time is stored
                     try:
-                        exif_ifd = exif_obj.get_ifd(0x8769)  # EXIF IFD
+                        exif_ifd = exif_obj.get_ifd(0x8769)
                         if exif_ifd:
-                            datetime_original = exif_ifd.get(36867)  # DateTimeOriginal
+                            datetime_original = exif_ifd.get(36867)
                             if not datetime_original:
-                                datetime_original = exif_ifd.get(0x9003)  # Same tag, hex
+                                datetime_original = exif_ifd.get(0x9003)
                     except (AttributeError, Exception):
-                        pass  # get_ifd not available in older Pillow
+                        pass
             except Exception:
                 pass
 
-            # Method 2: Try deprecated _getexif() as fallback (merges all IFDs)
             if not datetime_original:
                 try:
                     exif_data = img._getexif()
@@ -281,10 +166,8 @@ def get_exif_datetime(image_path: Path):
                 except (AttributeError, Exception):
                     pass
 
-            # Use DateTimeOriginal (capture time) if available, else DateTime
             timestamp = datetime_original or datetime_tag
 
-        # Method 3: Try exiftool as last resort (if installed)
         if not timestamp:
             try:
                 result = subprocess.run(
@@ -295,10 +178,9 @@ def get_exif_datetime(image_path: Path):
                     timestamp = result.stdout.strip()
                     print(f"    [EXIF] Got timestamp via exiftool: {timestamp}")
             except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-                pass  # exiftool not installed or failed
+                pass
 
         if timestamp:
-            # Format: "2026:01:20 19:06:54" -> "2026-01-20T19:06:54"
             result = str(timestamp).replace(':', '-', 2).replace(' ', 'T')
             return result
 
@@ -311,16 +193,9 @@ def get_exif_datetime(image_path: Path):
 
 
 def parse_cuddelink_datetime(filename: str, fallback_date: str) -> str:
-    """DEPRECATED - DO NOT USE. Filename timestamp is CuddeLink upload time, NOT capture time.
-
-    This function is kept for reference but should never be called.
-    Using filename timestamps causes ~1 hour errors vs actual EXIF time.
-    """
-    # WARNING: This returns WRONG timestamps - the filename contains CuddeLink upload time,
-    # not the actual camera capture time. Always use EXIF instead.
+    """DEPRECATED - DO NOT USE. Filename timestamp is CuddeLink upload time, NOT capture time."""
     print(f"    [WARNING] parse_cuddelink_datetime called - this produces WRONG timestamps!")
-    print(f"    [WARNING] Filename time != camera capture time. Returning None instead.")
-    return None  # Return None instead of wrong timestamp
+    return None
 
 
 def upload_to_r2(s3_client, bucket: str, file_path: Path, r2_key: str) -> bool:
@@ -352,7 +227,6 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
         "Prefer": "resolution=merge-duplicates",
     }
 
-    # Extract just the date part for the photo_key path
     date_part = datetime_taken.split("T")[0]
     photo_key = f"{date_part.replace('-', '/')}/{filename}"
 
@@ -365,7 +239,6 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
     }
 
     try:
-        # Upsert - update if exists, insert if new (requires unique constraint on file_hash)
         resp = requests.post(
             f"{supabase_url}/rest/v1/photos_sync?on_conflict=file_hash",
             headers=headers,
@@ -381,86 +254,477 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
         return False
 
 
-def process_day(session: requests.Session, day_str: str, s3_client, config: dict) -> tuple[int, int]:
-    """Process a single day's photos. Returns (uploaded, skipped)."""
-    print(f"\n[Sync] Processing {day_str}...")
+# ============================================================
+# Playwright functions (new — replaces old requests-based scraping)
+# ============================================================
 
-    apply_date_filter(session, day_str, day_str)
-    photo_ids = fetch_photo_ids(session)
+LOGIN_URL = f"{BASE_URL}/Account/Login"
+MAX_BOOTSTRAP_ATTEMPTS = 3
+BOOTSTRAP_TIMEOUT_MS = 15000
 
-    if not photo_ids:
-        print(f"[Sync] No photos for {day_str}")
-        return 0, 0
 
-    print(f"[Sync] Found {len(photo_ids)} photos")
+async def check_blazor_error(page) -> bool:
+    """Check if the Blazor error UI is visible (= Blazor crashed)."""
+    try:
+        return await page.evaluate("""() => {
+            const el = document.getElementById('blazor-error-ui');
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+        }""")
+    except Exception:
+        return False
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
 
-        # Download zip
-        zip_path = download_photos_zip(session, photo_ids, tmp_dir)
+async def wait_for_blazor_bootstrap(page, debug: bool = False) -> bool:
+    """Ensure Blazor has bootstrapped on the login page.
 
-        # Extract images
-        images = extract_images(zip_path, tmp_dir)
+    Navigates directly to /Account/Login, waits for the SignalR WebSocket
+    to connect, then waits for the login form to render.
+    Returns True if the login form is ready, False if bootstrap failed.
 
-        uploaded = 0
-        skipped = 0
+    IMPORTANT: Do NOT use page.wait_for_url() or page.wait_for_function()
+    here — they interfere with Blazor's SignalR/WebSocket initialization
+    and cause form submission to silently fail.
+    """
+    # Set up WebSocket listener BEFORE navigation so we catch the
+    # /_blazor handshake as it happens
+    blazor_ws_connected = asyncio.Event()
 
-        for img_path in images:
-            # Calculate hash
-            file_hash = hashlib.md5(img_path.read_bytes()).hexdigest()
+    def on_websocket(ws):
+        if "/_blazor" in ws.url:
+            if debug:
+                print(f"  [Debug] Blazor WebSocket connected: {ws.url[:60]}")
+            blazor_ws_connected.set()
 
-            # Check if exists
-            if check_photo_exists(config["supabase_url"], config["supabase_key"], file_hash):
-                print(f"  Skipping duplicate: {img_path.name}")
-                skipped += 1
-                continue
+    page.on("websocket", on_websocket)
 
-            # Upload full image to R2
-            r2_key = f"photos/{file_hash}.jpg"
-            if upload_to_r2(s3_client, config["r2_bucket"], img_path, r2_key):
-                # Generate and upload thumbnail
-                try:
-                    thumb_data = create_thumbnail(img_path)
-                    thumb_key = f"thumbnails/{file_hash}_thumb.jpg"
-                    upload_bytes_to_r2(s3_client, config["r2_bucket"], thumb_data, thumb_key)
-                    print(f"  Uploaded: {img_path.name} + thumbnail")
-                except Exception as e:
-                    print(f"  Uploaded: {img_path.name} (thumbnail failed: {e})")
+    print("[CuddeLink] Navigating to login page...")
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
 
-                # Get datetime from EXIF - DO NOT use filename fallback (it's wrong!)
-                datetime_taken = get_exif_datetime(img_path)
-                if datetime_taken:
-                    print(f"    EXIF timestamp: {datetime_taken}")
-                else:
-                    # No EXIF timestamp found - save with None and flag for later fix
-                    print(f"    [WARNING] No EXIF timestamp found for {img_path.name}")
-                    print(f"    [WARNING] Photo saved WITHOUT timestamp - needs manual fix!")
-                    # Use the date from the folder as a rough approximation (just the date, no time)
-                    datetime_taken = f"{day_str}T00:00:00"
-                    print(f"    Using date-only placeholder: {datetime_taken}")
+    # Wait for Blazor SignalR WebSocket to connect
+    try:
+        await asyncio.wait_for(blazor_ws_connected.wait(), timeout=BOOTSTRAP_TIMEOUT_MS / 1000)
+        if debug:
+            print("  [Debug] Blazor circuit established")
+    except asyncio.TimeoutError:
+        if debug:
+            print("  [Debug] Blazor WebSocket not detected (may still work)")
 
-                # Save metadata
-                save_to_supabase(
-                    config["supabase_url"],
-                    config["supabase_key"],
-                    file_hash,
-                    datetime_taken,
-                    img_path.name,
-                )
-                uploaded += 1
+    page.remove_listener("websocket", on_websocket)
+
+    # Wait for the email input field to render (proves Blazor bootstrapped)
+    try:
+        await page.wait_for_selector('input[type="email"]', timeout=BOOTSTRAP_TIMEOUT_MS)
+        if debug:
+            print(f"  [Debug] Login form ready at: {safe_url(page.url)}")
+        # Extra pause to let Blazor circuit fully stabilize
+        await rate_limit(1.0)
+        return True
+    except Exception:
+        pass
+
+    # Check if Blazor crashed (passive check, no polling)
+    if await check_blazor_error(page):
+        print("[CuddeLink] Blazor error UI is visible — runtime crashed")
+        return False
+
+    # Maybe already logged in (session cookie from previous run)
+    cloudfront_img = await page.query_selector('img[src*="cloudfront.net"]')
+    if cloudfront_img:
+        print("[CuddeLink] Already logged in — photos visible!")
+        return True
+
+    if debug:
+        print("  [Debug] Login form did not render")
+    return False
+
+
+async def submit_credentials(page, email: str, password: str, debug: bool = False):
+    """Fill and submit the login form. Assumes Blazor has bootstrapped.
+
+    CuddeLink uses Fluent UI web components (<fluent-text-field>) with Shadow
+    DOM. page.fill() puts values in the shadow <input> but doesn't trigger
+    Blazor's binding events, leaving the submit button disabled.
+
+    Solution: click the field, type with real keystrokes (keyboard.type),
+    then Tab to the next field. This fires keydown/input/keyup events that
+    Blazor's @bind handlers listen for.
+    """
+    # Double-check: if photos are already visible, skip login
+    cloudfront_img = await page.query_selector('img[src*="cloudfront.net"]')
+    if cloudfront_img:
+        print("[CuddeLink] Already logged in — skipping credential submit")
+        return
+
+    print("[CuddeLink] Filling login form...")
+
+    # Click email field and type (real keystrokes for Blazor binding)
+    # Try #username first, fall back to input[type="email"] if ID changes
+    try:
+        await page.click('#username', timeout=2000)
+    except Exception:
+        await page.click('input[type="email"]', timeout=3000)
+    await page.keyboard.press('Control+a')
+    await page.keyboard.type(email, delay=30)
+    await rate_limit(0.3)
+
+    # Tab to password field and type
+    await page.keyboard.press('Tab')
+    await rate_limit(0.2)
+    await page.keyboard.type(password, delay=30)
+    await rate_limit(0.3)
+
+    if debug:
+        # Check if submit button is enabled now
+        disabled = await page.evaluate("""() => {
+            const btn = document.querySelector('fluent-button[type="submit"], button[type="submit"]');
+            return btn ? btn.hasAttribute('disabled') : 'no button';
+        }""")
+        print(f"  [Debug] Submit button disabled={disabled}")
+
+    # Click the Sign In button with Playwright's trusted mouse event.
+    # JS .click() doesn't create trusted events, so Blazor ignores it.
+    # The <fluent-button> is a custom element; try multiple selectors.
+    submit_selectors = [
+        'fluent-button[type="submit"]',      # outer web component
+        'fluent-button:has-text("Sign In")',  # by visible text
+        'text=Sign In',                       # Playwright text selector
+    ]
+    clicked = False
+    for sel in submit_selectors:
+        try:
+            await page.click(sel, timeout=3000)
+            clicked = True
+            if debug:
+                print(f"  [Debug] Clicked submit via: {sel}")
+            break
+        except Exception:
+            continue
+
+    if not clicked:
+        # Last resort: submit form via JS requestSubmit
+        await page.evaluate("""() => {
+            const form = document.querySelector('form[method="post"]');
+            if (form && form.requestSubmit) form.requestSubmit();
+            else if (form) form.submit();
+        }""")
+        if debug:
+            print("  [Debug] Submitted form via JS requestSubmit")
+
+    # Wait for photos page (CloudFront images appear after login)
+    print("[CuddeLink] Waiting for photos page...")
+    try:
+        await page.wait_for_selector('img[src*="cloudfront.net"]', timeout=30000)
+        print("[CuddeLink] Login successful — photos page loaded!")
+    except Exception:
+        current_url = page.url
+        if "/Account/Login" in current_url or "/login" in current_url.lower():
+            await capture_failure(page, "login_failed")
+            raise RuntimeError(f"Login failed — still on login page: {safe_url(current_url)}")
+        print(f"[CuddeLink] Login may have succeeded — URL: {safe_url(current_url)}")
+        await rate_limit(5.0)
+
+
+async def playwright_login(browser, email: str, password: str, debug: bool = False):
+    """Login to CuddeLink with retry loop using fresh contexts.
+
+    Each attempt creates a brand-new browser context (clean cookies,
+    storage, service workers, and anti-forgery token). This prevents
+    stale Blazor circuit state from poisoning retries.
+
+    Returns (context, page) on success — caller must close context.
+    """
+    for attempt in range(1, MAX_BOOTSTRAP_ATTEMPTS + 1):
+        print(f"[CuddeLink] Login attempt {attempt}/{MAX_BOOTSTRAP_ATTEMPTS}...")
+
+        # Fresh context per attempt — no stale cookies/storage/tokens
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+        )
+        page = await context.new_page()
+
+        try:
+            ready = await wait_for_blazor_bootstrap(page, debug=debug)
+
+            if ready:
+                await submit_credentials(page, email, password, debug=debug)
+                return context, page
+
+        except Exception as e:
+            await capture_failure(page, f"login_fail_attempt_{attempt}")
+            if attempt >= MAX_BOOTSTRAP_ATTEMPTS:
+                await context.close()
+                raise
+            print(f"[CuddeLink] Attempt {attempt} failed: {e}")
+
+        # Bootstrap or login failed — capture state, close context, retry
+        if not ready:
+            await capture_failure(page, f"bootstrap_fail_attempt_{attempt}")
+        await context.close()
+
+        if attempt < MAX_BOOTSTRAP_ATTEMPTS:
+            backoff = [2, 5, 9][attempt - 1] + random.uniform(0, 1)
+            print(f"[CuddeLink] Retrying in {backoff:.1f}s...")
+            await rate_limit(backoff)
+
+    raise RuntimeError(
+        f"Login failed after {MAX_BOOTSTRAP_ATTEMPTS} attempts"
+    )
+
+
+async def collect_photos_from_dom(page, max_photos: int = 500, debug: bool = False) -> list[dict]:
+    """Extract unique photo URLs from the DOM.
+
+    CuddeLink serves photos via CloudFront CDN:
+    https://d9ekiakd1knvt.cloudfront.net/{device_uuid}/{timestamp}
+
+    The Blazor app renders multiple <img> tags per photo (duplicates),
+    so we dedupe by URL. Photos are already on the page after login —
+    no separate navigation needed.
+    """
+    print("[Collect] Waiting for photos to load...")
+    await rate_limit(5.0)
+
+    # Collect all CloudFront image URLs from the DOM
+    # The Blazor app may render photos with lazy loading, so scroll first
+    collected = {}
+    stall_count = 0
+    scroll_count = 0
+    start_time = time.time()
+
+    PHOTO_SELECTOR = 'img[src*="cloudfront.net"]'
+
+    while True:
+        # Extract unique photo URLs from currently rendered DOM
+        photo_data = await page.evaluate("""(selector) => {
+            const imgs = document.querySelectorAll(selector);
+            return Array.from(imgs).map(img => ({
+                src: img.src,
+                width: img.naturalWidth || img.width,
+                height: img.naturalHeight || img.height,
+            }));
+        }""", PHOTO_SELECTOR)
+
+        for item in photo_data:
+            src = item["src"]
+            if src and src not in collected:
+                collected[src] = {
+                    "src": src,
+                    # TODO: these are 960x558 display thumbnails from CloudFront.
+                    # Full-res originals may exist behind a lightbox or download
+                    # link. Treat full-res discovery as unresolved.
+                    "fullres_url": src,
+                    "width": item["width"],
+                    "height": item["height"],
+                }
+
+        prev_count = len(collected)
+
+        # Scroll down to load more
+        await page.evaluate("window.scrollBy(0, window.innerHeight)")
+        scroll_count += 1
+        await rate_limit(2.0)
+
+        new_count = len(collected)
+        elapsed = time.time() - start_time
+
+        if debug and new_count > prev_count:
+            print(f"  [Collect] Scroll {scroll_count}: {new_count} unique photos ({new_count - prev_count} new)")
+
+        # Stall detection
+        if new_count == prev_count:
+            stall_count += 1
+            if stall_count >= 3:
+                print(f"[Collect] All photos loaded after {scroll_count} scrolls")
+                break
+        else:
+            stall_count = 0
+
+        # Safety caps
+        if new_count >= max_photos:
+            print(f"[Collect] Hit max photo cap ({max_photos})")
+            break
+        if elapsed > 120:
+            print(f"[Collect] Scroll timeout (120s)")
+            break
+
+    photos = list(collected.values())
+    print(f"[Collect] Found {len(photos)} unique photos (from CloudFront CDN)")
+    return photos
+
+
+async def download_photos(context, photo_metas: list[dict], dest_dir: Path, debug: bool = False) -> list[tuple[Path, dict]]:
+    """Download photos using browser context (keeps cookies/auth).
+
+    Returns list of (local_path, meta) tuples.
+    """
+    if not photo_metas:
+        return []
+
+    print(f"[Download] Downloading {len(photo_metas)} photos...")
+    downloaded = []
+
+    for i, meta in enumerate(photo_metas):
+        url = meta.get("fullres_url") or meta.get("src", "")
+        if not url:
+            continue
+
+        try:
+            response = await context.request.get(url, timeout=30000)
+
+            if response.ok:
+                body = await response.body()
+                # Determine extension from content type
+                content_type = response.headers.get("content-type", "image/jpeg")
+                ext = ".jpg"
+                if "png" in content_type:
+                    ext = ".png"
+
+                filename = f"cuddelink_{i:04d}{ext}"
+                file_path = dest_dir / filename
+                file_path.write_bytes(body)
+
+                file_size_kb = len(body) / 1024
+                if debug:
+                    print(f"  [Download] {i+1}/{len(photo_metas)}: {filename} ({file_size_kb:.0f} KB)")
+
+                downloaded.append((file_path, meta))
             else:
-                print(f"  Failed: {img_path.name}")
+                print(f"  [Download] Failed {i+1}: HTTP {response.status}")
 
-        return uploaded, skipped
+        except Exception as e:
+            print(f"  [Download] Error {i+1}: {e}")
+
+        await rate_limit(1.0)
+
+    print(f"[Download] Downloaded {len(downloaded)} of {len(photo_metas)} photos")
+    return downloaded
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Sync CuddeLink photos to R2")
-    parser.add_argument("--days-back", type=int, default=1, help="Days to look back")
-    args = parser.parse_args()
+def process_downloaded_photos(downloaded: list[tuple[Path, dict]], s3_client, config: dict, target_date_range: tuple = None) -> tuple[int, int, int]:
+    """Process downloaded photos: hash, dedupe, upload to R2, save to Supabase.
 
-    # Load config from environment
+    Returns (uploaded, skipped_duplicate, skipped_date).
+    """
+    uploaded = 0
+    skipped_dup = 0
+    skipped_date = 0
+
+    for img_path, meta in downloaded:
+        # Calculate hash
+        file_hash = hashlib.md5(img_path.read_bytes()).hexdigest()
+
+        # Check for duplicate in Supabase
+        if check_photo_exists(config["supabase_url"], config["supabase_key"], file_hash):
+            print(f"  Skipping duplicate: {img_path.name} (hash: {file_hash[:8]})")
+            skipped_dup += 1
+            continue
+
+        # Get EXIF datetime
+        datetime_taken = get_exif_datetime(img_path)
+
+        # Date range filter (when UI date filter wasn't available)
+        if target_date_range and datetime_taken:
+            try:
+                photo_date = datetime.fromisoformat(datetime_taken).date()
+                if photo_date < target_date_range[0] or photo_date > target_date_range[1]:
+                    print(f"  Skipping out-of-range: {img_path.name} ({datetime_taken})")
+                    skipped_date += 1
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        if not datetime_taken:
+            print(f"    [WARNING] No EXIF timestamp for {img_path.name}")
+            datetime_taken = f"{date.today().isoformat()}T00:00:00"
+            print(f"    Using date-only placeholder: {datetime_taken}")
+
+        # Upload full image to R2
+        r2_key = f"photos/{file_hash}.jpg"
+        if upload_to_r2(s3_client, config["r2_bucket"], img_path, r2_key):
+            # Generate and upload thumbnail
+            try:
+                thumb_data = create_thumbnail(img_path)
+                thumb_key = f"thumbnails/{file_hash}_thumb.jpg"
+                upload_bytes_to_r2(s3_client, config["r2_bucket"], thumb_data, thumb_key)
+                print(f"  Uploaded: {img_path.name} + thumbnail ({file_hash[:8]})")
+            except Exception as e:
+                print(f"  Uploaded: {img_path.name} (thumbnail failed: {e})")
+
+            if datetime_taken:
+                print(f"    EXIF timestamp: {datetime_taken}")
+
+            # Save metadata to Supabase
+            save_to_supabase(
+                config["supabase_url"],
+                config["supabase_key"],
+                file_hash,
+                datetime_taken,
+                img_path.name,
+            )
+            uploaded += 1
+        else:
+            print(f"  Failed to upload: {img_path.name}")
+
+    return uploaded, skipped_dup, skipped_date
+
+
+async def apply_date_filter_if_possible(page, days_back: int, debug: bool = False) -> bool:
+    """Try to apply a date filter via the UI. Returns True if successful."""
+    print(f"[Filter] Looking for date filter UI (days_back={days_back})...")
+
+    date_selectors = [
+        'input[type="date"]',
+        'input[class*="date"]',
+        '[class*="date-picker"]',
+        '[class*="datepicker"]',
+        'input[placeholder*="date" i]',
+    ]
+
+    for selector in date_selectors:
+        try:
+            el = await page.query_selector(selector)
+            if el:
+                if debug:
+                    print(f"  [Filter] Found date element: {selector}")
+                # Found a date picker — try to use it
+                today = date.today()
+                start = today - timedelta(days=days_back)
+
+                # Try filling it
+                await el.fill(start.isoformat())
+                await rate_limit(1.0)
+
+                # Look for an "Apply" or "Filter" button
+                apply_selectors = [
+                    'button:has-text("Apply")',
+                    'button:has-text("Filter")',
+                    'button:has-text("Search")',
+                    'button[type="submit"]',
+                ]
+                for btn_sel in apply_selectors:
+                    btn = await page.query_selector(btn_sel)
+                    if btn:
+                        await btn.click()
+                        await rate_limit(3.0)
+                        print("[Filter] Date filter applied")
+                        return True
+
+                print("[Filter] Found date input but no apply button")
+                return False
+        except Exception:
+            continue
+
+    print("[Filter] No date filter UI found — will filter by EXIF date after download")
+    return False
+
+
+async def async_main(args):
+    """Main async entry point."""
+    from playwright.async_api import async_playwright
+
+    # Load config
     config = {
         "cuddelink_email": get_env("CUDDELINK_EMAIL"),
         "cuddelink_password": get_env("CUDDELINK_PASSWORD"),
@@ -472,6 +736,8 @@ def main():
         "supabase_key": get_env("SUPABASE_KEY"),
     }
 
+    debug = args.debug
+
     # Set up R2 client
     s3_client = boto3.client(
         "s3",
@@ -482,24 +748,141 @@ def main():
         region_name="auto",
     )
 
-    # Login to CuddeLink
-    session = requests.Session()
-    cuddelink_login(session, config["cuddelink_email"], config["cuddelink_password"])
+    uploaded = 0
+    skipped_dup = 0
+    skipped_date = 0
 
-    # Process each day
-    today = date.today()
-    total_uploaded = 0
-    total_skipped = 0
+    # Load local URL cache to skip known CloudFront URLs before downloading
+    seen_urls_path = Path("/tmp/cuddelink_seen_urls.json")
+    seen_urls = set()
+    try:
+        if seen_urls_path.exists():
+            seen_urls = set(json.loads(seen_urls_path.read_text()))
+            print(f"[Cache] Loaded {len(seen_urls)} known URLs from local cache")
+    except Exception:
+        pass
 
-    for days_ago in range(args.days_back, -1, -1):
-        day = today - timedelta(days=days_ago)
-        day_str = day.strftime("%Y-%m-%d")
+    async with async_playwright() as p:
+        # Always run headed — Blazor misbehaves in headless mode.
+        # CI uses xvfb-run to provide a virtual display.
+        chrome_channel = "chrome"
 
-        uploaded, skipped = process_day(session, day_str, s3_client, config)
-        total_uploaded += uploaded
-        total_skipped += skipped
+        # Use system Chrome — Playwright's bundled Chromium headless
+        # shell crashes Blazor WebAssembly apps.
+        # slow_mo=300 for login phase (Blazor form bindings need it).
+        try:
+            browser = await p.chromium.launch(
+                channel=chrome_channel, headless=False, slow_mo=300,
+            )
+            print("[Browser] Using system Chrome (slow_mo=300 for login)")
+        except Exception:
+            chrome_channel = None
+            browser = await p.chromium.launch(headless=False, slow_mo=300)
+            print("[Browser] Using bundled Chromium (slow_mo=300 for login)")
 
-    print(f"\n[Sync] Complete! Uploaded: {total_uploaded}, Skipped: {total_skipped}")
+        login_context = None
+        try:
+            # Phase 1: Login — each attempt creates a fresh context
+            # (clean cookies, storage, service workers, anti-forgery token)
+            login_context, page = await playwright_login(
+                browser, config["cuddelink_email"], config["cuddelink_password"], debug=debug,
+            )
+
+            # Phase 2: Try date filter (best effort)
+            filtered = await apply_date_filter_if_possible(page, args.days_back, debug=debug)
+
+            # Phase 3: Scroll and collect unique CloudFront photo URLs
+            photo_metas = await collect_photos_from_dom(page, max_photos=500, debug=debug)
+
+            if not photo_metas:
+                print("[Sync] No photos found!")
+                await capture_failure(page, "no_photos")
+                return
+
+            # Phase 4: Filter out already-seen URLs (local cache)
+            new_metas = [m for m in photo_metas if m["src"] not in seen_urls]
+            if len(new_metas) < len(photo_metas):
+                print(f"[Cache] Skipped {len(photo_metas) - len(new_metas)} "
+                      f"already-seen URLs, {len(new_metas)} to download")
+            photo_metas = new_metas
+
+            if not photo_metas:
+                print("[Sync] All photos already seen — nothing to download")
+                return
+
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            raise
+        finally:
+            if login_context:
+                await login_context.close()
+            await browser.close()
+
+        # Phase 5: Download with a FAST browser (no slow_mo)
+        launch_args = {"headless": False}
+        try:
+            if chrome_channel:
+                dl_browser = await p.chromium.launch(channel=chrome_channel, **launch_args)
+            else:
+                dl_browser = await p.chromium.launch(**launch_args)
+        except Exception:
+            dl_browser = await p.chromium.launch(**launch_args)
+
+        dl_context = await dl_browser.new_context()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                dest_dir = Path(tmp)
+
+                downloaded = await download_photos(dl_context, photo_metas, dest_dir, debug=debug)
+
+                if not downloaded:
+                    print("[Sync] No photos downloaded!")
+                    return
+
+                # Phase 6: Process, upload, save
+                target_date_range = None
+                if not filtered:
+                    today = date.today()
+                    start = today - timedelta(days=args.days_back)
+                    target_date_range = (start, today)
+
+                uploaded, skipped_dup, skipped_date = process_downloaded_photos(
+                    downloaded, s3_client, config, target_date_range
+                )
+
+                if not filtered and skipped_date > 0:
+                    pct = (skipped_date / len(downloaded)) * 100 if downloaded else 0
+                    print(f"[Filter] EXIF date filter: kept {len(downloaded) - skipped_date}, "
+                          f"skipped {skipped_date} out-of-range ({pct:.0f}%)")
+                    if pct > 50:
+                        print("[WARNING] Most downloaded photos were outside date range. "
+                              "Consider implementing UI date filter for efficiency.")
+
+            # Update local URL cache with all collected URLs (including dupes)
+            all_urls = {m["src"] for m in photo_metas}
+            seen_urls.update(all_urls)
+            try:
+                seen_urls_path.write_text(json.dumps(sorted(seen_urls)))
+                print(f"[Cache] Saved {len(seen_urls)} URLs to local cache")
+            except Exception:
+                pass
+
+        finally:
+            await dl_browser.close()
+
+    total_skipped = skipped_dup + skipped_date
+    print(f"\n[Sync] Complete! Uploaded: {uploaded}, Skipped: {total_skipped} "
+          f"(duplicates: {skipped_dup}, out-of-range: {skipped_date})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync CuddeLink photos to R2 (Playwright)")
+    parser.add_argument("--days-back", type=int, default=1, help="Days to look back")
+    parser.add_argument("--debug", action="store_true",
+                        help="Run headed browser with slow_mo + verbose logging")
+    args = parser.parse_args()
+
+    asyncio.run(async_main(args))
 
 
 if __name__ == "__main__":
