@@ -245,6 +245,10 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
             json=data,
             timeout=30,
         )
+        # 409 = duplicate key, which means the record already exists.
+        # Treat as success since Supabase is our idempotent store.
+        if resp.status_code == 409:
+            return True
         if resp.status_code >= 400:
             print(f"    [Supabase] Save failed: {resp.status_code} {resp.text[:100]}")
             return False
@@ -433,7 +437,7 @@ async def playwright_login(browser, email: str, password: str, debug: bool = Fal
     storage, service workers, and anti-forgery token). This prevents
     stale Blazor circuit state from poisoning retries.
 
-    Returns (context, page) on success — caller must close context.
+    Returns (context, page, attempts_used) on success — caller must close context.
     """
     for attempt in range(1, MAX_BOOTSTRAP_ATTEMPTS + 1):
         print(f"[CuddeLink] Login attempt {attempt}/{MAX_BOOTSTRAP_ATTEMPTS}...")
@@ -449,7 +453,9 @@ async def playwright_login(browser, email: str, password: str, debug: bool = Fal
 
             if ready:
                 await submit_credentials(page, email, password, debug=debug)
-                return context, page
+                if attempt > 1:
+                    print(f"[CuddeLink] WARNING: Login required {attempt} attempts")
+                return context, page, attempt
 
         except Exception as e:
             await capture_failure(page, f"login_fail_attempt_{attempt}")
@@ -564,6 +570,7 @@ async def download_photos(context, photo_metas: list[dict], dest_dir: Path, debu
 
     print(f"[Download] Downloading {len(photo_metas)} photos...")
     downloaded = []
+    dl_start = time.time()
 
     for i, meta in enumerate(photo_metas):
         url = meta.get("fullres_url") or meta.get("src", "")
@@ -598,7 +605,10 @@ async def download_photos(context, photo_metas: list[dict], dest_dir: Path, debu
 
         await rate_limit(1.0)
 
-    print(f"[Download] Downloaded {len(downloaded)} of {len(photo_metas)} photos")
+    dl_elapsed = time.time() - dl_start
+    avg_time = dl_elapsed / len(photo_metas) if photo_metas else 0
+    print(f"[Download] Downloaded {len(downloaded)} of {len(photo_metas)} photos "
+          f"in {dl_elapsed:.0f}s (avg {avg_time:.1f}s/photo)")
     return downloaded
 
 
@@ -781,10 +791,11 @@ async def async_main(args):
             print("[Browser] Using bundled Chromium (slow_mo=300 for login)")
 
         login_context = None
+        login_attempts = 0
         try:
             # Phase 1: Login — each attempt creates a fresh context
             # (clean cookies, storage, service workers, anti-forgery token)
-            login_context, page = await playwright_login(
+            login_context, page, login_attempts = await playwright_login(
                 browser, config["cuddelink_email"], config["cuddelink_password"], debug=debug,
             )
 
@@ -792,7 +803,7 @@ async def async_main(args):
             filtered = await apply_date_filter_if_possible(page, args.days_back, debug=debug)
 
             # Phase 3: Scroll and collect unique CloudFront photo URLs
-            photo_metas = await collect_photos_from_dom(page, max_photos=500, debug=debug)
+            photo_metas = await collect_photos_from_dom(page, max_photos=args.max_photos, debug=debug)
 
             if not photo_metas:
                 print("[Sync] No photos found!")
@@ -873,11 +884,15 @@ async def async_main(args):
     total_skipped = skipped_dup + skipped_date
     print(f"\n[Sync] Complete! Uploaded: {uploaded}, Skipped: {total_skipped} "
           f"(duplicates: {skipped_dup}, out-of-range: {skipped_date})")
+    print(f"[Telemetry] Login attempts: {login_attempts}, "
+          f"Photos collected: {len(photo_metas)}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sync CuddeLink photos to R2 (Playwright)")
     parser.add_argument("--days-back", type=int, default=1, help="Days to look back")
+    parser.add_argument("--max-photos", type=int, default=500,
+                        help="Max photos to collect before stopping (default 500)")
     parser.add_argument("--debug", action="store_true",
                         help="Run headed browser with slow_mo + verbose logging")
     args = parser.parse_args()
