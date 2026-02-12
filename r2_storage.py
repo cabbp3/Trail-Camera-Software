@@ -353,7 +353,14 @@ class R2Storage:
         try:
             self.client.head_object(Bucket=self.bucket_name, Key=r2_key)
             return True
-        except:
+        except self.client.exceptions.NoSuchKey:
+            return False
+        except Exception as e:
+            # 404 comes back as ClientError with code 404
+            error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
+            if error_code in ('404', 'NoSuchKey'):
+                return False
+            logger.warning(f"R2 check_exists unexpected error for {r2_key}: {e}")
             return False
 
     def get_bucket_stats(self) -> dict:
@@ -362,13 +369,13 @@ class R2Storage:
             return {"error": "Not configured"}
 
         try:
-            response = self.client.list_objects_v2(Bucket=self.bucket_name)
-
+            paginator = self.client.get_paginator('list_objects_v2')
             total_size = 0
             count = 0
-            for obj in response.get("Contents", []):
-                total_size += obj.get("Size", 0)
-                count += 1
+            for page in paginator.paginate(Bucket=self.bucket_name):
+                for obj in page.get("Contents", []):
+                    total_size += obj.get("Size", 0)
+                    count += 1
 
             return {
                 "object_count": count,

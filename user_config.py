@@ -13,6 +13,7 @@ from typing import Optional, List
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path.home() / ".trailcam" / "user_config.json"
+SESSION_PATH = Path.home() / ".trailcam" / "session.json"
 
 # Default clubs (matches collections in database)
 DEFAULT_CLUBS = [
@@ -22,8 +23,24 @@ DEFAULT_CLUBS = [
 ]
 
 
+def get_auth_username() -> Optional[str]:
+    """Get display_name from Supabase session, if available."""
+    if not SESSION_PATH.exists():
+        return None
+    try:
+        with open(SESSION_PATH) as f:
+            session = json.load(f)
+        return session.get("display_name") or session.get("user_email")
+    except Exception as e:
+        logger.error(f"Failed to read auth session: {e}")
+        return None
+
+
 def get_username() -> Optional[str]:
     """Get the stored username, or None if not set."""
+    auth_name = get_auth_username()
+    if auth_name:
+        return auth_name
     if not CONFIG_PATH.exists():
         return None
 

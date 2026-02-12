@@ -6,6 +6,7 @@ import os
 import time
 import threading
 import logging
+import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Union
 from datetime import datetime
@@ -36,7 +37,7 @@ class TrailCamDatabase:
         # Check for crash on previous run and repair if needed
         self._check_and_repair_after_crash()
 
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = self._connect_with_retry(db_path)
         self.conn.row_factory = sqlite3.Row
         # Enable WAL mode for better concurrent access and performance
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -52,6 +53,20 @@ class TrailCamDatabase:
 
         # Create daily backup if not done today (protects against corruption)
         self.check_daily_backup()
+
+    def _connect_with_retry(self, db_path: str, max_retries: int = 5) -> sqlite3.Connection:
+        """Connect to SQLite with exponential backoff on 'database is locked'."""
+        delay = 0.1
+        for attempt in range(max_retries):
+            try:
+                return sqlite3.connect(db_path, check_same_thread=False)
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    logger.warning(f"Database locked, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    raise
 
     def _get_audit_conn(self):
         """Get connection to audit log database (lazy loaded)."""
@@ -127,6 +142,7 @@ class TrailCamDatabase:
                 FROM tags t
                 JOIN photos p ON t.photo_id = p.id
                 WHERE p.file_hash IS NOT NULL
+                  AND t.deleted_at IS NULL
             """)
             db_tags = {(row[0], row[1]) for row in main_cursor.fetchall()}
 
@@ -167,6 +183,22 @@ class TrailCamDatabase:
 
         if not flag_path.exists():
             return  # Clean shutdown last time
+
+        # Check if the PID in the flag file is still alive
+        try:
+            content = flag_path.read_text()
+            for line in content.splitlines():
+                if line.startswith("pid:"):
+                    old_pid = int(line.split(":", 1)[1].strip())
+                    try:
+                        os.kill(old_pid, 0)  # Signal 0 = check if alive
+                        # PID is alive — another instance is running, not a crash
+                        logger.info(f"Another instance (PID {old_pid}) is still running, skipping crash repair")
+                        return
+                    except (OSError, ProcessLookupError):
+                        break  # PID is dead — treat as crash
+        except Exception:
+            pass  # Can't read flag — assume crash
 
         logger.warning("Detected unclean shutdown - checking database integrity...")
         print("Detected unclean shutdown - checking database integrity...")
@@ -357,8 +389,8 @@ class TrailCamDatabase:
             logger.info(f"Database backup created: {backup_path}")
             print(f"[Backup] Created: {backup_name}")
 
-            # Clean up old backups (keep last 10 per reason)
-            self._cleanup_old_backups(reason, keep=10)
+            # Clean up old backups (keep last 30 per reason)
+            self._cleanup_old_backups(reason, keep=30)
 
             return backup_path
 
@@ -367,7 +399,7 @@ class TrailCamDatabase:
             print(f"[Backup] Failed: {e}")
             return None
 
-    def _cleanup_old_backups(self, reason: str, keep: int = 10):
+    def _cleanup_old_backups(self, reason: str, keep: int = 30):
         """Remove old backups, keeping only the most recent ones."""
         try:
             backup_dir = self.get_backup_dir()
@@ -408,6 +440,8 @@ class TrailCamDatabase:
                 logger.info(f"Daily backup already exists: {existing[0].name}")
                 return True
 
+            # Checkpoint WAL before backup to capture recent writes
+            self.checkpoint_wal()
             # Create today's backup
             backup_path = self.create_backup(reason="daily")
             return backup_path is not None
@@ -613,6 +647,7 @@ class TrailCamDatabase:
                 representative_photo_id INTEGER,
                 photo_count INTEGER DEFAULT 0,
                 created_at TEXT,
+                confirmed INTEGER DEFAULT 1,
                 FOREIGN KEY (representative_photo_id) REFERENCES photos(id)
             )
         """)
@@ -644,9 +679,11 @@ class TrailCamDatabase:
 
         self.conn.commit()
         self._ensure_photo_columns()
+        self._ensure_site_columns()
         self._ensure_deer_columns()
         self._ensure_box_columns()
         self._ensure_sync_tracking()
+        self._ensure_roles_schema()
 
     def _ensure_photo_columns(self):
         """Ensure newer photo columns exist for backward compatibility."""
@@ -692,6 +729,16 @@ class TrailCamDatabase:
         """)
         self.conn.commit()
         self._backfill_season_years()
+
+    def _ensure_site_columns(self):
+        """Ensure newer site columns exist for backward compatibility."""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(sites)")
+        cols = {row[1] for row in cursor.fetchall()}
+        if "confirmed" not in cols:
+            cursor.execute("ALTER TABLE sites ADD COLUMN confirmed INTEGER DEFAULT 1")
+            cursor.execute("UPDATE sites SET confirmed = 1 WHERE confirmed IS NULL")
+        self.conn.commit()
 
     def _ensure_deer_columns(self):
         """Ensure deer metadata tables have newer columns."""
@@ -799,6 +846,17 @@ class TrailCamDatabase:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN species TEXT")
         if "species_conf" not in cols:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN species_conf REAL")
+        # Stable sync ID for multi-device conflict resolution
+        if "sync_id" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN sync_id TEXT")
+            import uuid as _uuid
+            cursor.execute("SELECT id FROM annotation_boxes WHERE sync_id IS NULL")
+            for row in cursor.fetchall():
+                cursor.execute("UPDATE annotation_boxes SET sync_id = ? WHERE id = ?",
+                              (str(_uuid.uuid4()), row[0]))
+        # Tombstone support for soft-delete sync
+        if "deleted_at" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN deleted_at TEXT")
         self.conn.commit()
 
     def _ensure_sync_tracking(self):
@@ -829,9 +887,26 @@ class TrailCamDatabase:
         # Initialize sync_state if empty
         cursor.execute("INSERT OR IGNORE INTO sync_state (id) VALUES (1)")
 
+        # Tombstone support for tags (soft-delete for multi-device sync)
+        cursor.execute("PRAGMA table_info(tags)")
+        tag_cols = {row[1] for row in cursor.fetchall()}
+        if "deleted_at" not in tag_cols:
+            cursor.execute("ALTER TABLE tags ADD COLUMN deleted_at TEXT")
+
+        # Add schema_version for migration tracking
+        cursor.execute("PRAGMA table_info(sync_state)")
+        ss_cols = {row[1] for row in cursor.fetchall()}
+        if "schema_version" not in ss_cols:
+            cursor.execute("ALTER TABLE sync_state ADD COLUMN schema_version INTEGER DEFAULT 1")
+
         # Create indexes for updated_at columns
         for table in sync_tables:
             cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_updated_at ON {table}(updated_at)")
+
+        # Indexes for tombstone and sync_id columns
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tags_deleted_at ON tags(deleted_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_annotation_boxes_sync_id ON annotation_boxes(sync_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_annotation_boxes_deleted_at ON annotation_boxes(deleted_at)")
 
         # Create triggers to auto-update updated_at on INSERT and UPDATE
         for table in sync_tables:
@@ -857,6 +932,242 @@ class TrailCamDatabase:
             """)
 
         self.conn.commit()
+
+    def _ensure_roles_schema(self):
+        """Add cameras, permissions, clubs, shares, and label_suggestions tables.
+
+        Supports the camera-owner-based permissions model where:
+        - Camera owner = photo owner
+        - Owner can share cameras to clubs
+        - Owner can delegate co-owner rights
+        - Members can suggest labels; only owners approve
+        """
+        import uuid
+        cursor = self.conn.cursor()
+
+        # --- New tables (all idempotent) ---
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cameras (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                verified INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS camera_permissions (
+                id TEXT PRIMARY KEY,
+                camera_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                granted_by TEXT,
+                granted_at TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                FOREIGN KEY (camera_id) REFERENCES cameras(id),
+                UNIQUE(camera_id, username)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clubs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_by TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS club_memberships (
+                id TEXT PRIMARY KEY,
+                club_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                created_at TEXT,
+                updated_at TEXT,
+                FOREIGN KEY (club_id) REFERENCES clubs(id),
+                UNIQUE(club_id, username)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS camera_club_shares (
+                id TEXT PRIMARY KEY,
+                camera_id TEXT NOT NULL,
+                club_id TEXT NOT NULL,
+                shared_by TEXT,
+                visibility TEXT DEFAULT 'full',
+                created_at TEXT,
+                updated_at TEXT,
+                FOREIGN KEY (camera_id) REFERENCES cameras(id),
+                FOREIGN KEY (club_id) REFERENCES clubs(id),
+                UNIQUE(camera_id, club_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS label_suggestions (
+                id TEXT PRIMARY KEY,
+                photo_id INTEGER NOT NULL,
+                file_hash TEXT,
+                tag_name TEXT NOT NULL,
+                suggested_by TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                reviewed_by TEXT,
+                reviewed_at TEXT,
+                camera_id TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                deleted_at TEXT,
+                FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE,
+                FOREIGN KEY (camera_id) REFERENCES cameras(id),
+                UNIQUE(photo_id, tag_name, suggested_by)
+            )
+        """)
+
+        # --- Add camera_id to photos table ---
+        cursor.execute("PRAGMA table_info(photos)")
+        photo_cols = {row[1] for row in cursor.fetchall()}
+        if "camera_id" not in photo_cols:
+            cursor.execute("ALTER TABLE photos ADD COLUMN camera_id TEXT")
+
+        # --- Add created_by to tags table ---
+        cursor.execute("PRAGMA table_info(tags)")
+        tag_cols = {row[1] for row in cursor.fetchall()}
+        if "created_by" not in tag_cols:
+            cursor.execute("ALTER TABLE tags ADD COLUMN created_by TEXT")
+
+        # --- Indexes on foreign keys and lookup columns ---
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_camera_id ON photos(camera_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_camera_permissions_camera ON camera_permissions(camera_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_camera_permissions_user ON camera_permissions(username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_club_memberships_club ON club_memberships(club_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_club_memberships_user ON club_memberships(username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_camera_club_shares_camera ON camera_club_shares(camera_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_camera_club_shares_club ON camera_club_shares(club_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_label_suggestions_photo ON label_suggestions(photo_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_label_suggestions_camera ON label_suggestions(camera_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_label_suggestions_status ON label_suggestions(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_label_suggestions_deleted ON label_suggestions(deleted_at)")
+
+        # --- Triggers for updated_at on new sync-able tables ---
+        new_sync_tables = ['cameras', 'camera_permissions', 'clubs',
+                           'club_memberships', 'camera_club_shares', 'label_suggestions']
+        for table in new_sync_tables:
+            cursor.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS {table}_insert_updated_at
+                AFTER INSERT ON {table}
+                FOR EACH ROW
+                WHEN NEW.updated_at IS NULL
+                BEGIN
+                    UPDATE {table} SET updated_at = datetime('now') WHERE rowid = NEW.rowid;
+                END
+            """)
+            cursor.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS {table}_update_updated_at
+                AFTER UPDATE ON {table}
+                FOR EACH ROW
+                WHEN NEW.updated_at = OLD.updated_at OR NEW.updated_at IS NULL
+                BEGIN
+                    UPDATE {table} SET updated_at = datetime('now') WHERE rowid = NEW.rowid;
+                END
+            """)
+
+        # --- Data migration: auto-create cameras from existing sites ---
+        cursor.execute("SELECT COUNT(*) FROM cameras")
+        camera_count = cursor.fetchone()[0]
+
+        if camera_count == 0:
+            # First time: create cameras from sites table
+            from user_config import get_username
+            current_user = get_username() or "unknown"
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Get all sites
+            cursor.execute("SELECT id, name FROM sites")
+            sites = cursor.fetchall()
+
+            # Map site_id -> camera_id for photo assignment
+            site_to_camera = {}
+
+            for site_id, site_name in sites:
+                camera_id = str(uuid.uuid4())
+                camera_name = f"Unverified: {site_name}" if site_name else "Unverified: Unknown"
+                cursor.execute(
+                    "INSERT INTO cameras (id, name, owner, verified, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)",
+                    (camera_id, camera_name, current_user, now, now))
+                # Owner permission
+                perm_id = str(uuid.uuid4())
+                cursor.execute(
+                    "INSERT INTO camera_permissions (id, camera_id, username, role, granted_by, granted_at, created_at, updated_at) VALUES (?, ?, ?, 'owner', ?, ?, ?, ?)",
+                    (perm_id, camera_id, current_user, current_user, now, now, now))
+                site_to_camera[site_id] = camera_id
+
+            # Create a fallback camera for photos with no site_id
+            fallback_camera_id = None
+            cursor.execute("SELECT COUNT(*) FROM photos WHERE site_id IS NULL OR site_id = 0")
+            no_site_count = cursor.fetchone()[0]
+            if no_site_count > 0:
+                fallback_camera_id = str(uuid.uuid4())
+                cursor.execute(
+                    "INSERT INTO cameras (id, name, owner, verified, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)",
+                    (fallback_camera_id, "Unverified: Unknown", current_user, now, now))
+                perm_id = str(uuid.uuid4())
+                cursor.execute(
+                    "INSERT INTO camera_permissions (id, camera_id, username, role, granted_by, granted_at, created_at, updated_at) VALUES (?, ?, ?, 'owner', ?, ?, ?, ?)",
+                    (perm_id, fallback_camera_id, current_user, current_user, now, now, now))
+
+            # Assign photos to cameras based on site_id
+            for site_id, camera_id in site_to_camera.items():
+                cursor.execute("UPDATE photos SET camera_id = ? WHERE site_id = ?", (camera_id, site_id))
+
+            # Assign photos with no site to fallback
+            if fallback_camera_id:
+                cursor.execute("UPDATE photos SET camera_id = ? WHERE camera_id IS NULL", (fallback_camera_id,))
+
+            migrated = sum(1 for _ in site_to_camera.values()) + (1 if fallback_camera_id else 0)
+            if migrated > 0:
+                logger.info(f"Roles migration: created {migrated} cameras from {len(sites)} sites, assigned all photos")
+
+        self.conn.commit()
+
+    def _normalize_ts(self, ts):
+        """Normalize timestamp for comparison: 'YYYY-MM-DD HH:MM:SS' format.
+
+        Handles both SQLite (YYYY-MM-DD HH:MM:SS) and Supabase
+        (YYYY-MM-DDTHH:MM:SS.ssssss+00:00) formats.
+        """
+        if not ts:
+            return ""
+        s = ts.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        s = s.replace('T', ' ')
+        s = s.split('.')[0]
+        s = re.sub(r'([+-]\d{2}:\d{2})$', '', s)
+        return s
+
+    def purge_old_tombstones(self, days=30):
+        """Hard-delete tombstoned tags and boxes older than `days` days.
+
+        Call after a successful sync to prevent tombstone buildup.
+        """
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM tags WHERE deleted_at IS NOT NULL AND deleted_at < ?", (cutoff,))
+            tags_purged = cursor.rowcount
+            cursor.execute("DELETE FROM annotation_boxes WHERE deleted_at IS NOT NULL AND deleted_at < ?", (cutoff,))
+            boxes_purged = cursor.rowcount
+            self.conn.commit()
+        if tags_purged or boxes_purged:
+            logger.info(f"Tombstone GC: purged {tags_purged} tags, {boxes_purged} boxes older than {days} days")
 
     def get_last_sync_time(self, sync_type='push') -> Optional[str]:
         """Get the last sync timestamp."""
@@ -1114,52 +1425,81 @@ class TrailCamDatabase:
 
     def set_camera_model(self, photo_id: int, camera_model: str):
         """Update camera_model for a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE photos SET camera_model = ? WHERE id = ?", (camera_model or "", photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET camera_model = ? WHERE id = ?", (camera_model or "", photo_id))
+            self.conn.commit()
 
     def set_date_taken(self, photo_id: int, date_taken: Optional[str]):
         """Update date_taken for a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE photos SET date_taken = ? WHERE id = ?", (date_taken, photo_id))
-        self.conn.commit()
-    
-    def add_tag(self, photo_id: int, tag_name: str):
-        """Add a tag to a photo."""
         with self._lock:
             cursor = self.conn.cursor()
-            try:
-                cursor.execute("INSERT INTO tags (photo_id, tag_name) VALUES (?, ?)",
-                             (photo_id, tag_name))
+            cursor.execute("UPDATE photos SET date_taken = ? WHERE id = ?", (date_taken, photo_id))
+            self.conn.commit()
+    
+    def add_tag(self, photo_id: int, tag_name: str):
+        """Add a tag to a photo. Un-tombstones if previously soft-deleted."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            # Check if tombstoned version exists — revive it
+            cursor.execute("SELECT id FROM tags WHERE photo_id = ? AND tag_name = ? AND deleted_at IS NOT NULL",
+                          (photo_id, tag_name))
+            tombstoned = cursor.fetchone()
+            if tombstoned:
+                cursor.execute("UPDATE tags SET deleted_at = NULL, updated_at = ? WHERE id = ?",
+                              (now, tombstoned[0]))
                 self.conn.commit()
-                # Log to audit trail
+                self._log_tag_change('add', photo_id, tag_name)
+                return
+            try:
+                cursor.execute("INSERT INTO tags (photo_id, tag_name, updated_at) VALUES (?, ?, ?)",
+                             (photo_id, tag_name, now))
+                self.conn.commit()
                 self._log_tag_change('add', photo_id, tag_name)
             except sqlite3.IntegrityError:
-                # Tag already exists, ignore
+                # Tag already exists and is active, ignore
                 pass
     
     def update_photo_tags(self, photo_id: int, tags: List[str]):
         """Replace all tags for a photo with the provided list.
+
+        Uses differential soft-delete for multi-device sync safety:
+        removed tags get tombstoned, new tags are inserted or un-tombstoned.
 
         If tags include 'Review' or 'Verification', automatically sets that
         as the photo-level suggested_tag for visibility in filters/reports.
         """
         with self._lock:
             cursor = self.conn.cursor()
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Get current tags for audit logging
-            cursor.execute("SELECT tag_name FROM tags WHERE photo_id = ?", (photo_id,))
-            old_tags = set(row[0] for row in cursor.fetchall())
+            # Get current active (non-tombstoned) tags
+            cursor.execute("SELECT id, tag_name FROM tags WHERE photo_id = ? AND deleted_at IS NULL", (photo_id,))
+            active = {row[1]: row[0] for row in cursor.fetchall()}
 
-            cursor.execute("DELETE FROM tags WHERE photo_id = ?", (photo_id,))
-            # Deduplicate tags to avoid UNIQUE constraint violation
-            unique_tags = list(dict.fromkeys(tags))  # Preserves order
+            # Deduplicate incoming tags
+            unique_tags = list(dict.fromkeys(tags))
             new_tags = set(unique_tags)
+            old_tags = set(active.keys())
 
-            cursor.executemany(
-                "INSERT INTO tags (photo_id, tag_name) VALUES (?, ?)",
-                [(photo_id, tag) for tag in unique_tags]
-            )
+            # Soft-delete removed tags
+            for tag in old_tags - new_tags:
+                cursor.execute("UPDATE tags SET deleted_at = ?, updated_at = ? WHERE id = ?",
+                              (now, now, active[tag]))
+
+            # Un-tombstone or insert added tags
+            for tag in new_tags - old_tags:
+                # Check if there's a tombstoned version we can revive
+                cursor.execute("SELECT id FROM tags WHERE photo_id = ? AND tag_name = ? AND deleted_at IS NOT NULL",
+                              (photo_id, tag))
+                tombstoned = cursor.fetchone()
+                if tombstoned:
+                    cursor.execute("UPDATE tags SET deleted_at = NULL, updated_at = ? WHERE id = ?",
+                                  (now, tombstoned[0]))
+                else:
+                    cursor.execute("INSERT INTO tags (photo_id, tag_name, updated_at) VALUES (?, ?, ?)",
+                                  (photo_id, tag, now))
 
             # Auto-sync verification tags to photo level for visibility
             review_tags = {'Review', 'Verification'}
@@ -1183,28 +1523,48 @@ class TrailCamDatabase:
         return self.get_tags(photo_id)
     
     def remove_tag(self, photo_id: int, tag_name: str):
-        """Remove a tag from a photo. Thread-safe."""
+        """Remove a tag from a photo (soft-delete for sync). Thread-safe."""
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM tags WHERE photo_id = ? AND tag_name = ?",
-                          (photo_id, tag_name))
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                "UPDATE tags SET deleted_at = ?, updated_at = ? WHERE photo_id = ? AND tag_name = ? AND deleted_at IS NULL",
+                (now, now, photo_id, tag_name))
             self.conn.commit()
         # Log to audit trail
         self._log_tag_change('remove', photo_id, tag_name)
     
     def get_tags(self, photo_id: int) -> List[str]:
-        """Get all tags for a photo. Thread-safe."""
+        """Get all active (non-tombstoned) tags for a photo. Thread-safe."""
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT tag_name FROM tags WHERE photo_id = ? ORDER BY tag_name",
+            cursor.execute("SELECT tag_name FROM tags WHERE photo_id = ? AND deleted_at IS NULL ORDER BY tag_name",
                           (photo_id,))
             return [row['tag_name'] for row in cursor.fetchall()]
+
+    def get_all_tags_batch(self, photo_ids: List[int]) -> Dict[int, List[str]]:
+        """Get tags for many photos in one query. Thread-safe."""
+        if not photo_ids:
+            return {}
+        with self._lock:
+            cursor = self.conn.cursor()
+            placeholders = ",".join(["?"] * len(photo_ids))
+            cursor.execute(
+                f"SELECT photo_id, tag_name FROM tags "
+                f"WHERE photo_id IN ({placeholders}) AND deleted_at IS NULL",
+                photo_ids
+            )
+            tags_map: Dict[int, List[str]] = {}
+            for row in cursor.fetchall():
+                pid = row["photo_id"]
+                tags_map.setdefault(pid, []).append(row["tag_name"])
+            return tags_map
 
     def get_all_distinct_tags(self) -> List[str]:
         """Get all distinct tag names across all photos. Thread-safe."""
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT DISTINCT tag_name FROM tags ORDER BY tag_name")
+            cursor.execute("SELECT DISTINCT tag_name FROM tags WHERE deleted_at IS NULL ORDER BY tag_name")
             return [row['tag_name'] for row in cursor.fetchall()]
 
     def set_deer_metadata(self, photo_id: int, deer_id: str = None, age_class: str = None,
@@ -1671,9 +2031,10 @@ class TrailCamDatabase:
 
     def set_favorite(self, photo_id: int, is_favorite: bool):
         """Set favorite flag for a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE photos SET favorite = ? WHERE id = ?", (1 if is_favorite else 0, photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET favorite = ? WHERE id = ?", (1 if is_favorite else 0, photo_id))
+            self.conn.commit()
 
     def is_favorite(self, photo_id: int) -> bool:
         """Check if photo is marked favorite."""
@@ -1684,9 +2045,10 @@ class TrailCamDatabase:
 
     def set_notes(self, photo_id: int, notes: str):
         """Set notes text for a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE photos SET notes = ? WHERE id = ?", (notes or "", photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET notes = ? WHERE id = ?", (notes or "", photo_id))
+            self.conn.commit()
 
     def get_notes(self, photo_id: int) -> str:
         """Get notes text for a photo."""
@@ -1850,12 +2212,23 @@ class TrailCamDatabase:
 
     # Annotation boxes
     def set_boxes(self, photo_id: int, boxes: List[Dict[str, float]]):
-        """Replace boxes for a photo. Boxes use relative coords 0-1 and optional per-box data."""
+        """Replace boxes for a photo. Uses differential update with soft-delete for sync safety.
+
+        Boxes with an 'id' matching an existing active box are updated in-place.
+        Boxes without a matching id are inserted with a new sync_id.
+        Existing active boxes not present in the incoming list are soft-deleted.
+        """
+        import uuid as _uuid
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Deduplicate boxes by (label, rounded coordinates)
+            # Get existing active (non-tombstoned) boxes
+            cursor.execute("SELECT id, sync_id FROM annotation_boxes WHERE photo_id = ? AND deleted_at IS NULL",
+                          (photo_id,))
+            existing = {row[0]: row[1] for row in cursor.fetchall()}
+
+            # Deduplicate incoming boxes by (label, rounded coordinates)
             seen = set()
             unique_boxes = []
             for b in boxes:
@@ -1866,38 +2239,64 @@ class TrailCamDatabase:
                     seen.add(key)
                     unique_boxes.append(b)
 
-            to_insert = []
+            incoming_ids = set()
             for b in unique_boxes:
+                box_id = b.get("id")
                 conf = b.get("confidence")
                 species = b.get("species", "")
                 species_conf = b.get("species_conf")
                 sex = b.get("sex", "")
                 sex_conf = b.get("sex_conf")
                 ai_suggested = b.get("ai_suggested_species", "")
-                to_insert.append((
-                    photo_id,
-                    b.get("label", ""),
-                    float(b["x1"]),
-                    float(b["y1"]),
-                    float(b["x2"]),
-                    float(b["y2"]),
-                    float(conf) if conf is not None else None,
-                    species if species else None,
-                    float(species_conf) if species_conf is not None else None,
-                    sex if sex else None,
-                    float(sex_conf) if sex_conf is not None else None,
-                    b.get("head_x1"),
-                    b.get("head_y1"),
-                    b.get("head_x2"),
-                    b.get("head_y2"),
-                    b.get("head_notes") or None,
-                    ai_suggested if ai_suggested else None,
-                ))
-            if to_insert:
-                cursor.executemany(
-                    "INSERT INTO annotation_boxes (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf, sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes, ai_suggested_species) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    to_insert,
-                )
+
+                if box_id and box_id in existing:
+                    # UPDATE existing box (preserves sync_id)
+                    incoming_ids.add(box_id)
+                    cursor.execute("""UPDATE annotation_boxes SET
+                        label=?, x1=?, y1=?, x2=?, y2=?, confidence=?,
+                        species=?, species_conf=?, sex=?, sex_conf=?,
+                        head_x1=?, head_y1=?, head_x2=?, head_y2=?, head_notes=?,
+                        ai_suggested_species=?
+                        WHERE id = ?""",
+                        (b.get("label", ""), float(b["x1"]), float(b["y1"]),
+                         float(b["x2"]), float(b["y2"]),
+                         float(conf) if conf is not None else None,
+                         species if species else None,
+                         float(species_conf) if species_conf is not None else None,
+                         sex if sex else None,
+                         float(sex_conf) if sex_conf is not None else None,
+                         b.get("head_x1"), b.get("head_y1"),
+                         b.get("head_x2"), b.get("head_y2"),
+                         b.get("head_notes") or None,
+                         ai_suggested if ai_suggested else None,
+                         box_id))
+                else:
+                    # INSERT new box with sync_id
+                    sync_id = b.get("sync_id") or str(_uuid.uuid4())
+                    cursor.execute("""INSERT INTO annotation_boxes
+                        (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf,
+                         sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes,
+                         ai_suggested_species, sync_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (photo_id, b.get("label", ""), float(b["x1"]), float(b["y1"]),
+                         float(b["x2"]), float(b["y2"]),
+                         float(conf) if conf is not None else None,
+                         species if species else None,
+                         float(species_conf) if species_conf is not None else None,
+                         sex if sex else None,
+                         float(sex_conf) if sex_conf is not None else None,
+                         b.get("head_x1"), b.get("head_y1"),
+                         b.get("head_x2"), b.get("head_y2"),
+                         b.get("head_notes") or None,
+                         ai_suggested if ai_suggested else None,
+                         sync_id))
+
+            # Soft-delete boxes not in incoming set
+            for box_id in existing:
+                if box_id not in incoming_ids:
+                    cursor.execute("UPDATE annotation_boxes SET deleted_at = ?, updated_at = ? WHERE id = ?",
+                                  (now, now, box_id))
+
             self.conn.commit()
 
     def get_boxes(self, photo_id: int) -> List[Dict[str, float]]:
@@ -1906,8 +2305,8 @@ class TrailCamDatabase:
             cursor.execute("""
                 SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf,
                        head_x1, head_y1, head_x2, head_y2, head_notes, sex, sex_conf,
-                       ai_suggested_species
-                FROM annotation_boxes WHERE photo_id = ?
+                       ai_suggested_species, sync_id
+                FROM annotation_boxes WHERE photo_id = ? AND deleted_at IS NULL
             """, (photo_id,))
             out = []
             for row in cursor.fetchall():
@@ -1933,6 +2332,8 @@ class TrailCamDatabase:
                     box["sex_conf"] = row[15]
                 if row[16]:
                     box["ai_suggested_species"] = row[16]
+                if row[17]:
+                    box["sync_id"] = row[17]
                 out.append(box)
             return out
 
@@ -1975,55 +2376,59 @@ class TrailCamDatabase:
             x2, y2: Nose tip position (relative 0-1)
             notes: Optional notes about this annotation
         """
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE annotation_boxes SET head_x1 = ?, head_y1 = ?, head_x2 = ?, head_y2 = ?, head_notes = ? WHERE id = ?",
-            (x1, y1, x2, y2, notes, box_id)
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE annotation_boxes SET head_x1 = ?, head_y1 = ?, head_x2 = ?, head_y2 = ?, head_notes = ? WHERE id = ?",
+                (x1, y1, x2, y2, notes, box_id)
+            )
+            self.conn.commit()
 
     def clear_box_head_line(self, box_id: int):
         """Clear head direction line for a specific box."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE annotation_boxes SET head_x1 = NULL, head_y1 = NULL, head_x2 = NULL, head_y2 = NULL, head_notes = NULL WHERE id = ?",
-            (box_id,)
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE annotation_boxes SET head_x1 = NULL, head_y1 = NULL, head_x2 = NULL, head_y2 = NULL, head_notes = NULL WHERE id = ?",
+                (box_id,)
+            )
+            self.conn.commit()
 
     def get_deer_boxes_for_head_annotation(self) -> List[Dict]:
         """Get all deer boxes that need head direction annotation.
 
         Returns boxes where species is 'Deer' and head line is not set.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT ab.id, ab.photo_id, p.file_path, ab.x1, ab.y1, ab.x2, ab.y2,
-                   ab.head_x1, ab.head_y1, ab.head_x2, ab.head_y2, ab.head_notes
-            FROM annotation_boxes ab
-            JOIN photos p ON ab.photo_id = p.id
-            JOIN tags t ON p.id = t.photo_id
-            WHERE t.tag_name = 'Deer'
-              AND ab.label IN ('subject', 'ai_animal')
-            ORDER BY p.date_taken DESC
-        """)
-        out = []
-        for row in cursor.fetchall():
-            out.append({
-                "box_id": row[0],
-                "photo_id": row[1],
-                "file_path": row[2],
-                "x1": row[3], "y1": row[4], "x2": row[5], "y2": row[6],
-                "head_x1": row[7], "head_y1": row[8], "head_x2": row[9], "head_y2": row[10],
-                "head_notes": row[11]
-            })
-        return out
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT ab.id, ab.photo_id, p.file_path, ab.x1, ab.y1, ab.x2, ab.y2,
+                       ab.head_x1, ab.head_y1, ab.head_x2, ab.head_y2, ab.head_notes
+                FROM annotation_boxes ab
+                JOIN photos p ON ab.photo_id = p.id
+                JOIN tags t ON p.id = t.photo_id
+                WHERE t.tag_name = 'Deer'
+                  AND t.deleted_at IS NULL
+                  AND ab.label IN ('subject', 'ai_animal')
+                ORDER BY p.date_taken DESC
+            """)
+            out = []
+            for row in cursor.fetchall():
+                out.append({
+                    "box_id": row[0],
+                    "photo_id": row[1],
+                    "file_path": row[2],
+                    "x1": row[3], "y1": row[4], "x2": row[5], "y2": row[6],
+                    "head_x1": row[7], "head_y1": row[8], "head_x2": row[9], "head_y2": row[10],
+                    "head_notes": row[11]
+                })
+            return out
 
     def has_detection_boxes(self, photo_id: int) -> bool:
         """Check if photo has any detection boxes (AI or human-labeled)."""
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM annotation_boxes WHERE photo_id = ?", (photo_id,))
+            cursor.execute("SELECT COUNT(*) FROM annotation_boxes WHERE photo_id = ? AND deleted_at IS NULL", (photo_id,))
             return cursor.fetchone()[0] > 0
 
     def get_seasons(self) -> List[int]:
@@ -2085,6 +2490,41 @@ class TrailCamDatabase:
             'broken_antler_side': None,
             'broken_antler_note': None,
         }
+
+    def get_all_deer_metadata_batch(self, photo_ids: List[int]) -> Dict[int, Dict]:
+        """Get deer metadata for many photos in one query. Thread-safe."""
+        if not photo_ids:
+            return {}
+        with self._lock:
+            cursor = self.conn.cursor()
+            placeholders = ",".join(["?"] * len(photo_ids))
+            cursor.execute(f"""
+                SELECT photo_id, deer_id, age_class, left_points_min, right_points_min,
+                       left_points_uncertain, right_points_uncertain,
+                       left_ab_points_min, right_ab_points_min,
+                       left_ab_points_uncertain, right_ab_points_uncertain,
+                       abnormal_points_min, abnormal_points_max, broken_antler_side, broken_antler_note
+                FROM deer_metadata WHERE photo_id IN ({placeholders})
+            """, photo_ids)
+            out: Dict[int, Dict] = {}
+            for row in cursor.fetchall():
+                out[row["photo_id"]] = {
+                    'deer_id': row['deer_id'],
+                    'age_class': row['age_class'],
+                    'left_points_min': row['left_points_min'],
+                    'left_points_uncertain': bool(row['left_points_uncertain']) if row['left_points_uncertain'] is not None else False,
+                    'right_points_min': row['right_points_min'],
+                    'right_points_uncertain': bool(row['right_points_uncertain']) if row['right_points_uncertain'] is not None else False,
+                    'left_ab_points_min': row['left_ab_points_min'],
+                    'right_ab_points_min': row['right_ab_points_min'],
+                    'left_ab_points_uncertain': bool(row['left_ab_points_uncertain']) if row['left_ab_points_uncertain'] is not None else False,
+                    'right_ab_points_uncertain': bool(row['right_ab_points_uncertain']) if row['right_ab_points_uncertain'] is not None else False,
+                    'abnormal_points_min': row['abnormal_points_min'],
+                    'abnormal_points_max': row['abnormal_points_max'],
+                    'broken_antler_side': row['broken_antler_side'],
+                    'broken_antler_note': row['broken_antler_note'],
+                }
+            return out
     
     def get_nearby_photos(self, camera_location: Optional[str], date_taken: Optional[str], window_minutes: int = 5) -> List[Dict]:
         """Return photos from the same camera_location taken within +/- window_minutes of date_taken."""
@@ -2154,6 +2594,7 @@ class TrailCamDatabase:
         
         if tag:
             query += " INNER JOIN tags t ON p.id = t.photo_id"
+            conditions.append("t.deleted_at IS NULL")
             if isinstance(tag, list):
                 placeholders = ",".join(["?"] * len(tag))
                 conditions.append(f"t.tag_name IN ({placeholders})")
@@ -2289,9 +2730,10 @@ class TrailCamDatabase:
 
     def set_favorite(self, photo_id: int, favorite: bool):
         """Set favorite status for a photo."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE photos SET favorite = ? WHERE id = ?", (1 if favorite else 0, photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET favorite = ? WHERE id = ?", (1 if favorite else 0, photo_id))
+            self.conn.commit()
 
     def get_archived_count(self) -> int:
         """Get count of archived photos."""
@@ -2332,11 +2774,13 @@ class TrailCamDatabase:
             FROM photos p
             INNER JOIN tags t ON t.photo_id = p.id
             WHERE p.archived = 0
+              AND t.deleted_at IS NULL
               AND (p.favorite IS NULL OR p.favorite = 0)
               AND p.id NOT IN (
                   SELECT DISTINCT photo_id
                   FROM tags
                   WHERE tag_name IN ({placeholders})
+                    AND deleted_at IS NULL
               )
         """
 
@@ -2350,6 +2794,7 @@ class TrailCamDatabase:
             SELECT tag_name, COUNT(*) as cnt
             FROM tags
             WHERE tag_name NOT IN ('Buck', 'Doe', 'Unknown')
+              AND deleted_at IS NULL
             GROUP BY tag_name
             ORDER BY cnt DESC
         """)
@@ -2360,14 +2805,15 @@ class TrailCamDatabase:
     def create_site(self, name: str, description: str = "", representative_photo_id: int = None,
                     confirmed: bool = True) -> int:
         """Create a new site and return its ID. confirmed=False means it's a suggestion."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO sites (name, description, representative_photo_id, created_at, confirmed)
-            VALUES (?, ?, ?, datetime('now'), ?)
-        """, (name, description, representative_photo_id, 1 if confirmed else 0))
-        site_id = cursor.lastrowid
-        self.conn.commit()
-        return site_id
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT INTO sites (name, description, representative_photo_id, created_at, confirmed)
+                VALUES (?, ?, ?, datetime('now'), ?)
+            """, (name, description, representative_photo_id, 1 if confirmed else 0))
+            site_id = cursor.lastrowid
+            self.conn.commit()
+            return site_id
 
     def get_site(self, site_id: int) -> Optional[Dict]:
         """Get site by ID."""
@@ -2405,44 +2851,41 @@ class TrailCamDatabase:
     def update_site(self, site_id: int, name: str = None, description: str = None,
                     representative_photo_id: int = None):
         """Update site details."""
-        cursor = self.conn.cursor()
-        updates = []
-        params = []
-        if name is not None:
-            updates.append("name = ?")
-            params.append(name)
-        if description is not None:
-            updates.append("description = ?")
-            params.append(description)
-        if representative_photo_id is not None:
-            updates.append("representative_photo_id = ?")
-            params.append(representative_photo_id)
-        if updates:
-            params.append(site_id)
-            cursor.execute(f"UPDATE sites SET {', '.join(updates)} WHERE id = ?", params)
-            self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            updates = []
+            params = []
+            if name is not None:
+                updates.append("name = ?")
+                params.append(name)
+            if description is not None:
+                updates.append("description = ?")
+                params.append(description)
+            if representative_photo_id is not None:
+                updates.append("representative_photo_id = ?")
+                params.append(representative_photo_id)
+            if updates:
+                params.append(site_id)
+                cursor.execute(f"UPDATE sites SET {', '.join(updates)} WHERE id = ?", params)
+                self.conn.commit()
 
     def delete_site(self, site_id: int):
         """Delete a site (does not delete photos, just unlinks them)."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE photos SET site_id = NULL WHERE site_id = ?", (site_id,))
-        cursor.execute("DELETE FROM sites WHERE id = ?", (site_id,))
-        self.conn.commit()
-
-    def set_photo_site(self, photo_id: int, site_id: Optional[int]):
-        """Assign a photo to a site."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE photos SET site_id = ? WHERE id = ?", (site_id, photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET site_id = NULL WHERE site_id = ?", (site_id,))
+            cursor.execute("DELETE FROM sites WHERE id = ?", (site_id,))
+            self.conn.commit()
 
     def set_photos_site(self, photo_ids: List[int], site_id: Optional[int]):
         """Assign multiple photos to a site."""
-        cursor = self.conn.cursor()
-        cursor.executemany(
-            "UPDATE photos SET site_id = ? WHERE id = ?",
-            [(site_id, pid) for pid in photo_ids]
-        )
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.executemany(
+                "UPDATE photos SET site_id = ? WHERE id = ?",
+                [(site_id, pid) for pid in photo_ids]
+            )
+            self.conn.commit()
 
     def get_photos_by_site(self, site_id: Optional[int]) -> List[Dict]:
         """Get all photos for a site (None = unassigned)."""
@@ -2481,46 +2924,50 @@ class TrailCamDatabase:
 
     def set_photo_site(self, photo_id: int, site_id: Optional[int]):
         """Manually assign a photo to a site (confirmed), clearing any suggestion."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE photos SET site_id = ?, suggested_site_id = NULL, suggested_site_confidence = NULL
-            WHERE id = ?
-        """, (site_id, photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE photos SET site_id = ?, suggested_site_id = NULL, suggested_site_confidence = NULL
+                WHERE id = ?
+            """, (site_id, photo_id))
+            self.conn.commit()
 
     def set_photo_site_suggestion(self, photo_id: int, site_id: int, confidence: float):
         """Set a suggested site for a photo (not confirmed yet)."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE photos SET suggested_site_id = ?, suggested_site_confidence = ?
-            WHERE id = ?
-        """, (site_id, confidence, photo_id))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE photos SET suggested_site_id = ?, suggested_site_confidence = ?
+                WHERE id = ?
+            """, (site_id, confidence, photo_id))
+            self.conn.commit()
 
     def confirm_site(self, site_id: int):
         """Mark a site as confirmed and move all suggested photos to confirmed."""
-        cursor = self.conn.cursor()
-        # Mark site as confirmed
-        cursor.execute("UPDATE sites SET confirmed = 1 WHERE id = ?", (site_id,))
-        # Move suggested photos to confirmed site_id
-        cursor.execute("""
-            UPDATE photos SET site_id = suggested_site_id,
-                             suggested_site_id = NULL,
-                             suggested_site_confidence = NULL
-            WHERE suggested_site_id = ?
-        """, (site_id,))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            # Mark site as confirmed
+            cursor.execute("UPDATE sites SET confirmed = 1 WHERE id = ?", (site_id,))
+            # Move suggested photos to confirmed site_id
+            cursor.execute("""
+                UPDATE photos SET site_id = suggested_site_id,
+                                 suggested_site_id = NULL,
+                                 suggested_site_confidence = NULL
+                WHERE suggested_site_id = ?
+            """, (site_id,))
+            self.conn.commit()
 
     def reject_site_suggestion(self, site_id: int):
         """Reject a site suggestion - clear suggested_site_id for those photos."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE photos SET suggested_site_id = NULL, suggested_site_confidence = NULL
-            WHERE suggested_site_id = ?
-        """, (site_id,))
-        # Delete the unconfirmed site
-        cursor.execute("DELETE FROM sites WHERE id = ? AND COALESCE(confirmed, 0) = 0", (site_id,))
-        self.conn.commit()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE photos SET suggested_site_id = NULL, suggested_site_confidence = NULL
+                WHERE suggested_site_id = ?
+            """, (site_id,))
+            # Delete the unconfirmed site
+            cursor.execute("DELETE FROM sites WHERE id = ? AND COALESCE(confirmed, 0) = 0", (site_id,))
+            self.conn.commit()
 
     def get_suggested_site_photos(self, site_id: int) -> List[Dict]:
         """Get photos suggested for a site (not yet confirmed)."""
@@ -2664,10 +3111,21 @@ class TrailCamDatabase:
         return f"{original_name}|{date_taken}|{camera_model}"
 
     def _get_photo_by_key(self, photo_key: str, file_hash: str = None) -> Optional[Dict]:
-        """Find a local photo by its sync key, with fallback to file_hash."""
+        """Find a local photo by file_hash (preferred) or photo_key fallback.
+
+        file_hash is stable across devices; photo_key can differ if filenames
+        or camera_model strings vary between machines.
+        """
         cursor = self.conn.cursor()
 
-        # First try matching by the full photo_key
+        # Prefer file_hash — stable across devices
+        if file_hash:
+            cursor.execute("SELECT * FROM photos WHERE file_hash = ?", (file_hash,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+
+        # Fallback: try matching by the full photo_key
         parts = photo_key.split("|")
         if len(parts) == 3:
             original_name, date_taken, camera_model = parts
@@ -2679,14 +3137,347 @@ class TrailCamDatabase:
             if row:
                 return dict(row)
 
-        # Fallback: try matching by file_hash (for CuddeLink photos with different filenames)
-        if file_hash:
-            cursor.execute("SELECT * FROM photos WHERE file_hash = ?", (file_hash,))
+        return None
+
+    # ----------------------------------------------------------------
+    # Camera / Club / Roles / Label Suggestions CRUD
+    # ----------------------------------------------------------------
+
+    def create_camera(self, name: str, owner: str) -> str:
+        """Create a new camera and set owner permission. Returns camera_id."""
+        import uuid
+        camera_id = str(uuid.uuid4())
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO cameras (id, name, owner, verified, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+                (camera_id, name, owner, now, now))
+            perm_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO camera_permissions (id, camera_id, username, role, granted_by, granted_at, created_at, updated_at) VALUES (?, ?, ?, 'owner', ?, ?, ?, ?)",
+                (perm_id, camera_id, owner, owner, now, now, now))
+            self.conn.commit()
+        logger.info(f"Created camera '{name}' (id={camera_id}) owned by {owner}")
+        return camera_id
+
+    def get_cameras(self, owner: str = None) -> List[Dict]:
+        """Get all cameras, optionally filtered by owner."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            if owner:
+                cursor.execute("""
+                    SELECT c.* FROM cameras c
+                    JOIN camera_permissions cp ON c.id = cp.camera_id
+                    WHERE cp.username = ? AND cp.role = 'owner'
+                    ORDER BY c.name
+                """, (owner,))
+            else:
+                cursor.execute("SELECT * FROM cameras ORDER BY name")
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def get_camera(self, camera_id: str) -> Optional[Dict]:
+        """Get a single camera by id."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM cameras WHERE id = ?", (camera_id,))
             row = cursor.fetchone()
             if row:
-                return dict(row)
-
+                cols = [d[0] for d in cursor.description]
+                return dict(zip(cols, row))
         return None
+
+    def rename_camera(self, camera_id: str, new_name: str):
+        """Rename a camera and mark as verified."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE cameras SET name = ?, verified = 1 WHERE id = ?",
+                (new_name, camera_id))
+            self.conn.commit()
+
+    def merge_cameras(self, keep_id: str, merge_id: str):
+        """Merge merge_id camera into keep_id. Reassigns photos and deletes merge_id."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE photos SET camera_id = ? WHERE camera_id = ?", (keep_id, merge_id))
+            cursor.execute("UPDATE label_suggestions SET camera_id = ? WHERE camera_id = ?", (keep_id, merge_id))
+            cursor.execute("DELETE FROM camera_permissions WHERE camera_id = ?", (merge_id,))
+            cursor.execute("DELETE FROM camera_club_shares WHERE camera_id = ?", (merge_id,))
+            cursor.execute("DELETE FROM cameras WHERE id = ?", (merge_id,))
+            self.conn.commit()
+        logger.info(f"Merged camera {merge_id} into {keep_id}")
+
+    def get_user_role_for_photo(self, photo_id: int, username: str) -> str:
+        """Check user's role for a photo. Returns 'owner', 'member', or 'none'.
+
+        Owner = has 'owner' permission on the photo's camera.
+        Member = member of a club that the photo's camera is shared to.
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            # Get photo's camera_id
+            cursor.execute("SELECT camera_id FROM photos WHERE id = ?", (photo_id,))
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return 'owner'  # No camera assigned = legacy data, treat as owner
+            camera_id = row[0]
+            return self._get_role_for_camera(cursor, camera_id, username)
+
+    def _get_role_for_camera(self, cursor, camera_id: str, username: str) -> str:
+        """Internal: check role for a specific camera."""
+        # Check direct camera permission
+        cursor.execute(
+            "SELECT role FROM camera_permissions WHERE camera_id = ? AND username = ?",
+            (camera_id, username))
+        perm = cursor.fetchone()
+        if perm:
+            return perm[0]  # 'owner' or 'member'
+
+        # Check club membership (member of a club the camera is shared to)
+        cursor.execute("""
+            SELECT 1 FROM camera_club_shares ccs
+            JOIN club_memberships cm ON ccs.club_id = cm.club_id
+            WHERE ccs.camera_id = ? AND cm.username = ?
+            LIMIT 1
+        """, (camera_id, username))
+        if cursor.fetchone():
+            return 'member'
+
+        return 'none'
+
+    def grant_camera_permission(self, camera_id: str, username: str, role: str, granted_by: str):
+        """Grant a user permission on a camera."""
+        import uuid
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            perm_id = str(uuid.uuid4())
+            cursor.execute("""
+                INSERT INTO camera_permissions (id, camera_id, username, role, granted_by, granted_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(camera_id, username) DO UPDATE SET role = ?, granted_by = ?, granted_at = ?
+            """, (perm_id, camera_id, username, role, granted_by, now, now, now,
+                  role, granted_by, now))
+            self.conn.commit()
+        logger.info(f"Granted {role} on camera {camera_id} to {username} by {granted_by}")
+
+    def revoke_camera_permission(self, camera_id: str, username: str):
+        """Revoke a user's permission on a camera."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "DELETE FROM camera_permissions WHERE camera_id = ? AND username = ?",
+                (camera_id, username))
+            self.conn.commit()
+        logger.info(f"Revoked permission on camera {camera_id} from {username}")
+
+    def create_club(self, name: str, created_by: str) -> str:
+        """Create a new club. Returns club_id."""
+        import uuid
+        club_id = str(uuid.uuid4())
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO clubs (id, name, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (club_id, name, created_by, now, now))
+            # Creator is automatically a member
+            mem_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO club_memberships (id, club_id, username, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (mem_id, club_id, created_by, now, now))
+            self.conn.commit()
+        logger.info(f"Created club '{name}' (id={club_id}) by {created_by}")
+        return club_id
+
+    def get_clubs(self, username: str = None) -> List[Dict]:
+        """Get all clubs, optionally filtered to ones a user belongs to."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            if username:
+                cursor.execute("""
+                    SELECT c.* FROM clubs c
+                    JOIN club_memberships cm ON c.id = cm.club_id
+                    WHERE cm.username = ?
+                    ORDER BY c.name
+                """, (username,))
+            else:
+                cursor.execute("SELECT * FROM clubs ORDER BY name")
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def add_club_member(self, club_id: str, username: str):
+        """Add a member to a club."""
+        import uuid
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            mem_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT OR IGNORE INTO club_memberships (id, club_id, username, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (mem_id, club_id, username, now, now))
+            self.conn.commit()
+
+    def remove_club_member(self, club_id: str, username: str):
+        """Remove a member from a club."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "DELETE FROM club_memberships WHERE club_id = ? AND username = ?",
+                (club_id, username))
+            self.conn.commit()
+
+    def get_club_members(self, club_id: str) -> List[Dict]:
+        """Get all members of a club."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT * FROM club_memberships WHERE club_id = ? ORDER BY username",
+                (club_id,))
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def share_camera_to_club(self, camera_id: str, club_id: str, shared_by: str, visibility: str = 'full'):
+        """Share a camera's photos to a club."""
+        import uuid
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            share_id = str(uuid.uuid4())
+            cursor.execute("""
+                INSERT INTO camera_club_shares (id, camera_id, club_id, shared_by, visibility, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(camera_id, club_id) DO UPDATE SET visibility = ?, shared_by = ?
+            """, (share_id, camera_id, club_id, shared_by, visibility, now, now,
+                  visibility, shared_by))
+            self.conn.commit()
+        logger.info(f"Shared camera {camera_id} to club {club_id} by {shared_by}")
+
+    def unshare_camera_from_club(self, camera_id: str, club_id: str):
+        """Remove camera sharing from a club."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "DELETE FROM camera_club_shares WHERE camera_id = ? AND club_id = ?",
+                (camera_id, club_id))
+            self.conn.commit()
+
+    def add_label_suggestion(self, photo_id: int, tag_name: str, suggested_by: str) -> str:
+        """Add a label suggestion for a photo. Returns suggestion id."""
+        import uuid
+        suggestion_id = str(uuid.uuid4())
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            # Get file_hash and camera_id from photo
+            cursor.execute("SELECT file_hash, camera_id FROM photos WHERE id = ?", (photo_id,))
+            row = cursor.fetchone()
+            file_hash = row[0] if row else None
+            camera_id = row[1] if row else None
+
+            # Check for existing tombstoned suggestion — un-tombstone it
+            cursor.execute(
+                "SELECT id FROM label_suggestions WHERE photo_id = ? AND tag_name = ? AND suggested_by = ? AND deleted_at IS NOT NULL",
+                (photo_id, tag_name, suggested_by))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    "UPDATE label_suggestions SET deleted_at = NULL, status = 'pending', reviewed_by = NULL, reviewed_at = NULL, updated_at = ? WHERE id = ?",
+                    (now, existing[0]))
+                self.conn.commit()
+                return existing[0]
+
+            try:
+                cursor.execute("""
+                    INSERT INTO label_suggestions (id, photo_id, file_hash, tag_name, suggested_by, status, camera_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """, (suggestion_id, photo_id, file_hash, tag_name, suggested_by, camera_id, now, now))
+                self.conn.commit()
+            except sqlite3.IntegrityError:
+                # Already exists (not tombstoned) — just return
+                cursor.execute(
+                    "SELECT id FROM label_suggestions WHERE photo_id = ? AND tag_name = ? AND suggested_by = ?",
+                    (photo_id, tag_name, suggested_by))
+                row = cursor.fetchone()
+                return row[0] if row else suggestion_id
+        return suggestion_id
+
+    def approve_suggestion(self, suggestion_id: str, reviewed_by: str):
+        """Approve a label suggestion — promotes it to tags."""
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT photo_id, tag_name FROM label_suggestions WHERE id = ? AND status = 'pending'",
+                (suggestion_id,))
+            row = cursor.fetchone()
+            if not row:
+                return
+            photo_id, tag_name = row
+
+            # Promote to tags
+            self.add_tag(photo_id, tag_name)
+            # Update the tag's created_by
+            cursor.execute(
+                "UPDATE tags SET created_by = ? WHERE photo_id = ? AND tag_name = ? AND deleted_at IS NULL",
+                (reviewed_by, photo_id, tag_name))
+
+            # Mark suggestion as approved
+            cursor.execute(
+                "UPDATE label_suggestions SET status = 'approved', reviewed_by = ?, reviewed_at = ?, updated_at = ? WHERE id = ?",
+                (reviewed_by, now, now, suggestion_id))
+            self.conn.commit()
+        logger.info(f"Approved suggestion {suggestion_id} by {reviewed_by}")
+
+    def reject_suggestion(self, suggestion_id: str, reviewed_by: str):
+        """Reject a label suggestion."""
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE label_suggestions SET status = 'rejected', reviewed_by = ?, reviewed_at = ?, updated_at = ? WHERE id = ?",
+                (reviewed_by, now, now, suggestion_id))
+            self.conn.commit()
+        logger.info(f"Rejected suggestion {suggestion_id} by {reviewed_by}")
+
+    def get_pending_suggestions(self, camera_id: str = None, limit: int = 100) -> List[Dict]:
+        """Get pending label suggestions, optionally filtered by camera."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            if camera_id:
+                cursor.execute("""
+                    SELECT ls.*, p.file_path, p.thumbnail_path
+                    FROM label_suggestions ls
+                    JOIN photos p ON ls.photo_id = p.id
+                    WHERE ls.status = 'pending' AND ls.deleted_at IS NULL AND ls.camera_id = ?
+                    ORDER BY ls.created_at DESC
+                    LIMIT ?
+                """, (camera_id, limit))
+            else:
+                cursor.execute("""
+                    SELECT ls.*, p.file_path, p.thumbnail_path
+                    FROM label_suggestions ls
+                    JOIN photos p ON ls.photo_id = p.id
+                    WHERE ls.status = 'pending' AND ls.deleted_at IS NULL
+                    ORDER BY ls.created_at DESC
+                    LIMIT ?
+                """, (limit,))
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def get_suggestions_for_photo(self, photo_id: int) -> List[Dict]:
+        """Get all non-deleted suggestions for a photo."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT * FROM label_suggestions
+                WHERE photo_id = ? AND deleted_at IS NULL
+                ORDER BY created_at
+            """, (photo_id,))
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
     def push_to_supabase(self, supabase_client, progress_callback=None, force_full=False) -> Dict[str, int]:
         """Push changed local data to Supabase using batch operations. Returns counts of items pushed.
@@ -2698,7 +3489,7 @@ class TrailCamDatabase:
         """
         def report(step, msg):
             if progress_callback:
-                progress_callback(step, 7, msg)
+                progress_callback(step, 9, msg)
             print(msg)
 
         # Ensure all required columns exist before syncing (handles old databases)
@@ -2706,6 +3497,20 @@ class TrailCamDatabase:
         with self._lock:
             self._ensure_deer_columns()
             self._ensure_sync_tracking()
+
+        # Check schema_version — force full sync after conflict resolution migration
+        schema_version_bump = False
+        try:
+            with self._lock:
+                sv_cursor = self.conn.cursor()
+                sv_cursor.execute("SELECT schema_version FROM sync_state WHERE id = 1")
+                sv_row = sv_cursor.fetchone()
+                if sv_row and (sv_row[0] or 1) < 2:
+                    force_full = True
+                    schema_version_bump = True
+                    logger.info("Schema version < 2: forcing full push to upload sync_ids")
+        except Exception:
+            pass
 
         # Get last sync time for incremental push
         last_sync = None if force_full else self.get_last_sync_time('push')
@@ -2721,7 +3526,9 @@ class TrailCamDatabase:
 
         from datetime import datetime
         counts = {"photos": 0, "tags": 0, "deer_metadata": 0, "deer_additional": 0,
-                  "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0}
+                  "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0,
+                  "cameras": 0, "camera_permissions": 0, "clubs": 0, "club_memberships": 0,
+                  "camera_club_shares": 0, "label_suggestions": 0}
 
         # Use a separate read-only connection for sync queries to avoid blocking main thread
         # This prevents "cannot commit transaction - SQL statements in progress" errors
@@ -2781,64 +3588,34 @@ class TrailCamDatabase:
                     "collection": photo.get("collection"),  # Club/collection name
                     "r2_photo_id": str(photo.get("id")),  # Local photo ID for R2 URL mapping
                     "archived": bool(photo.get("archived")),  # Hide from mobile by default
-                    "updated_at": now
+                    "updated_at": normalize_datetime(photo.get("updated_at") or now)
                 })
             batch_upsert("photos_sync", photos_data, "file_hash")
             counts["photos"] = len(photos_data)
 
-            # Push tags
+            # Push tags (including tombstones for soft-deleted tags)
             report(2, "Syncing tags...")
             tag_clause, tag_params = since_clause('t')
             cursor.execute(f"""
-                SELECT t.tag_name, t.updated_at, p.original_name, p.date_taken, p.camera_model, p.file_hash
+                SELECT t.tag_name, t.updated_at, t.deleted_at,
+                       p.original_name, p.date_taken, p.camera_model, p.file_hash
                 FROM tags t
                 JOIN photos p ON t.photo_id = p.id
                 WHERE 1=1 {tag_clause}
             """, tag_params)
             tags_data = []
             for row in cursor.fetchall():
-                photo_key = f"{row['original_name']}|{row['date_taken']}|{row['camera_model']}"
+                t = dict(row)
+                photo_key = f"{t['original_name']}|{t['date_taken']}|{t['camera_model']}"
                 tags_data.append({
                     "photo_key": photo_key,
-                    "file_hash": row["file_hash"],
-                    "tag_name": row["tag_name"],
-                    "updated_at": now
+                    "file_hash": t["file_hash"],
+                    "tag_name": t["tag_name"],
+                    "deleted_at": normalize_datetime(t["deleted_at"]) if t["deleted_at"] else None,
+                    "updated_at": normalize_datetime(t.get("updated_at") or now)
                 })
             batch_upsert("tags", tags_data, "file_hash,tag_name")
             counts["tags"] = len(tags_data)
-
-            # Delete tags from Supabase that were deleted locally
-            # Get ALL local tags (not just recent) to compare
-            cursor.execute("""
-                SELECT t.tag_name, p.file_hash
-                FROM tags t
-                JOIN photos p ON t.photo_id = p.id
-                WHERE p.file_hash IS NOT NULL
-            """)
-            local_tags = set()
-            for row in cursor.fetchall():
-                local_tags.add((row["file_hash"], row["tag_name"]))
-
-            # Get all tags from Supabase
-            try:
-                result = supabase_client.table("tags").select("file_hash,tag_name").execute(fetch_all=True)
-                cloud_tags = set()
-                for row in result.data:
-                    if row.get("file_hash"):
-                        cloud_tags.add((row["file_hash"], row["tag_name"]))
-
-                # Find tags in cloud but not local (deleted locally)
-                deleted_tags = cloud_tags - local_tags
-                if deleted_tags:
-                    logger.info(f"Deleting {len(deleted_tags)} tags from Supabase that were deleted locally")
-                    for file_hash, tag_name in deleted_tags:
-                        try:
-                            supabase_client.table("tags").delete().eq("file_hash", file_hash).eq("tag_name", tag_name).execute()
-                        except Exception as e:
-                            logger.warning(f"Failed to delete tag {tag_name} for {file_hash}: {e}")
-                    counts["tags_deleted"] = len(deleted_tags)
-            except Exception as e:
-                logger.warning(f"Could not sync tag deletions: {e}")
 
             # Push deer_metadata
             report(3, "Syncing deer metadata...")
@@ -2872,7 +3649,7 @@ class TrailCamDatabase:
                     "abnormal_points_max": d.get("abnormal_points_max"),
                     "broken_antler_side": d.get("broken_antler_side"),
                     "broken_antler_note": d.get("broken_antler_note"),
-                    "updated_at": now
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
                 })
             batch_upsert("deer_metadata", deer_meta_data, "file_hash")
             counts["deer_metadata"] = len(deer_meta_data)
@@ -2909,7 +3686,7 @@ class TrailCamDatabase:
                     "abnormal_points_max": d.get("abnormal_points_max"),
                     "broken_antler_side": d.get("broken_antler_side"),
                     "broken_antler_note": d.get("broken_antler_note"),
-                    "updated_at": now
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
                 })
             batch_upsert("deer_additional", deer_add_data, "file_hash,deer_id")
             counts["deer_additional"] = len(deer_add_data)
@@ -2925,7 +3702,7 @@ class TrailCamDatabase:
                     "deer_id": d.get("deer_id"),
                     "display_name": d.get("display_name"),
                     "notes": d.get("notes"),
-                    "updated_at": now
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
                 })
             batch_upsert("buck_profiles", profiles_data, "deer_id")
             counts["buck_profiles"] = len(profiles_data)
@@ -2952,7 +3729,7 @@ class TrailCamDatabase:
                     "right_ab_points_max": d.get("right_ab_points_max"),
                     "abnormal_points_min": d.get("abnormal_points_min"),
                     "abnormal_points_max": d.get("abnormal_points_max"),
-                    "updated_at": now
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
                 })
             batch_upsert("buck_profile_seasons", seasons_data, "deer_id,season_year")
             counts["buck_profile_seasons"] = len(seasons_data)
@@ -2973,14 +3750,13 @@ class TrailCamDatabase:
 
             # Safety check: don't delete cloud boxes if local has very few
             # (protects against pushing from empty/new database)
-            if local_box_count < 100:
-                print(f"  Skipping box sync - only {local_box_count} local boxes (need 100+ to sync)")
-                print("  This protects cloud data from being overwritten by an empty database.")
+            if local_box_count == 0 and cloud_box_count > 0:
+                print("  Skipping box sync - local box table is empty but cloud has data.")
                 print("  Run 'Pull from Cloud' first if this is a new computer.")
                 counts["annotation_boxes"] = 0
             else:
                 # If cloud is empty but local has data, do full sync (skip since_clause)
-                force_full_sync = (cloud_box_count == 0 and local_box_count > 100)
+                force_full_sync = (cloud_box_count == 0 and local_box_count > 0)
                 if force_full_sync:
                     print(f"  Cloud annotation_boxes is empty but local has {local_box_count} - doing full sync")
 
@@ -2999,6 +3775,7 @@ class TrailCamDatabase:
                     d = dict(row)
                     photo_key = f"{d['original_name']}|{d['date_taken']}|{d['camera_model']}"
                     boxes_data.append({
+                        "sync_id": d.get("sync_id"),
                         "photo_key": photo_key,
                         "file_hash": d.get("file_hash"),
                         "label": d.get("label"),
@@ -3011,27 +3788,136 @@ class TrailCamDatabase:
                         "species_conf": d.get("species_conf"),
                         "sex": d.get("sex"),
                         "sex_conf": d.get("sex_conf"),
-                        "updated_at": now
+                        "deleted_at": normalize_datetime(d.get("deleted_at")) if d.get("deleted_at") else None,
+                        "updated_at": normalize_datetime(d.get("updated_at") or now)
                     })
-                # For incremental sync, use upsert instead of delete+insert
+                # Upsert by sync_id — handles both full and incremental sync
                 if boxes_data:
-                    if last_sync is None or force_full_sync:
-                        # Full sync: delete all and re-insert
-                        supabase_client.table("annotation_boxes").delete().neq("photo_key", "").execute()
-                        for i in range(0, len(boxes_data), BATCH_SIZE):
-                            batch = boxes_data[i:i + BATCH_SIZE]
-                            if batch:
-                                supabase_client.table("annotation_boxes").insert(batch).execute()
-                    else:
-                        # Incremental sync: upsert changed boxes
-                        batch_upsert("annotation_boxes", boxes_data, "file_hash,label,x1,y1")
+                    batch_upsert("annotation_boxes", boxes_data, "sync_id")
                 counts["annotation_boxes"] = len(boxes_data)
 
-            report(7, "Sync complete!")
+            # Push cameras
+            report(8, "Syncing cameras...")
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM cameras WHERE 1=1{clause}", params)
+            cameras_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                cameras_data.append({
+                    "id": d.get("id"),
+                    "name": d.get("name"),
+                    "owner": d.get("owner"),
+                    "verified": bool(d.get("verified")),
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
+                })
+            if cameras_data:
+                batch_upsert("cameras", cameras_data, "id")
+            counts["cameras"] = len(cameras_data)
+
+            # Push camera_permissions
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM camera_permissions WHERE 1=1{clause}", params)
+            perms_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                perms_data.append({
+                    "id": d.get("id"),
+                    "camera_id": d.get("camera_id"),
+                    "username": d.get("username"),
+                    "role": d.get("role"),
+                    "granted_by": d.get("granted_by"),
+                    "granted_at": normalize_datetime(d.get("granted_at")),
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
+                })
+            if perms_data:
+                batch_upsert("camera_permissions", perms_data, "id")
+            counts["camera_permissions"] = len(perms_data)
+
+            # Push clubs
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM clubs WHERE 1=1{clause}", params)
+            clubs_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                clubs_data.append({
+                    "id": d.get("id"),
+                    "name": d.get("name"),
+                    "created_by": d.get("created_by"),
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
+                })
+            if clubs_data:
+                batch_upsert("clubs", clubs_data, "id")
+            counts["clubs"] = len(clubs_data)
+
+            # Push club_memberships
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM club_memberships WHERE 1=1{clause}", params)
+            memberships_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                memberships_data.append({
+                    "id": d.get("id"),
+                    "club_id": d.get("club_id"),
+                    "username": d.get("username"),
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
+                })
+            if memberships_data:
+                batch_upsert("club_memberships", memberships_data, "id")
+            counts["club_memberships"] = len(memberships_data)
+
+            # Push camera_club_shares
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM camera_club_shares WHERE 1=1{clause}", params)
+            shares_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                shares_data.append({
+                    "id": d.get("id"),
+                    "camera_id": d.get("camera_id"),
+                    "club_id": d.get("club_id"),
+                    "shared_by": d.get("shared_by"),
+                    "visibility": d.get("visibility"),
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
+                })
+            if shares_data:
+                batch_upsert("camera_club_shares", shares_data, "id")
+            counts["camera_club_shares"] = len(shares_data)
+
+            # Push label_suggestions (with tombstones)
+            clause, params = since_clause()
+            cursor.execute(f"SELECT * FROM label_suggestions WHERE 1=1{clause}", params)
+            suggestions_data = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                suggestions_data.append({
+                    "id": d.get("id"),
+                    "file_hash": d.get("file_hash"),
+                    "tag_name": d.get("tag_name"),
+                    "suggested_by": d.get("suggested_by"),
+                    "status": d.get("status"),
+                    "reviewed_by": d.get("reviewed_by"),
+                    "reviewed_at": normalize_datetime(d.get("reviewed_at")),
+                    "camera_id": d.get("camera_id"),
+                    "deleted_at": normalize_datetime(d.get("deleted_at")) if d.get("deleted_at") else None,
+                    "updated_at": normalize_datetime(d.get("updated_at") or now)
+                })
+            if suggestions_data:
+                batch_upsert("label_suggestions", suggestions_data, "id")
+            counts["label_suggestions"] = len(suggestions_data)
+
+            report(9, "Sync complete!")
 
             # Update last sync time after successful push
             with self._lock:
                 self.set_last_sync_time('push', now)
+                # Bump schema_version after first successful full push with sync_ids
+                if schema_version_bump:
+                    self.conn.cursor().execute("UPDATE sync_state SET schema_version = 2 WHERE id = 1")
+                    self.conn.commit()
+                    logger.info("Schema version bumped to 2 (conflict resolution migration complete)")
+
+            # Garbage-collect old tombstones after successful sync
+            self.purge_old_tombstones(days=30)
 
             return counts
         finally:
@@ -3050,7 +3936,7 @@ class TrailCamDatabase:
 
         def report(step, msg):
             if progress_callback:
-                progress_callback(step, 9, msg)
+                progress_callback(step, 10, msg)
             print(msg)
 
         # Ensure all required columns exist before syncing (handles old databases)
@@ -3065,7 +3951,9 @@ class TrailCamDatabase:
         now = datetime.utcnow().isoformat() + "+00:00"
 
         counts = {"photos": 0, "tags": 0, "deer_metadata": 0, "deer_additional": 0,
-                  "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0}
+                  "buck_profiles": 0, "buck_profile_seasons": 0, "annotation_boxes": 0,
+                  "cameras": 0, "camera_permissions": 0, "clubs": 0, "club_memberships": 0,
+                  "camera_club_shares": 0, "label_suggestions": 0}
 
         cursor = self.conn.cursor()
 
@@ -3083,20 +3971,21 @@ class TrailCamDatabase:
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
-                # Update existing photo
-                # For date_taken, prefer LOCAL value (read from EXIF during import)
-                # Cloud values from CuddeLink may be upload times, not capture times
-                # Only use cloud date if local is empty
-                cloud_date = row.get("date_taken")
-                cursor.execute("""
-                    UPDATE photos SET
-                        camera_location = COALESCE(?, camera_location),
-                        favorite = COALESCE(?, favorite),
-                        notes = COALESCE(?, notes),
-                        date_taken = COALESCE(date_taken, ?)
-                    WHERE id = ?
-                """, (row.get("camera_location"), row.get("favorite"), row.get("notes"),
-                      cloud_date, photo["id"]))
+                # Last-write-wins: only update if cloud is newer
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+                local_updated = self._normalize_ts(photo.get("updated_at", ""))
+                if cloud_updated > local_updated:
+                    cloud_date = row.get("date_taken")
+                    cursor.execute("""
+                        UPDATE photos SET
+                            camera_location = ?,
+                            favorite = COALESCE(?, favorite),
+                            notes = ?,
+                            date_taken = COALESCE(?, date_taken),
+                            updated_at = ?
+                        WHERE id = ?
+                    """, (row.get("camera_location"), row.get("favorite"), row.get("notes"),
+                          cloud_date, self._normalize_ts(row.get("updated_at")), photo["id"]))
                 counts["photos"] += 1
             else:
                 # Create cloud-only stub for photos that don't exist locally
@@ -3106,30 +3995,51 @@ class TrailCamDatabase:
                     if new_id:
                         counts["photos_created"] += 1
 
-        # Pull tags
+        # Pull tags (tombstone-aware + last-write-wins)
         report(2, "Pulling tags...")
         result = fetch_table("tags")
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO tags (photo_id, tag_name) VALUES (?, ?)
-                """, (photo["id"], row["tag_name"]))
+                cloud_deleted = self._normalize_ts(row.get("deleted_at"))
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+
+                cursor.execute("SELECT id, deleted_at, updated_at FROM tags WHERE photo_id = ? AND tag_name = ?",
+                              (photo["id"], row["tag_name"]))
+                local = cursor.fetchone()
+
+                if local:
+                    local_updated = self._normalize_ts(local[2] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("UPDATE tags SET deleted_at = ?, updated_at = ? WHERE id = ?",
+                                      (cloud_deleted or None, cloud_updated, local[0]))
+                else:
+                    cursor.execute("INSERT INTO tags (photo_id, tag_name, deleted_at, updated_at) VALUES (?, ?, ?, ?)",
+                                  (photo["id"], row["tag_name"], cloud_deleted or None, cloud_updated))
                 counts["tags"] += 1
 
-        # Pull deer_metadata
+        # Pull deer_metadata (last-write-wins)
         report(3, "Pulling deer metadata...")
         result = fetch_table("deer_metadata")
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo:
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+                cursor.execute("SELECT updated_at FROM deer_metadata WHERE photo_id = ?", (photo["id"],))
+                local = cursor.fetchone()
+                if local:
+                    local_updated = self._normalize_ts(local[0] or "")
+                    if cloud_updated <= local_updated:
+                        counts["deer_metadata"] += 1
+                        continue
                 cursor.execute("""
                     INSERT OR REPLACE INTO deer_metadata
                     (photo_id, deer_id, age_class, left_points_min, left_points_max,
                      right_points_min, right_points_max, left_points_uncertain, right_points_uncertain,
                      left_ab_points_min, left_ab_points_max, right_ab_points_min, right_ab_points_max,
-                     abnormal_points_min, abnormal_points_max, broken_antler_side, broken_antler_note)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     abnormal_points_min, abnormal_points_max, broken_antler_side, broken_antler_note,
+                     updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (photo["id"], row.get("deer_id"), row.get("age_class"),
                       row.get("left_points_min"), row.get("left_points_max"),
                       row.get("right_points_min"), row.get("right_points_max"),
@@ -3137,22 +4047,33 @@ class TrailCamDatabase:
                       row.get("left_ab_points_min"), row.get("left_ab_points_max"),
                       row.get("right_ab_points_min"), row.get("right_ab_points_max"),
                       row.get("abnormal_points_min"), row.get("abnormal_points_max"),
-                      row.get("broken_antler_side"), row.get("broken_antler_note")))
+                      row.get("broken_antler_side"), row.get("broken_antler_note"),
+                      self._normalize_ts(row.get("updated_at"))))
                 counts["deer_metadata"] += 1
 
-        # Pull deer_additional
+        # Pull deer_additional (last-write-wins)
         report(4, "Pulling additional deer...")
         result = fetch_table("deer_additional")
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
             if photo and row.get("deer_id"):
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+                cursor.execute("SELECT updated_at FROM deer_additional WHERE photo_id = ? AND deer_id = ?",
+                              (photo["id"], row["deer_id"]))
+                local = cursor.fetchone()
+                if local:
+                    local_updated = self._normalize_ts(local[0] or "")
+                    if cloud_updated <= local_updated:
+                        counts["deer_additional"] += 1
+                        continue
                 cursor.execute("""
                     INSERT OR REPLACE INTO deer_additional
                     (photo_id, deer_id, age_class, left_points_min, left_points_max,
                      right_points_min, right_points_max, left_points_uncertain, right_points_uncertain,
                      left_ab_points_min, left_ab_points_max, right_ab_points_min, right_ab_points_max,
-                     abnormal_points_min, abnormal_points_max, broken_antler_side, broken_antler_note)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     abnormal_points_min, abnormal_points_max, broken_antler_side, broken_antler_note,
+                     updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (photo["id"], row.get("deer_id"), row.get("age_class"),
                       row.get("left_points_min"), row.get("left_points_max"),
                       row.get("right_points_min"), row.get("right_points_max"),
@@ -3160,43 +4081,65 @@ class TrailCamDatabase:
                       row.get("left_ab_points_min"), row.get("left_ab_points_max"),
                       row.get("right_ab_points_min"), row.get("right_ab_points_max"),
                       row.get("abnormal_points_min"), row.get("abnormal_points_max"),
-                      row.get("broken_antler_side"), row.get("broken_antler_note")))
+                      row.get("broken_antler_side"), row.get("broken_antler_note"),
+                      self._normalize_ts(row.get("updated_at"))))
                 counts["deer_additional"] += 1
 
-        # Pull buck_profiles
+        # Pull buck_profiles (last-write-wins)
         report(5, "Pulling buck profiles...")
         result = fetch_table("buck_profiles")
         for row in result.data:
             if row.get("deer_id"):
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+                cursor.execute("SELECT updated_at FROM buck_profiles WHERE deer_id = ?", (row["deer_id"],))
+                local = cursor.fetchone()
+                if local:
+                    local_updated = self._normalize_ts(local[0] or "")
+                    if cloud_updated <= local_updated:
+                        counts["buck_profiles"] += 1
+                        continue
                 cursor.execute("""
-                    INSERT OR REPLACE INTO buck_profiles (deer_id, display_name, notes)
-                    VALUES (?, ?, ?)
-                """, (row["deer_id"], row.get("display_name"), row.get("notes")))
+                    INSERT OR REPLACE INTO buck_profiles (deer_id, display_name, notes, updated_at)
+                    VALUES (?, ?, ?, ?)
+                """, (row["deer_id"], row.get("display_name"), row.get("notes"),
+                      self._normalize_ts(row.get("updated_at"))))
                 counts["buck_profiles"] += 1
 
-        # Pull buck_profile_seasons
+        # Pull buck_profile_seasons (last-write-wins)
         report(6, "Pulling buck profile seasons...")
         result = fetch_table("buck_profile_seasons")
         for row in result.data:
             if row.get("deer_id") and row.get("season_year"):
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+                cursor.execute("SELECT updated_at FROM buck_profile_seasons WHERE deer_id = ? AND season_year = ?",
+                              (row["deer_id"], row["season_year"]))
+                local = cursor.fetchone()
+                if local:
+                    local_updated = self._normalize_ts(local[0] or "")
+                    if cloud_updated <= local_updated:
+                        counts["buck_profile_seasons"] += 1
+                        continue
                 cursor.execute("""
                     INSERT OR REPLACE INTO buck_profile_seasons
                     (deer_id, season_year, camera_locations, key_characteristics,
                      left_points_min, left_points_max, right_points_min, right_points_max,
                      left_ab_points_min, left_ab_points_max, right_ab_points_min, right_ab_points_max,
-                     abnormal_points_min, abnormal_points_max)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     abnormal_points_min, abnormal_points_max, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (row["deer_id"], row["season_year"], row.get("camera_locations"),
                       row.get("key_characteristics"), row.get("left_points_min"), row.get("left_points_max"),
                       row.get("right_points_min"), row.get("right_points_max"),
                       row.get("left_ab_points_min"), row.get("left_ab_points_max"),
                       row.get("right_ab_points_min"), row.get("right_ab_points_max"),
-                      row.get("abnormal_points_min"), row.get("abnormal_points_max")))
+                      row.get("abnormal_points_min"), row.get("abnormal_points_max"),
+                      self._normalize_ts(row.get("updated_at"))))
                 counts["buck_profile_seasons"] += 1
 
-        # Pull annotation_boxes
+        # Pull annotation_boxes (sync_id-based + last-write-wins + tombstones)
         report(7, "Pulling annotation boxes...")
         result = fetch_table("annotation_boxes")
+
+        import uuid as _uuid
 
         def safe_float(val):
             """Safely convert value to float, handling bytes/blob corruption."""
@@ -3205,7 +4148,6 @@ class TrailCamDatabase:
             if isinstance(val, (int, float)):
                 return float(val)
             if isinstance(val, bytes):
-                # Try to decode as 4-byte or 8-byte float
                 import struct
                 try:
                     if len(val) == 4:
@@ -3222,103 +4164,287 @@ class TrailCamDatabase:
 
         for row in result.data:
             photo = self._get_photo_by_key(row["photo_key"], row.get("file_hash"))
-            if photo:
-                # Safely convert coordinates to floats (prevents blob corruption)
-                x1 = safe_float(row.get("x1"))
-                y1 = safe_float(row.get("y1"))
-                x2 = safe_float(row.get("x2"))
-                y2 = safe_float(row.get("y2"))
+            if not photo:
+                continue
 
-                # Skip if any required coordinate is invalid
-                if None in (x1, y1, x2, y2):
-                    print(f"  Skipping box with invalid coordinates: {row.get('photo_key')}")
-                    continue
+            x1 = safe_float(row.get("x1"))
+            y1 = safe_float(row.get("y1"))
+            x2 = safe_float(row.get("x2"))
+            y2 = safe_float(row.get("y2"))
 
-                # Check if this box already exists (by photo_id + label + coordinates)
+            if None in (x1, y1, x2, y2):
+                print(f"  Skipping box with invalid coordinates: {row.get('photo_key')}")
+                continue
+
+            sync_id = row.get("sync_id")
+            cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+            cloud_deleted = self._normalize_ts(row.get("deleted_at")) or None
+
+            if sync_id:
+                # Preferred path: match by sync_id
+                cursor.execute("SELECT id, updated_at FROM annotation_boxes WHERE sync_id = ?", (sync_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    local_updated = self._normalize_ts(existing[1] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("""
+                            UPDATE annotation_boxes SET
+                                label=?, x1=?, y1=?, x2=?, y2=?, confidence=?,
+                                species=?, species_conf=?, sex=?, sex_conf=?,
+                                head_x1=?, head_y1=?, head_x2=?, head_y2=?, head_notes=?,
+                                deleted_at=?, updated_at=?
+                            WHERE sync_id = ?
+                        """, (row.get("label"), x1, y1, x2, y2,
+                              safe_float(row.get("confidence")),
+                              row.get("species"), safe_float(row.get("species_conf")),
+                              row.get("sex"), safe_float(row.get("sex_conf")),
+                              safe_float(row.get("head_x1")), safe_float(row.get("head_y1")),
+                              safe_float(row.get("head_x2")), safe_float(row.get("head_y2")),
+                              row.get("head_notes"), cloud_deleted, cloud_updated,
+                              sync_id))
+                else:
+                    # New box from cloud
+                    cursor.execute("""
+                        INSERT INTO annotation_boxes
+                        (photo_id, sync_id, label, x1, y1, x2, y2, confidence,
+                         species, species_conf, sex, sex_conf,
+                         head_x1, head_y1, head_x2, head_y2, head_notes,
+                         deleted_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (photo["id"], sync_id, row.get("label"), x1, y1, x2, y2,
+                          safe_float(row.get("confidence")),
+                          row.get("species"), safe_float(row.get("species_conf")),
+                          row.get("sex"), safe_float(row.get("sex_conf")),
+                          safe_float(row.get("head_x1")), safe_float(row.get("head_y1")),
+                          safe_float(row.get("head_x2")), safe_float(row.get("head_y2")),
+                          row.get("head_notes"), cloud_deleted, cloud_updated))
+            else:
+                # Legacy box without sync_id — fall back to coordinate matching
                 cursor.execute("""
                     SELECT id FROM annotation_boxes
                     WHERE photo_id = ? AND label = ? AND x1 = ? AND y1 = ? AND x2 = ? AND y2 = ?
                 """, (photo["id"], row.get("label"), x1, y1, x2, y2))
-                existing = cursor.fetchone()
-
-                if existing:
-                    # Update existing box - PRESERVE local labels if cloud is null
-                    # Use COALESCE to keep local value when cloud value is null
-                    cursor.execute("""
-                        UPDATE annotation_boxes SET
-                            confidence = COALESCE(?, confidence),
-                            species = COALESCE(?, species),
-                            species_conf = COALESCE(?, species_conf),
-                            sex = COALESCE(?, sex),
-                            sex_conf = COALESCE(?, sex_conf),
-                            head_x1 = COALESCE(?, head_x1),
-                            head_y1 = COALESCE(?, head_y1),
-                            head_x2 = COALESCE(?, head_x2),
-                            head_y2 = COALESCE(?, head_y2),
-                            head_notes = COALESCE(?, head_notes)
-                        WHERE id = ?
-                    """, (safe_float(row.get("confidence")), row.get("species"), safe_float(row.get("species_conf")),
-                          row.get("sex"), safe_float(row.get("sex_conf")),
-                          safe_float(row.get("head_x1")), safe_float(row.get("head_y1")),
-                          safe_float(row.get("head_x2")), safe_float(row.get("head_y2")),
-                          row.get("head_notes"), existing[0]))
+                match = cursor.fetchone()
+                if match:
+                    # Assign a sync_id so future syncs use stable identity
+                    new_sync_id = str(_uuid.uuid4())
+                    cursor.execute("UPDATE annotation_boxes SET sync_id = ?, updated_at = ? WHERE id = ?",
+                                  (new_sync_id, cloud_updated, match[0]))
                 else:
-                    # Insert new box
+                    # Insert as new with a sync_id (include deleted_at for tombstoned cloud boxes)
                     cursor.execute("""
                         INSERT INTO annotation_boxes
                         (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf,
-                         sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes,
+                         sync_id, deleted_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (photo["id"], row.get("label"), x1, y1, x2, y2,
                           safe_float(row.get("confidence")),
                           row.get("species"), safe_float(row.get("species_conf")),
                           row.get("sex"), safe_float(row.get("sex_conf")),
                           safe_float(row.get("head_x1")), safe_float(row.get("head_y1")),
                           safe_float(row.get("head_x2")), safe_float(row.get("head_y2")),
-                          row.get("head_notes")))
-                counts["annotation_boxes"] += 1
+                          row.get("head_notes"), str(_uuid.uuid4()),
+                          cloud_deleted, cloud_updated))
+            counts["annotation_boxes"] += 1
 
-        # NOTE: Push-before-pull disabled due to potential recursion/threading issues
-        # The proper fix is to ensure sync happens regularly (on close, manual sync)
-        # rather than trying to push during every pull
-        report(8, "Preparing deletion sync...")
+        # Tombstone-based deletions replace the old destructive set-subtraction
+        # Deletions are now synced as tombstones (deleted_at timestamps) in both
+        # tags and annotation_boxes, handled by the LWW pull logic above
 
-        # Sync deletions: Remove local records that were deleted from cloud
-        # This is critical for keeping devices in sync when records are removed
-        report(9, "Checking for deleted records...")
-        counts["tags_deleted"] = 0
-
+        # Pull cameras
+        report(8, "Pulling cameras...")
         try:
-            # Get all tags from cloud (need full list to detect deletions)
-            cloud_tags_result = supabase_client.table("tags").select("file_hash,tag_name").execute(fetch_all=True)
-            cloud_tags = set()
-            for row in cloud_tags_result.data:
-                if row.get("file_hash") and row.get("tag_name"):
-                    cloud_tags.add((row["file_hash"], row["tag_name"]))
+            result = fetch_table("cameras")
+            for row in result.data:
+                camera_id = row.get("id")
+                if not camera_id:
+                    continue
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
 
-            # Get all local tags with file_hash
-            cursor.execute("""
-                SELECT t.id, t.tag_name, p.file_hash
-                FROM tags t
-                JOIN photos p ON t.photo_id = p.id
-                WHERE p.file_hash IS NOT NULL
-            """)
-            local_tags = cursor.fetchall()
+                cursor.execute("SELECT id, updated_at FROM cameras WHERE id = ?", (camera_id,))
+                existing = cursor.fetchone()
 
-            # Find and delete local tags that don't exist in cloud
-            for row in local_tags:
-                tag_id = row[0]
-                tag_name = row[1]
-                file_hash = row[2]
-                if (file_hash, tag_name) not in cloud_tags:
-                    cursor.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
-                    counts["tags_deleted"] += 1
-                    logger.info(f"Deleted local tag '{tag_name}' for {file_hash} (removed from cloud)")
-
+                if existing:
+                    local_updated = self._normalize_ts(existing[1] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("""
+                            UPDATE cameras SET name=?, owner=?, verified=?, updated_at=?
+                            WHERE id = ?
+                        """, (row.get("name"), row.get("owner"), row.get("verified"),
+                              cloud_updated, camera_id))
+                else:
+                    cursor.execute("""
+                        INSERT INTO cameras (id, name, owner, verified, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (camera_id, row.get("name"), row.get("owner"),
+                          row.get("verified"), cloud_updated))
+                counts["cameras"] = counts.get("cameras", 0) + 1
         except Exception as e:
-            logger.warning(f"Failed to sync tag deletions: {e}")
+            print(f"  Warning: Could not pull cameras: {e}")
 
-        report(9, "Sync complete!")
+        # Pull camera_permissions
+        try:
+            result = fetch_table("camera_permissions")
+            for row in result.data:
+                perm_id = row.get("id")
+                if not perm_id:
+                    continue
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+
+                cursor.execute("SELECT id, updated_at FROM camera_permissions WHERE id = ?", (perm_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    local_updated = self._normalize_ts(existing[1] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("""
+                            UPDATE camera_permissions SET camera_id=?, username=?, role=?,
+                                granted_by=?, granted_at=?, updated_at=?
+                            WHERE id = ?
+                        """, (row.get("camera_id"), row.get("username"), row.get("role"),
+                              row.get("granted_by"), self._normalize_ts(row.get("granted_at")),
+                              cloud_updated, perm_id))
+                else:
+                    cursor.execute("""
+                        INSERT INTO camera_permissions (id, camera_id, username, role, granted_by, granted_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (perm_id, row.get("camera_id"), row.get("username"), row.get("role"),
+                          row.get("granted_by"), self._normalize_ts(row.get("granted_at")),
+                          cloud_updated))
+                counts["camera_permissions"] = counts.get("camera_permissions", 0) + 1
+        except Exception as e:
+            print(f"  Warning: Could not pull camera_permissions: {e}")
+
+        # Pull clubs
+        try:
+            result = fetch_table("clubs")
+            for row in result.data:
+                club_id = row.get("id")
+                if not club_id:
+                    continue
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+
+                cursor.execute("SELECT id, updated_at FROM clubs WHERE id = ?", (club_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    local_updated = self._normalize_ts(existing[1] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("""
+                            UPDATE clubs SET name=?, created_by=?, updated_at=?
+                            WHERE id = ?
+                        """, (row.get("name"), row.get("created_by"), cloud_updated, club_id))
+                else:
+                    cursor.execute("""
+                        INSERT INTO clubs (id, name, created_by, updated_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (club_id, row.get("name"), row.get("created_by"), cloud_updated))
+                counts["clubs"] = counts.get("clubs", 0) + 1
+        except Exception as e:
+            print(f"  Warning: Could not pull clubs: {e}")
+
+        # Pull club_memberships
+        try:
+            result = fetch_table("club_memberships")
+            for row in result.data:
+                mem_id = row.get("id")
+                if not mem_id:
+                    continue
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+
+                cursor.execute("SELECT id, updated_at FROM club_memberships WHERE id = ?", (mem_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    local_updated = self._normalize_ts(existing[1] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("""
+                            UPDATE club_memberships SET club_id=?, username=?, updated_at=?
+                            WHERE id = ?
+                        """, (row.get("club_id"), row.get("username"), cloud_updated, mem_id))
+                else:
+                    cursor.execute("""
+                        INSERT INTO club_memberships (id, club_id, username, updated_at)
+                        VALUES (?, ?, ?, ?)
+                    """, (mem_id, row.get("club_id"), row.get("username"), cloud_updated))
+                counts["club_memberships"] = counts.get("club_memberships", 0) + 1
+        except Exception as e:
+            print(f"  Warning: Could not pull club_memberships: {e}")
+
+        # Pull camera_club_shares
+        try:
+            result = fetch_table("camera_club_shares")
+            for row in result.data:
+                share_id = row.get("id")
+                if not share_id:
+                    continue
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+
+                cursor.execute("SELECT id, updated_at FROM camera_club_shares WHERE id = ?", (share_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    local_updated = self._normalize_ts(existing[1] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("""
+                            UPDATE camera_club_shares SET camera_id=?, club_id=?, shared_by=?,
+                                visibility=?, updated_at=?
+                            WHERE id = ?
+                        """, (row.get("camera_id"), row.get("club_id"), row.get("shared_by"),
+                              row.get("visibility"), cloud_updated, share_id))
+                else:
+                    cursor.execute("""
+                        INSERT INTO camera_club_shares (id, camera_id, club_id, shared_by, visibility, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (share_id, row.get("camera_id"), row.get("club_id"), row.get("shared_by"),
+                          row.get("visibility"), cloud_updated))
+                counts["camera_club_shares"] = counts.get("camera_club_shares", 0) + 1
+        except Exception as e:
+            print(f"  Warning: Could not pull camera_club_shares: {e}")
+
+        # Pull label_suggestions (with tombstone support)
+        try:
+            result = fetch_table("label_suggestions")
+            for row in result.data:
+                sug_id = row.get("id")
+                if not sug_id:
+                    continue
+                cloud_updated = self._normalize_ts(row.get("updated_at", ""))
+                cloud_deleted = self._normalize_ts(row.get("deleted_at")) or None
+
+                cursor.execute("SELECT id, updated_at FROM label_suggestions WHERE id = ?", (sug_id,))
+                existing = cursor.fetchone()
+
+                if existing:
+                    local_updated = self._normalize_ts(existing[1] or "")
+                    if cloud_updated > local_updated:
+                        cursor.execute("""
+                            UPDATE label_suggestions SET file_hash=?, tag_name=?, suggested_by=?,
+                                status=?, reviewed_by=?, reviewed_at=?, camera_id=?,
+                                deleted_at=?, updated_at=?
+                            WHERE id = ?
+                        """, (row.get("file_hash"), row.get("tag_name"), row.get("suggested_by"),
+                              row.get("status"), row.get("reviewed_by"),
+                              self._normalize_ts(row.get("reviewed_at")),
+                              row.get("camera_id"), cloud_deleted, cloud_updated, sug_id))
+                else:
+                    cursor.execute("""
+                        INSERT INTO label_suggestions (id, file_hash, tag_name, suggested_by,
+                            status, reviewed_by, reviewed_at, camera_id, deleted_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (sug_id, row.get("file_hash"), row.get("tag_name"), row.get("suggested_by"),
+                          row.get("status"), row.get("reviewed_by"),
+                          self._normalize_ts(row.get("reviewed_at")),
+                          row.get("camera_id"), cloud_deleted, cloud_updated))
+                counts["label_suggestions"] = counts.get("label_suggestions", 0) + 1
+        except Exception as e:
+            print(f"  Warning: Could not pull label_suggestions: {e}")
+
+        report(9, "Finalizing...")
+
+        report(10, "Sync complete!")
         self.conn.commit()
 
         # Save pull sync time for next incremental pull

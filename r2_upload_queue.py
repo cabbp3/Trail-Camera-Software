@@ -185,11 +185,23 @@ class R2UploadManager(QObject):
         self.upload_progress.emit(current, total)
         self.status_changed.emit(f"R2: {current}/{total}")
 
+    MAX_RETRIES = 5
+
     def _on_item_complete(self, file_hash: str, success: bool):
         """Handle individual upload completion."""
         if success:
             # Remove from queue
             self._queue = [q for q in self._queue if q.get('file_hash') != file_hash]
+            self._save_queue()
+        else:
+            # Increment retry_count; drop after MAX_RETRIES
+            for item in self._queue:
+                if item.get('file_hash') == file_hash:
+                    item['retry_count'] = item.get('retry_count', 0) + 1
+                    if item['retry_count'] >= self.MAX_RETRIES:
+                        logger.warning(f"R2 upload dropped after {self.MAX_RETRIES} retries: {file_hash}")
+                        self._queue = [q for q in self._queue if q.get('file_hash') != file_hash]
+                    break
             self._save_queue()
 
     def _on_all_complete(self, uploaded: int, failed: int):

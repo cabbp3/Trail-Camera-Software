@@ -94,6 +94,104 @@ from database import TrailCamDatabase  # noqa: E402
 from preview_window import ImageGraphicsView  # reuse zoom/pan behavior
 
 
+class SupabaseAuthDialog(QDialog):
+    """Simple Supabase auth dialog (sign in / sign up)."""
+
+    def __init__(self, client, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self._signup_mode = False
+        self.result_mode = None
+
+        self.setWindowTitle("Supabase Login")
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.email_edit = QLineEdit()
+        self.email_edit.setPlaceholderText("Email")
+        self.password_edit = QLineEdit()
+        self.password_edit.setPlaceholderText("Password")
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.display_name_label = QLabel("Display Name")
+        self.display_name_edit = QLineEdit()
+        self.display_name_edit.setPlaceholderText("Your name")
+
+        form.addRow("Email", self.email_edit)
+        form.addRow("Password", self.password_edit)
+        form.addRow(self.display_name_label, self.display_name_edit)
+        layout.addLayout(form)
+
+        self.display_name_label.hide()
+        self.display_name_edit.hide()
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: red;")
+        layout.addWidget(self.error_label)
+
+        btn_row = QHBoxLayout()
+        self.sign_in_btn = QPushButton("Sign In")
+        self.sign_up_btn = QPushButton("Sign Up")
+        self.continue_btn = QPushButton("Continue Without Login")
+        btn_row.addWidget(self.sign_in_btn)
+        btn_row.addWidget(self.sign_up_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.continue_btn)
+        layout.addLayout(btn_row)
+
+        self.sign_in_btn.clicked.connect(self._on_sign_in)
+        self.sign_up_btn.clicked.connect(self._on_sign_up)
+        self.continue_btn.clicked.connect(self._on_continue)
+
+    def _set_signup_mode(self, enabled: bool):
+        self._signup_mode = enabled
+        if enabled:
+            self.display_name_label.show()
+            self.display_name_edit.show()
+        else:
+            self.display_name_label.hide()
+            self.display_name_edit.hide()
+
+    def _on_sign_in(self):
+        email = self.email_edit.text().strip()
+        password = self.password_edit.text().strip()
+        if not email or not password:
+            self.error_label.setText("Email and password are required.")
+            return
+        result = self.client.sign_in(email, password)
+        if result.get("ok") and self.client.is_authenticated:
+            self.result_mode = "signed_in"
+            self.accept()
+        else:
+            msg = result.get("error", "Check credentials.")
+            self.error_label.setText(f"Login failed: {msg}")
+
+    def _on_sign_up(self):
+        if not self._signup_mode:
+            self._set_signup_mode(True)
+            self.error_label.setText("")
+            return
+        email = self.email_edit.text().strip()
+        password = self.password_edit.text().strip()
+        display_name = self.display_name_edit.text().strip()
+        if not email or not password or not display_name:
+            self.error_label.setText("Email, password, and display name are required.")
+            return
+        result = self.client.sign_up(email, password, display_name)
+        if result.get("ok") and self.client.is_authenticated:
+            self.result_mode = "signed_in"
+            self.accept()
+        elif result.get("ok"):
+            self.error_label.setText("Sign up succeeded. Check email to confirm.")
+        else:
+            msg = result.get("error", "Check details.")
+            self.error_label.setText(f"Sign up failed: {msg}")
+
+    def _on_continue(self):
+        self.result_mode = "continue"
+        self.accept()
+
+
 class CheckableComboBox(QComboBox):
     """A combo box with checkable items for multi-select filtering."""
     selectionChanged = pyqtSignal()  # Emitted when selection changes
@@ -2012,6 +2110,9 @@ class TrainerWindow(QMainWindow):
         pull_cloud_action = file_menu.addAction("Pull from Cloud...")
         pull_cloud_action.triggered.connect(self.pull_from_cloud)
         file_menu.addSeparator()
+        sign_out_action = file_menu.addAction("Sign Out")
+        sign_out_action.triggered.connect(self._sign_out)
+        file_menu.addSeparator()
         exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
         menubar.addMenu(file_menu)
@@ -2049,6 +2150,9 @@ class TrainerWindow(QMainWindow):
 
         site_review_action = self.tools_menu.addAction("Review Site Suggestions...")
         site_review_action.triggered.connect(self.review_site_suggestions)
+
+        label_suggestion_action = self.tools_menu.addAction("Review Label Suggestions...")
+        label_suggestion_action.triggered.connect(self.review_label_suggestions)
 
         self.claude_review_action = self.tools_menu.addAction("Claude Review Queue...")
         self.claude_review_action.triggered.connect(self.review_claude_queue)
@@ -2170,6 +2274,12 @@ class TrainerWindow(QMainWindow):
         self.r2_status_label = QLabel("R2: Synced")
         self.r2_status_label.setStyleSheet("color: green; padding: 0 10px;")
         self.statusBar().addPermanentWidget(self.r2_status_label)
+        # Add user auth status indicator
+        self.user_status_label = QLabel("User: Not logged in")
+        self.user_status_label.setStyleSheet("color: gray; padding: 0 10px;")
+        self.statusBar().addPermanentWidget(self.user_status_label)
+        self._update_auth_status()
+        QTimer.singleShot(0, self._maybe_show_login_dialog)
 
         if not self.photos:
             QMessageBox.information(self, "Trainer", "No photos found in the database.")
@@ -3503,125 +3613,47 @@ class TrainerWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Download failed: {e}")
 
     def closeEvent(self, event):
-        """Save settings and optionally push to cloud before closing."""
-        self._save_settings()
-
-        # Create daily backup if one hasn't been made today
+        """Save settings and push to cloud before closing."""
         try:
-            if self.db.check_daily_backup():
-                print("[Shutdown] Daily backup created")
-        except Exception as e:
-            print(f"[Shutdown] Daily backup failed: {e}")
+            self._save_settings()
 
-        # Do a final sync before closing to ensure all changes are pushed
-        if hasattr(self, 'sync_manager'):
-            # Force a sync regardless of debounce timer
-            if self.sync_manager._check_network():
-                try:
-                    client = self._get_supabase_client_silent()
-                    if client and client.is_configured():
-                        print("[Shutdown] Pushing final changes to cloud...")
-                        counts = self.db.push_to_supabase(client)
-                        total = sum(counts.values())
-                        if total > 0:
-                            print(f"[Shutdown] Pushed {total} items to cloud")
-                except Exception as e:
-                    print(f"[Shutdown] Cloud push failed: {e}")
-            elif self.sync_manager._pending:
-                # Offline with pending changes
-                QMessageBox.information(
-                    self,
-                    "Offline Changes Pending",
-                    "Some label changes could not be synced to the cloud because the app was offline.\n\n"
-                    "Your changes are saved locally and will sync automatically the next time "
-                    "you open the app with an internet connection."
-                )
+            # Create daily backup if one hasn't been made today
+            try:
+                if self.db.check_daily_backup():
+                    print("[Shutdown] Daily backup created")
+            except Exception as e:
+                print(f"[Shutdown] Daily backup failed: {e}")
 
-        # Check if we should push to cloud
-        settings = QSettings("TrailCam", "Trainer")
-        url = settings.value("supabase_url", "")
-        key = settings.value("supabase_key", "")
-
-        if url and key:
-            always_push = settings.value("cloud_always_push_on_close", "")
-
-            if always_push == "yes":
-                self._do_cloud_push_silent()
-            elif always_push == "no":
-                pass  # User chose to never push
-            else:
-                # Ask the user
-                if self._prompt_cloud_push():
-                    self._do_cloud_push_silent()
-
-        # Close database cleanly (clears crash flag)
-        if hasattr(self, 'db') and self.db:
-            self.db.close()
+            # Do a final sync before closing to ensure all changes are pushed
+            if hasattr(self, 'sync_manager'):
+                # Force a sync regardless of debounce timer
+                if self.sync_manager._check_network():
+                    try:
+                        client = self._get_supabase_client_silent()
+                        if client and client.is_configured():
+                            print("[Shutdown] Pushing final changes to cloud...")
+                            counts = self.db.push_to_supabase(client)
+                            total = sum(counts.values())
+                            if total > 0:
+                                print(f"[Shutdown] Pushed {total} items to cloud")
+                    except Exception as e:
+                        print(f"[Shutdown] Cloud push failed: {e}")
+                elif self.sync_manager._pending:
+                    # Offline with pending changes
+                    QMessageBox.information(
+                        self,
+                        "Offline Changes Pending",
+                        "Some label changes could not be synced to the cloud because the app was offline.\n\n"
+                        "Your changes are saved locally and will sync automatically the next time "
+                        "you open the app with an internet connection."
+                    )
+        finally:
+            # Close database cleanly (clears crash flag) — always runs
+            if hasattr(self, 'db') and self.db:
+                self.db.close()
 
         event.accept()
         QApplication.instance().quit()
-
-    def _prompt_cloud_push(self):
-        """Show dialog asking whether to push to cloud. Returns True if user chose yes."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Cloud Sync")
-        dialog.setMinimumWidth(400)
-        layout = QVBoxLayout(dialog)
-
-        label = QLabel("Would you like to save your labels to the cloud before closing?")
-        label.setWordWrap(True)
-        layout.addWidget(label)
-
-        remember_check = QCheckBox("Remember my choice")
-        layout.addWidget(remember_check)
-
-        btn_layout = QHBoxLayout()
-        yes_btn = QPushButton("Yes, Save to Cloud")
-        no_btn = QPushButton("No, Just Close")
-        btn_layout.addWidget(yes_btn)
-        btn_layout.addWidget(no_btn)
-        layout.addLayout(btn_layout)
-
-        result = {"choice": False}
-
-        def on_yes():
-            result["choice"] = True
-            if remember_check.isChecked():
-                settings = QSettings("TrailCam", "Trainer")
-                settings.setValue("cloud_always_push_on_close", "yes")
-            dialog.accept()
-
-        def on_no():
-            result["choice"] = False
-            if remember_check.isChecked():
-                settings = QSettings("TrailCam", "Trainer")
-                settings.setValue("cloud_always_push_on_close", "no")
-            dialog.accept()
-
-        yes_btn.clicked.connect(on_yes)
-        no_btn.clicked.connect(on_no)
-
-        dialog.exec()
-
-        return result["choice"]
-
-    def _do_cloud_push_silent(self):
-        """Push to cloud without showing the full dialog."""
-        try:
-            client = self._get_supabase_client()
-            if not client:
-                return
-
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            QApplication.processEvents()
-
-            self.db.push_to_supabase(client)
-
-            QApplication.restoreOverrideCursor()
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            # Don't show error on close, just log it
-            logger.warning(f"Cloud push failed: {e}")
 
     def _reset_cloud_sync_preferences(self):
         """Reset the cloud sync and CuddeLink preferences so the app will ask again."""
@@ -4012,8 +4044,12 @@ class TrainerWindow(QMainWindow):
         # Load metadata
         pid = photo["id"]
         tags = self.db.get_tags(pid)
+        # Also show pending label suggestions with visual indicator
+        suggestions = self.db.get_suggestions_for_photo(pid)
+        pending_names = [s["tag_name"] for s in suggestions if s["status"] == "pending" and s["tag_name"] not in tags]
+        display_tags = list(tags) + [f"{name}?" for name in pending_names]
         self.tags_edit.blockSignals(True)
-        self.tags_edit.setText(", ".join(tags))
+        self.tags_edit.setText(", ".join(display_tags))
         self.tags_edit.blockSignals(False)
 
         # Update favorite checkbox
@@ -4046,7 +4082,9 @@ class TrainerWindow(QMainWindow):
         current_species = [t for t in tags if t in species_options]
         # Show first species in combo, all in label
         species = current_species[0] if current_species else ""
+        self.species_combo.blockSignals(True)
         self.species_combo.setCurrentText(species)
+        self.species_combo.blockSignals(False)
         # Track original saved species to know if user added NEW tag
         self._original_saved_species = set(current_species)
         self._update_current_species_label(current_species)
@@ -4071,7 +4109,9 @@ class TrainerWindow(QMainWindow):
         # Default species/sex when a buck ID exists
         if deer.get("deer_id"):
             if not (self.species_combo.currentText().strip()):
+                self.species_combo.blockSignals(True)
                 self.species_combo.setCurrentText("Deer")
+                self.species_combo.blockSignals(False)
             current_sex = self._get_sex()
             if current_sex == "Unknown":
                 self._set_sex("Buck")
@@ -4143,15 +4183,52 @@ class TrainerWindow(QMainWindow):
             _, photo = filtered[i]
             path = photo.get("file_path")
             if path and os.path.exists(path):
-                create_thumbnail(path)  # Will skip if already exists
+                create_thumbnail(path, file_hash=photo.get("file_hash"))  # Will skip if already exists
+
+    def _get_current_username(self):
+        """Get current username from config (cached per session)."""
+        if not hasattr(self, '_cached_username'):
+            from user_config import get_username
+            self._cached_username = get_username() or "unknown"
+        return self._cached_username
+
+    def _clear_cached_username(self):
+        """Clear cached username so it re-resolves from config/session."""
+        if hasattr(self, '_cached_username'):
+            delattr(self, '_cached_username')
+
+    def _save_tags_role_aware(self, photo_id, tags):
+        """Save tags with role awareness: owners write tags directly, members write suggestions."""
+        username = self._get_current_username()
+        role = self.db.get_user_role_for_photo(photo_id, username)
+
+        if role == 'owner':
+            # Owner: write directly to tags as before
+            self.db.update_photo_tags(photo_id=photo_id, tags=tags)
+        else:
+            # Member: calculate new tags vs existing, add as suggestions
+            existing_tags = set(self.db.get_tags(photo_id))
+            new_tags = set(tags) - existing_tags
+            for tag_name in new_tags:
+                self.db.add_label_suggestion(photo_id, tag_name, username)
+
+    def _add_tag_role_aware(self, photo_id, tag_name):
+        """Add a single tag with role awareness."""
+        username = self._get_current_username()
+        role = self.db.get_user_role_for_photo(photo_id, username)
+
+        if role == 'owner':
+            self.db.add_tag(photo_id, tag_name)
+        else:
+            self.db.add_label_suggestion(photo_id, tag_name, username)
 
     def save_current(self):
-        if not self.photos:
+        photo = self._current_photo()
+        if not photo:
             return
         # Prevent saving during photo load - UI fields may be in transitional state
         if getattr(self, '_loading_photo_data', False):
             return
-        photo = self.photos[self.index]
         pid = photo["id"]
         species = self.species_combo.currentText().strip()
         if species.lower() in SEX_TAGS:
@@ -4209,7 +4286,7 @@ class TrainerWindow(QMainWindow):
         # Verification is treated like other suggestions - not exclusive
         if "Empty" in tags:
             tags = ["Empty"]
-        self.db.update_photo_tags(pid, tags)
+        self._save_tags_role_aware(pid, tags)
         # Update UI to reflect tag changes (block signals to prevent re-triggering save)
         self.tags_edit.blockSignals(True)
         self.tags_edit.setText(", ".join(tags))
@@ -4286,7 +4363,7 @@ class TrainerWindow(QMainWindow):
             self._populate_camera_locations()
         self._update_recent_species_buttons()
         # refresh in-memory photo metadata
-        self.photos[self.index].update(self.db.get_photo_by_id(pid) or {})
+        photo.update(self.db.get_photo_by_id(pid) or {})
         self._bump_recent_buck(deer_id)
         self._update_recent_buck_buttons()
         self._update_photo_list_item(self.index)
@@ -4347,57 +4424,72 @@ class TrainerWindow(QMainWindow):
 
     def _on_species_changed(self):
         """Handle species combo changes - save immediately to ensure changes persist."""
-        # Save immediately instead of debouncing to ensure tag changes are saved
-        self.save_timer.stop()
+        if getattr(self, '_in_species_changed', False):
+            return
+        self._in_species_changed = True
+        try:
+            # Save immediately instead of debouncing to ensure tag changes are saved
+            self.save_timer.stop()
 
-        # Update box species and tab name
-        species = self.species_combo.currentText().strip()
-        # Debug: trace species changes in queue mode
-        if self.queue_mode:
-            has_boxes = hasattr(self, "current_boxes") and bool(self.current_boxes)
-            print(f"[DEBUG] _on_species_changed: species='{species}', queue_mode={self.queue_mode}, has_boxes={has_boxes}")
-        if hasattr(self, "current_boxes") and self.current_boxes:
-            if self.current_box_index < len(self.current_boxes):
-                self.current_boxes[self.current_box_index]["species"] = species
-                # Clear sex if species is not Deer (sex only applies to deer)
-                if species and species.lower() != "deer":
-                    self.current_boxes[self.current_box_index]["sex"] = None
-                    self.current_boxes[self.current_box_index]["sex_conf"] = None
-                self._update_box_tab_name(self.current_box_index)
-
-        self.save_current()
-
-        # In queue mode, auto-advance when ALL boxes are labeled (not just current box)
-        if self.queue_mode and not self._loading_photo_data:
-            # Don't auto-advance if "Multiple species" is checked
-            if hasattr(self, 'queue_multi_species') and self.queue_multi_species.isChecked():
-                print("[DEBUG] queue advance blocked: multi_species checked")
-                return
+            # Update box species and tab name
             species = self.species_combo.currentText().strip()
-            if species:  # Only check if a species was actually selected
-                # Only advance when ALL boxes are labeled
-                all_labeled = self._all_boxes_labeled()
-                print(f"[DEBUG] queue advance check: species='{species}', all_labeled={all_labeled}")
-                if not all_labeled:
-                    print("[DEBUG] queue advance blocked: not all boxes labeled")
-                    return  # Still have unlabeled boxes
-                current_pid = None
-                if self.photos and self.index < len(self.photos):
-                    current_pid = self.photos[self.index].get("id")
-                if current_pid:
-                    # Check if already reviewed (prevents double-advance from multiple signals)
-                    if current_pid in self.queue_reviewed:
-                        return
-                    # Mark as reviewed for green highlighting
-                    self.queue_reviewed.add(current_pid)
-                    # Clear AI suggestion since user made a decision
-                    self.db.set_suggested_tag(current_pid, None, None)
-                    self._mark_current_list_item_reviewed()
-                self._queue_advance()
+            # Don't treat sex tags as species
+            if species.lower() in SEX_TAGS:
+                return
+            # Debug: trace species changes in queue mode
+            if self.queue_mode:
+                has_boxes = hasattr(self, "current_boxes") and bool(self.current_boxes)
+                print(f"[DEBUG] _on_species_changed: species='{species}', queue_mode={self.queue_mode}, has_boxes={has_boxes}")
+            if hasattr(self, "current_boxes") and self.current_boxes:
+                if self.current_box_index < len(self.current_boxes):
+                    self.current_boxes[self.current_box_index]["species"] = species
+                    # Clear sex if species is not Deer (sex only applies to deer)
+                    if species and species.lower() != "deer":
+                        self.current_boxes[self.current_box_index]["sex"] = None
+                        self.current_boxes[self.current_box_index]["sex_conf"] = None
+                    self._update_box_tab_name(self.current_box_index)
+
+            self.save_current()
+
+            # In queue mode, auto-advance when ALL boxes are labeled (not just current box)
+            if self.queue_mode and not self._loading_photo_data:
+                # Don't auto-advance if "Multiple species" is checked
+                if hasattr(self, 'queue_multi_species') and self.queue_multi_species.isChecked():
+                    print("[DEBUG] queue advance blocked: multi_species checked")
+                    return
+                species = self.species_combo.currentText().strip()
+                if species:  # Only check if a species was actually selected
+                    # Only advance when ALL boxes are labeled
+                    all_labeled = self._all_boxes_labeled()
+                    print(f"[DEBUG] queue advance check: species='{species}', all_labeled={all_labeled}")
+                    if not all_labeled:
+                        print("[DEBUG] queue advance blocked: not all boxes labeled")
+                        return  # Still have unlabeled boxes
+                    current_pid = None
+                    if self.photos and self.index < len(self.photos):
+                        current_pid = self.photos[self.index].get("id")
+                    if current_pid:
+                        # Check if already reviewed (prevents double-advance from multiple signals)
+                        if current_pid in self.queue_reviewed:
+                            return
+                        # Mark as reviewed for green highlighting
+                        self.queue_reviewed.add(current_pid)
+                        # Clear AI suggestion since user made a decision
+                        self.db.set_suggested_tag(current_pid, None, None)
+                        self._mark_current_list_item_reviewed()
+                    self._queue_advance()
+        finally:
+            self._in_species_changed = False
 
     def _get_filtered_indices(self) -> List[int]:
         """Get list of photo indices that pass current filters."""
         return [idx for idx, _ in self._filtered_photos()]
+
+    def _current_photo(self):
+        """Return current photo dict or None if out of bounds."""
+        if not self.photos or self.index < 0 or self.index >= len(self.photos):
+            return None
+        return self.photos[self.index]
 
     def prev_photo(self):
         if not self.photos:
@@ -5935,7 +6027,9 @@ class TrainerWindow(QMainWindow):
         tag = getattr(self, "current_suggested_tag", "") or ""
         if not tag:
             return
+        self.species_combo.blockSignals(True)
         self.species_combo.setCurrentText(tag)
+        self.species_combo.blockSignals(False)
         self.schedule_save()
 
     def _apply_all_suggestions(self):
@@ -5990,7 +6084,9 @@ class TrainerWindow(QMainWindow):
             # NOTE: deer_id is intentionally NOT copied
 
         # Update form field to match
+        self.species_combo.blockSignals(True)
         self.species_combo.setCurrentText(species)
+        self.species_combo.blockSignals(False)
 
         # Persist boxes
         self._persist_boxes()
@@ -6602,6 +6698,43 @@ class TrainerWindow(QMainWindow):
                 result = [(idx, p) for idx, p in result if p.get("favorite") and not p.get("archived")]
             # "all" shows everything, no filter needed
 
+        sort_key = self.sort_combo.currentData() if hasattr(self, "sort_combo") else None
+        needs_tags = False
+        needs_deer = False
+
+        if hasattr(self, "species_filter_combo"):
+            if hasattr(self.species_filter_combo, 'get_checked_data'):
+                selected_species = self.species_filter_combo.get_checked_data()
+                total_options = self.species_filter_combo._model.rowCount() - 1 if hasattr(self.species_filter_combo, '_model') else 0
+                if selected_species and len(selected_species) < total_options:
+                    needs_tags = True
+            else:
+                species_flt = self.species_filter_combo.currentData()
+                if species_flt:
+                    needs_tags = True
+
+        if hasattr(self, "sex_filter_combo"):
+            if self.sex_filter_combo.currentData():
+                needs_tags = True
+
+        if hasattr(self, "deer_id_filter_combo"):
+            if self.deer_id_filter_combo.currentData():
+                needs_deer = True
+
+        if sort_key == "species":
+            needs_tags = True
+        if sort_key == "deer_id":
+            needs_deer = True
+
+        tags_map = {}
+        deer_map = {}
+        if needs_tags or needs_deer:
+            photo_ids = [p.get("id") for _, p in result if p.get("id") is not None]
+            if needs_tags:
+                tags_map = self.db.get_all_tags_batch(photo_ids)
+            if needs_deer:
+                deer_map = self.db.get_all_deer_metadata_batch(photo_ids)
+
         # Apply species filter (multi-select)
         if hasattr(self, "species_filter_combo"):
             # Check if it's a multi-select combo
@@ -6614,7 +6747,7 @@ class TrainerWindow(QMainWindow):
                     filtered = []
                     selected_set = set(selected_species)
                     for idx, p in result:
-                        tags = set(self.db.get_tags(p["id"]))
+                        tags = set(tags_map.get(p["id"], []))
                         species_tags = tags & VALID_SPECIES
                         # Check if "__unlabeled__" is selected
                         if "__unlabeled__" in selected_set and not species_tags:
@@ -6628,7 +6761,7 @@ class TrainerWindow(QMainWindow):
                 if species_flt:
                     filtered = []
                     for idx, p in result:
-                        tags = set(self.db.get_tags(p["id"]))
+                        tags = set(tags_map.get(p["id"], []))
                         species_tags = tags & VALID_SPECIES
                         if species_flt == "__unlabeled__":
                             if not species_tags:
@@ -6643,7 +6776,7 @@ class TrainerWindow(QMainWindow):
             if sex_flt:
                 filtered = []
                 for idx, p in result:
-                    tags = set(self.db.get_tags(p["id"]))
+                    tags = set(tags_map.get(p["id"], []))
                     photo_sex = ""
                     if "Buck" in tags:
                         photo_sex = "Buck"
@@ -6661,7 +6794,7 @@ class TrainerWindow(QMainWindow):
             if deer_flt:
                 filtered = []
                 for idx, p in result:
-                    meta = self.db.get_deer_metadata(p["id"])
+                    meta = deer_map.get(p["id"], {})
                     deer_id = meta.get("deer_id") or ""
                     if deer_flt == "__has_id__":
                         if deer_id:
@@ -6742,13 +6875,13 @@ class TrainerWindow(QMainWindow):
                 result.sort(key=lambda x: (x[1].get("camera_location") or "zzz", x[1].get("date_taken") or ""))
             elif sort_key == "species":
                 def get_species(p):
-                    tags = self.db.get_tags(p["id"])
+                    tags = tags_map.get(p["id"], [])
                     species_tags = set(tags) & VALID_SPECIES
                     return sorted(species_tags)[0] if species_tags else "zzz"
                 result.sort(key=lambda x: (get_species(x[1]), x[1].get("date_taken") or ""))
             elif sort_key == "deer_id":
                 def get_deer_id(p):
-                    meta = self.db.get_deer_metadata(p["id"])
+                    meta = deer_map.get(p["id"], {})
                     return meta.get("deer_id") or "zzz"
                 result.sort(key=lambda x: (get_deer_id(x[1]), x[1].get("date_taken") or ""))
 
@@ -6783,6 +6916,37 @@ class TrainerWindow(QMainWindow):
             elif archive_flt == "archived":
                 result = [p for p in result if p.get("archived")]
 
+        # Pre-fetch batch data to avoid N+1 queries
+        needs_tags = False
+        needs_deer = False
+
+        if exclude_filter != 'species' and hasattr(self, "species_filter_combo"):
+            if hasattr(self.species_filter_combo, 'get_checked_data'):
+                selected_species = self.species_filter_combo.get_checked_data()
+                total_options = self.species_filter_combo._model.rowCount() - 1 if hasattr(self.species_filter_combo, '_model') else 0
+                if selected_species and len(selected_species) < total_options:
+                    needs_tags = True
+            else:
+                if self.species_filter_combo.currentData():
+                    needs_tags = True
+
+        if exclude_filter != 'sex' and hasattr(self, "sex_filter_combo"):
+            if self.sex_filter_combo.currentData():
+                needs_tags = True
+
+        if exclude_filter != 'deer_id' and hasattr(self, "deer_id_filter_combo"):
+            if self.deer_id_filter_combo.currentData():
+                needs_deer = True
+
+        tags_map = {}
+        deer_map = {}
+        if needs_tags or needs_deer:
+            photo_ids = [p.get("id") for p in result if p.get("id") is not None]
+            if needs_tags:
+                tags_map = self.db.get_all_tags_batch(photo_ids)
+            if needs_deer:
+                deer_map = self.db.get_all_deer_metadata_batch(photo_ids)
+
         # Apply species filter (multi-select)
         if exclude_filter != 'species' and hasattr(self, "species_filter_combo"):
             if hasattr(self.species_filter_combo, 'get_checked_data'):
@@ -6792,7 +6956,7 @@ class TrainerWindow(QMainWindow):
                     filtered = []
                     selected_set = set(selected_species)
                     for p in result:
-                        tags = set(self.db.get_tags(p["id"]))
+                        tags = set(tags_map.get(p["id"], []))
                         species_tags = tags & VALID_SPECIES
                         if "__unlabeled__" in selected_set and not species_tags:
                             filtered.append(p)
@@ -6804,7 +6968,7 @@ class TrainerWindow(QMainWindow):
                 if species_flt:
                     filtered = []
                     for p in result:
-                        tags = set(self.db.get_tags(p["id"]))
+                        tags = set(tags_map.get(p["id"], []))
                         species_tags = tags & VALID_SPECIES
                         if species_flt == "__unlabeled__":
                             if not species_tags:
@@ -6819,7 +6983,7 @@ class TrainerWindow(QMainWindow):
             if sex_flt:
                 filtered = []
                 for p in result:
-                    tags = set(self.db.get_tags(p["id"]))
+                    tags = set(tags_map.get(p["id"], []))
                     photo_sex = ""
                     if "Buck" in tags:
                         photo_sex = "Buck"
@@ -6837,7 +7001,7 @@ class TrainerWindow(QMainWindow):
             if deer_flt:
                 filtered = []
                 for p in result:
-                    meta = self.db.get_deer_metadata(p["id"])
+                    meta = deer_map.get(p["id"], {})
                     deer_id = meta.get("deer_id") or ""
                     if deer_flt == "__has_id__":
                         if deer_id:
@@ -6919,7 +7083,7 @@ class TrainerWindow(QMainWindow):
             return
         for item in selected:
             idx = item.data(Qt.ItemDataRole.UserRole)
-            if idx is None:
+            if idx is None or idx < 0 or idx >= len(self.photos):
                 continue
             pid = self.photos[idx]["id"]
             self.db.set_deer_metadata(photo_id=pid, deer_id=deer_id)
@@ -6932,7 +7096,9 @@ class TrainerWindow(QMainWindow):
         if not deer_id:
             return
         # Determine season_year from photo
-        photo = self.photos[self.index]
+        photo = self._current_photo()
+        if not photo:
+            return
         season_year = photo.get("season_year")
         if season_year is None and photo.get("date_taken"):
             season_year = TrailCamDatabase.compute_season_year(photo.get("date_taken"))
@@ -7058,7 +7224,7 @@ class TrainerWindow(QMainWindow):
         photo_ids = []
         for item in selected[:4]:
             idx = item.data(Qt.ItemDataRole.UserRole)
-            if idx is None:
+            if idx is None or idx < 0 or idx >= len(self.photos):
                 continue
             pid = self.photos[idx].get("id")
             if pid:
@@ -7277,6 +7443,16 @@ class TrainerWindow(QMainWindow):
         if not queue:
             QMessageBox.information(self, "AI Review", "No photos with AI boxes to review.")
             return
+
+        # Disable queue mode if active — only one review system at a time
+        if self.queue_mode:
+            self.queue_mode = False
+            self.queue_type = None
+            self.queue_photo_ids = []
+            self.queue_data = {}
+            self.queue_reviewed = set()
+            self.queue_panel.hide()
+
         self.ai_review_mode = True
         self.ai_review_queue = queue
         self.ai_reviewed_photos = set()  # Clear reviewed tracking
@@ -7345,21 +7521,25 @@ class TrainerWindow(QMainWindow):
         if not selected:
             QMessageBox.information(self, "Bulk Set", "Select one or more photos in the list.")
             return
+        count = 0
         for item in selected:
             idx = item.data(Qt.ItemDataRole.UserRole)
-            if idx is None:
+            if idx is None or idx < 0 or idx >= len(self.photos):
                 continue
             pid = self.photos[idx]["id"]
             tags = set(self.db.get_tags(pid))
             tags.add(species)
             self.db.update_photo_tags(pid, list(tags))
             self.db.set_suggested_tag(pid, species, None)
-        QMessageBox.information(self, "Bulk Set", f"Assigned species '{species}' to {len(selected)} photo(s).")
+            count += 1
+        QMessageBox.information(self, "Bulk Set", f"Assigned species '{species}' to {count} photo(s).")
         self._populate_photo_list()
 
     def _build_photo_label(self, idx: int) -> tuple:
         """Build list label: date + most specific identifier (buck ID > buck/doe > species).
         Returns (display_string, is_suggestion) tuple."""
+        if idx < 0 or idx >= len(self.photos):
+            return ("", False)
         p = self.photos[idx]
         pid = p.get("id")
         # Format date as m/d/yyyy time
@@ -7531,7 +7711,7 @@ class TrainerWindow(QMainWindow):
             # Map camera ID to site name (use mapping if provided, else use raw camera ID)
             camera_location = site_mappings.get(camera_id, camera_id) if camera_id else None
 
-            thumb_path = create_thumbnail(dest_path)
+            thumb_path = create_thumbnail(dest_path, file_hash=file_hash)
             try:
                 # Pass file_hash to add_photo to store it immediately and enable duplicate detection
                 photo_id = self.db.add_photo(
@@ -7600,6 +7780,7 @@ class TrainerWindow(QMainWindow):
     def _load_known_hashes(self) -> set:
         """Compute hashes for existing photos once to skip duplicates upfront."""
         hashes = set()
+        failures = 0
         for p in self.db.get_all_photos():
             fp = p.get("file_path")
             if not fp:
@@ -8830,6 +9011,49 @@ class TrainerWindow(QMainWindow):
     # Supabase Cloud Sync
     # ─────────────────────────────────────────────────────────────────────
 
+    def _maybe_show_login_dialog(self):
+        """Show login dialog on startup if not authenticated."""
+        client = self._get_supabase_client_silent()
+        if not client or not client.is_configured():
+            self._update_auth_status()
+            return
+        if client.is_authenticated:
+            self._update_auth_status()
+            return
+        dlg = SupabaseAuthDialog(client, self)
+        dlg.exec()
+        self._update_auth_status()
+        self._clear_cached_username()
+        if dlg.result_mode == "continue":
+            if hasattr(self, 'statusBar'):
+                self.statusBar().showMessage(
+                    "Continuing without login (anon key in use)", 8000
+                )
+
+    def _update_auth_status(self):
+        """Update the status bar user indicator."""
+        if not hasattr(self, 'user_status_label'):
+            return
+        client = self._get_supabase_client_silent()
+        if client and client.is_authenticated:
+            session = client.get_session_info()
+            email = session.get("user_email")
+            display = session.get("display_name")
+            label = email or display or "Logged in"
+            self.user_status_label.setText(f"User: {label}")
+            self.user_status_label.setStyleSheet("color: green; padding: 0 10px;")
+        else:
+            self.user_status_label.setText("User: Not logged in")
+            self.user_status_label.setStyleSheet("color: gray; padding: 0 10px;")
+
+    def _sign_out(self):
+        """Sign out of Supabase."""
+        client = self._get_supabase_client_silent()
+        if client:
+            client.sign_out()
+        self._update_auth_status()
+        self._clear_cached_username()
+
     def setup_supabase_credentials(self):
         """Show dialog to set up Supabase credentials."""
         dlg = SupabaseCredentialsDialog(self)
@@ -8871,7 +9095,19 @@ class TrainerWindow(QMainWindow):
 
         try:
             from supabase_rest import create_client
-            return create_client(url, key)
+            client = create_client(url, key)
+            try:
+                client.refresh_if_needed()
+            except Exception:
+                pass
+            # Surface auth refresh failures so the user knows to re-login
+            if getattr(client, '_auth_error', None):
+                logger.warning(f"Auth refresh issue: {client._auth_error}")
+                if hasattr(self, 'sync_status_label'):
+                    self.sync_status_label.setText("Cloud: Auth expired")
+                    self.sync_status_label.setStyleSheet("color: red;")
+                client._auth_error = None  # Clear after surfacing
+            return client
         except Exception:
             return None
 
@@ -8994,7 +9230,15 @@ class TrainerWindow(QMainWindow):
 
         try:
             from supabase_rest import create_client
-            return create_client(url, key)
+            client = create_client(url, key)
+            try:
+                client.refresh_if_needed()
+            except Exception:
+                pass
+            if getattr(client, '_auth_error', None) or (client.get_session_info() and not client.is_authenticated):
+                client._auth_error = None  # Clear after detecting
+                self._maybe_show_login_dialog()
+            return client
         except Exception as e:
             QMessageBox.warning(self, "Supabase", f"Failed to connect to Supabase:\n{str(e)}")
             return None
@@ -9465,6 +9709,13 @@ class TrainerWindow(QMainWindow):
         if self.photos and self.index < len(self.photos):
             self.queue_pre_filter_index = self.index
 
+        # Disable AI review mode if active — only one review system at a time
+        if self.ai_review_mode:
+            self.ai_review_mode = False
+            self.ai_review_queue = []
+            self.ai_reviewed_photos = set()
+            self._advancing_review = False
+
         self.queue_mode = True
         self.queue_type = queue_type
         self.queue_photo_ids = list(photo_ids)
@@ -9859,7 +10110,7 @@ class TrainerWindow(QMainWindow):
                         for row in range(self.photo_list_widget.count()):
                             item = self.photo_list_widget.item(row)
                             idx = item.data(Qt.ItemDataRole.UserRole)
-                            if idx is not None and self.photos[idx].get("id") == pid:
+                            if idx is not None and 0 <= idx < len(self.photos) and self.photos[idx].get("id") == pid:
                                 self.photo_list_widget.blockSignals(True)
                                 self.photo_list_widget.setCurrentItem(item)
                                 self.photo_list_widget.scrollToItem(item)
@@ -9872,6 +10123,146 @@ class TrainerWindow(QMainWindow):
         reviewed_count = len(self.queue_reviewed)
         self._exit_queue_mode()
         QMessageBox.information(self, "Queue Complete", f"Finished reviewing {reviewed_count} photo(s).")
+
+    def review_label_suggestions(self):
+        """Review and approve/reject pending label suggestions from club members."""
+        from PyQt6.QtWidgets import QGraphicsView
+
+        pending = self.db.get_pending_suggestions()
+        if not pending:
+            QMessageBox.information(self, "Label Suggestions", "No pending label suggestions to review.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Review Label Suggestions ({len(pending)})")
+        dlg.resize(1000, 650)
+        layout = QVBoxLayout(dlg)
+
+        # Main content: list on left, photo on right
+        content_layout = QHBoxLayout()
+
+        # Left side: list of suggestions
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(QLabel(f"Pending suggestions ({len(pending)}):"))
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        list_widget.setMaximumWidth(320)
+
+        for item in pending:
+            text = f"{item['tag_name']} — by {item['suggested_by']}"
+            li = QListWidgetItem(text)
+            li.setData(Qt.ItemDataRole.UserRole, item)
+            list_widget.addItem(li)
+
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+
+        left_panel.addWidget(list_widget)
+        content_layout.addLayout(left_panel)
+
+        # Right side: photo preview + action buttons
+        right_panel = QVBoxLayout()
+        suggestion_label = QLabel("Suggestion: —")
+        suggestion_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 5px;")
+        right_panel.addWidget(suggestion_label)
+
+        # Photo preview
+        scene = QGraphicsScene()
+        view = QGraphicsView(scene)
+        view.setMinimumSize(600, 450)
+        view.setStyleSheet("background: #222; border: 1px solid #444;")
+        right_panel.addWidget(view, 1)
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        approve_btn = QPushButton("Approve")
+        approve_btn.setStyleSheet("background: #2d5a2d; color: white; padding: 8px 20px; font-weight: bold;")
+        reject_btn = QPushButton("Reject")
+        reject_btn.setStyleSheet("background: #5a2d2d; color: white; padding: 8px 20px; font-weight: bold;")
+        skip_btn = QPushButton("Skip")
+        skip_btn.setStyleSheet("padding: 8px 20px;")
+        btn_row.addWidget(approve_btn)
+        btn_row.addWidget(reject_btn)
+        btn_row.addWidget(skip_btn)
+        btn_row.addStretch()
+        right_panel.addLayout(btn_row)
+
+        content_layout.addLayout(right_panel, 1)
+        layout.addLayout(content_layout)
+
+        # Status bar
+        status_label = QLabel("")
+        layout.addWidget(status_label)
+
+        # Counter
+        counts = {"approved": 0, "rejected": 0}
+
+        def _update_preview():
+            item = list_widget.currentItem()
+            if not item:
+                suggestion_label.setText("Suggestion: —")
+                scene.clear()
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            suggestion_label.setText(
+                f"Suggestion: \"{data['tag_name']}\" by {data['suggested_by']}")
+            # Load photo
+            scene.clear()
+            path = data.get("file_path", "")
+            if path and os.path.exists(path):
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    scene.addPixmap(pixmap)
+                    view.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+        def _approve():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            username = self._get_current_username()
+            self.db.approve_suggestion(data["id"], username)
+            counts["approved"] += 1
+            row = list_widget.row(item)
+            list_widget.takeItem(row)
+            status_label.setText(
+                f"Approved: {counts['approved']}  Rejected: {counts['rejected']}  Remaining: {list_widget.count()}")
+            if list_widget.count() == 0:
+                QMessageBox.information(dlg, "Done", "All suggestions reviewed!")
+                dlg.accept()
+
+        def _reject():
+            item = list_widget.currentItem()
+            if not item:
+                return
+            data = item.data(Qt.ItemDataRole.UserRole)
+            username = self._get_current_username()
+            self.db.reject_suggestion(data["id"], username)
+            counts["rejected"] += 1
+            row = list_widget.row(item)
+            list_widget.takeItem(row)
+            status_label.setText(
+                f"Approved: {counts['approved']}  Rejected: {counts['rejected']}  Remaining: {list_widget.count()}")
+            if list_widget.count() == 0:
+                QMessageBox.information(dlg, "Done", "All suggestions reviewed!")
+                dlg.accept()
+
+        def _skip():
+            current = list_widget.currentRow()
+            if current < list_widget.count() - 1:
+                list_widget.setCurrentRow(current + 1)
+
+        list_widget.currentItemChanged.connect(lambda: _update_preview())
+        approve_btn.clicked.connect(_approve)
+        reject_btn.clicked.connect(_reject)
+        skip_btn.clicked.connect(_skip)
+
+        _update_preview()
+        dlg.exec()
+
+        # Refresh main view after reviewing
+        if counts["approved"] > 0 or counts["rejected"] > 0:
+            self.load_photo()
 
     def review_species_suggestions_integrated(self):
         """Enter integrated queue mode for species review."""
@@ -10467,6 +10858,7 @@ class TrainerWindow(QMainWindow):
             SELECT DISTINCT t.tag_name FROM tags t
             JOIN annotation_boxes b ON t.photo_id = b.photo_id
             WHERE t.tag_name NOT IN ('Buck', 'Doe', 'Other')
+              AND t.deleted_at IS NULL
         """)
         db_species = set(row[0] for row in cursor.fetchall())
 
@@ -10959,6 +11351,7 @@ class TrainerWindow(QMainWindow):
                   AND NOT EXISTS (
                       SELECT 1 FROM annotation_boxes b
                       WHERE b.photo_id = p.id
+                        AND b.deleted_at IS NULL
                         AND b.sex IN ('Buck', 'Doe')
                         AND (b.sex_conf IS NULL OR b.sex_conf = 0)
                   )
@@ -10970,6 +11363,7 @@ class TrainerWindow(QMainWindow):
                   AND NOT EXISTS (
                       SELECT 1 FROM annotation_boxes b
                       WHERE b.photo_id = p.id
+                        AND b.deleted_at IS NULL
                         AND b.species IS NOT NULL AND b.species != '' AND b.species != 'Unknown'
                         AND b.label NOT LIKE '%head%'
                         AND (b.species_conf IS NULL OR b.species_conf = 0)
@@ -11090,6 +11484,7 @@ class TrainerWindow(QMainWindow):
             SELECT DISTINCT t.tag_name FROM tags t
             JOIN annotation_boxes b ON t.photo_id = b.photo_id
             WHERE t.tag_name NOT IN ('Buck', 'Doe', 'Empty', 'Other')
+              AND t.deleted_at IS NULL
         """)
         db_species = set(row[0] for row in cursor.fetchall())
 
@@ -12549,8 +12944,9 @@ class TrainerWindow(QMainWindow):
                       (species IS NOT NULL AND species != '' AND LOWER(species) != 'deer')
                       OR photo_id IN (
                           SELECT photo_id FROM tags
-                          WHERE tag_name IN ('Turkey', 'Coyote', 'Raccoon', 'Squirrel', 'Bird', 'Other Bird', 'Person', 'Vehicle', 'Empty', 'Verification')
-                             OR tag_name LIKE '%Bird%'
+                          WHERE (tag_name IN ('Turkey', 'Coyote', 'Raccoon', 'Squirrel', 'Bird', 'Other Bird', 'Person', 'Vehicle', 'Empty', 'Verification')
+                             OR tag_name LIKE '%Bird%')
+                            AND deleted_at IS NULL
                       )
                   )
             """)
@@ -12569,7 +12965,8 @@ class TrainerWindow(QMainWindow):
                 FROM annotation_boxes b
                 JOIN photos p ON b.photo_id = p.id
                 LEFT JOIN deer_metadata dm ON dm.photo_id = p.id
-                WHERE b.sex IS NOT NULL
+                WHERE b.deleted_at IS NULL
+                  AND b.sex IS NOT NULL
                   AND b.sex != ''
                   AND b.sex_conf IS NOT NULL
                   AND b.sex_conf > 0
@@ -12579,6 +12976,7 @@ class TrainerWindow(QMainWindow):
                   AND NOT EXISTS (
                       SELECT 1 FROM tags t
                       WHERE t.photo_id = p.id
+                      AND t.deleted_at IS NULL
                       AND (t.tag_name IN ('Turkey', 'Coyote', 'Raccoon', 'Squirrel', 'Bird', 'Other Bird', 'Person', 'Vehicle', 'Empty', 'Verification')
                            OR t.tag_name LIKE '%Bird%')
                   )
@@ -12608,9 +13006,11 @@ class TrainerWindow(QMainWindow):
 
     def run_ai_boxes(self):
         """Run detector to propose subject boxes (AI-labeled). Prefer custom ONNX, fall back to torchvision."""
-        if not self.current_pixmap or not self.photos:
+        if not self.current_pixmap:
             return
-        photo = self.photos[self.index]
+        photo = self._current_photo()
+        if not photo:
+            return
         # Skip if already fully human-labeled (species + boxes)
         if self._photo_has_human_species(photo) and self._photo_has_human_boxes(photo.get("id")):
             QMessageBox.information(self, "AI Boxes", "Skipped: photo already has human species and boxes.")
@@ -13530,12 +13930,12 @@ class TrainerWindow(QMainWindow):
 
     def _add_species_tag(self):
         """Add the selected species as an additional tag (multi-species support)."""
-        if not self.photos:
+        photo = self._current_photo()
+        if not photo:
             return
         species = self.species_combo.currentText().strip()
         if not species or species.lower() in SEX_TAGS:
             return
-        photo = self.photos[self.index]
         pid = photo["id"]
         # Get current tags and species
         tags = self.db.get_tags(pid)
@@ -13553,7 +13953,7 @@ class TrainerWindow(QMainWindow):
             # Note: Custom species addition disabled - using fixed species list
             self._update_recent_species_buttons()
             # Refresh photo data
-            self.photos[self.index].update(self.db.get_photo_by_id(pid) or {})
+            photo.update(self.db.get_photo_by_id(pid) or {})
             self._update_photo_list_item(self.index)
 
     def _bump_recent_buck(self, deer_id: Optional[str]):
@@ -15440,7 +15840,7 @@ class TrainerWindow(QMainWindow):
                     if site:
                         self.db.set_photo_site_suggestion(photo['id'], site['id'], confidence)
                     else:
-                        site_id = self.db.create_site(site_name, confirmed=True)
+                        site_id = self.db.create_site(site_name, confirmed=False)
                         self.db.set_photo_site_suggestion(photo['id'], site_id, confidence)
 
                     by_site[site_name] = by_site.get(site_name, 0) + 1
@@ -15760,14 +16160,14 @@ class TrainerWindow(QMainWindow):
 
                         # Add to database without copying
                         try:
-                            from image_processor import extract_exif_datetime
+                            from image_processor import extract_exif_data
 
-                            date_taken = extract_exif_datetime(str(file_path))
+                            date_taken, camera_model = extract_exif_data(str(file_path))
                             photo_id = self.db.add_photo(
                                 file_path=str(file_path),
                                 original_name=file_path.name,
-                                date_taken=date_taken.isoformat() if date_taken else None,
-                                camera_model=None,
+                                date_taken=date_taken,
+                                camera_model=camera_model,
                                 thumbnail_path=None,
                                 file_hash=file_hash
                             )

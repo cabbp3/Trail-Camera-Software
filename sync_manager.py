@@ -33,14 +33,26 @@ class SyncWorker(QThread):
         self._cancelled = False
 
     def run(self):
-        """Execute the sync operation."""
+        """Execute the sync operation: pull first, then push."""
         try:
-            # Use existing push_to_supabase method
-            counts = self.db.push_to_supabase(
+            # Pull first to get latest cloud state (prevents overwriting other devices' changes)
+            pull_counts = self.db.pull_from_supabase(
+                self.supabase_client,
+                progress_callback=None  # Silent sync
+            )
+            if self._cancelled:
+                return
+
+            # Then push local changes
+            push_counts = self.db.push_to_supabase(
                 self.supabase_client,
                 progress_callback=None  # Silent sync
             )
             if not self._cancelled:
+                # Combine counts for reporting
+                counts = {}
+                for k in set(list(push_counts) + list(pull_counts)):
+                    counts[k] = push_counts.get(k, 0) + pull_counts.get(k, 0)
                 self.sync_completed.emit(counts)
         except Exception as e:
             if not self._cancelled:
@@ -197,6 +209,10 @@ class SyncManager(QObject):
                 logger.warning("Supabase not configured, skipping sync")
                 self._set_status('offline')
                 return
+            try:
+                client.refresh_if_needed()
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Failed to get Supabase client: {e}")
             self._set_status('offline')
@@ -268,7 +284,9 @@ class SyncManager(QObject):
                 'last_change': datetime.now().isoformat(),
                 'retry_count': self._retry_count
             }
-            self.QUEUE_FILE.write_text(json.dumps(data, indent=2))
+            tmp_path = self.QUEUE_FILE.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(data, indent=2))
+            tmp_path.replace(self.QUEUE_FILE)
         except Exception as e:
             logger.error(f"Failed to save sync queue: {e}")
 

@@ -326,13 +326,14 @@ def import_photo(source_path: str) -> Tuple[str, str, str, str]:
 
 
 def create_thumbnail(image_path: str, size: Tuple[int, int] = (250, 250),
-                     force: bool = False) -> Optional[str]:
+                     force: bool = False, file_hash: Optional[str] = None) -> Optional[str]:
     """Create a thumbnail for an image.
 
     Args:
         image_path: Path to source image
         size: Thumbnail size (width, height)
         force: If True, regenerate even if thumbnail exists
+        file_hash: If provided, use {file_hash}_thumb.jpg for collision-free naming
 
     Returns:
         Path to thumbnail file, or None if failed
@@ -342,7 +343,10 @@ def create_thumbnail(image_path: str, size: Tuple[int, int] = (250, 250),
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
         source_path = Path(image_path)
-        thumb_filename = f"{source_path.stem}_thumb.jpg"
+        if file_hash:
+            thumb_filename = f"{file_hash}_thumb.jpg"
+        else:
+            thumb_filename = f"{source_path.stem}_thumb.jpg"
         thumb_path = thumb_dir / thumb_filename
 
         # Skip if thumbnail already exists (unless forced)
