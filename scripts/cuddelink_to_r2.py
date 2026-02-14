@@ -46,7 +46,9 @@ def get_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
-    return value.strip()
+    # Remove ALL whitespace (including embedded newlines from multi-line
+    # secret pastes in GitHub Actions).  Safe for JWT tokens and API keys.
+    return "".join(value.split())
 
 
 def safe_url(url: str) -> str:
