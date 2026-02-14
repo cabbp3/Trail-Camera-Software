@@ -41,14 +41,26 @@ BASE_URL = "https://camp.cuddeback.com"
 # Utility functions
 # ============================================================
 
+_TOKEN_ENV_VARS = {
+    "SUPABASE_KEY", "SUPABASE_URL", "R2_ENDPOINT",
+    "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET",
+}
+
+
 def get_env(name: str) -> str:
-    """Get required environment variable."""
+    """Get required environment variable.
+
+    For known token/key vars, all embedded whitespace is removed (handles
+    newlines from multi-line pastes in GitHub Secrets).  For credentials
+    like CUDDELINK_EMAIL/PASSWORD, only leading/trailing whitespace is
+    stripped so that spaces in passwords are preserved.
+    """
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
-    # Remove ALL whitespace (including embedded newlines from multi-line
-    # secret pastes in GitHub Actions).  Safe for JWT tokens and API keys.
-    return "".join(value.split())
+    if name in _TOKEN_ENV_VARS:
+        return "".join(value.split())
+    return value.strip()
 
 
 def safe_url(url: str) -> str:
@@ -92,6 +104,22 @@ async def capture_failure(page, step_name: str):
 # R2 / Supabase functions (preserved from original)
 # ============================================================
 
+class SupabaseFatalError(Exception):
+    """Raised on 401/403 to stop the entire run (bad key or RLS)."""
+
+
+def _dump_supabase_error(context: str, status: int, body: str):
+    """Write Supabase error details to /tmp for CI artifact collection."""
+    ts = datetime.now().strftime("%H%M%S")
+    path = f"/tmp/cuddelink_failure_supabase_{context}_{ts}.log"
+    try:
+        with open(path, "w") as f:
+            f.write(f"context: {context}\nstatus: {status}\nbody: {body}\n")
+        print(f"    [Supabase] Error details saved to {path}")
+    except Exception:
+        pass
+
+
 def check_photo_exists(supabase_url: str, supabase_key: str, file_hash: str) -> bool:
     """Check if photo hash already exists in Supabase."""
     headers = {
@@ -105,8 +133,14 @@ def check_photo_exists(supabase_url: str, supabase_key: str, file_hash: str) -> 
         if resp.status_code == 200:
             data = resp.json()
             return len(data) > 0
-        else:
-            print(f"[Supabase] Duplicate check failed: {resp.status_code} {resp.text[:200]}")
+        if resp.status_code in (401, 403):
+            _dump_supabase_error("check_exists", resp.status_code, resp.text[:400])
+            raise SupabaseFatalError(
+                f"Supabase returned {resp.status_code} — bad key or RLS misconfiguration"
+            )
+        print(f"[Supabase] Duplicate check failed: {resp.status_code} {resp.text[:200]}")
+    except SupabaseFatalError:
+        raise
     except Exception as e:
         print(f"[Supabase] Warning: Could not check for duplicate: {e}")
 
@@ -253,10 +287,18 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
         # Treat as success since Supabase is our idempotent store.
         if resp.status_code == 409:
             return True
+        if resp.status_code in (401, 403):
+            _dump_supabase_error("save", resp.status_code, resp.text[:400])
+            raise SupabaseFatalError(
+                f"Supabase returned {resp.status_code} — bad key or RLS misconfiguration"
+            )
         if resp.status_code >= 400:
             print(f"    [Supabase] Save failed: {resp.status_code} {resp.text[:400]}")
+            _dump_supabase_error("save", resp.status_code, resp.text[:400])
             return False
         return True
+    except SupabaseFatalError:
+        raise
     except Exception as e:
         print(f"[Supabase] Save failed: {e}")
         return False
@@ -616,23 +658,58 @@ async def download_photos(context, photo_metas: list[dict], dest_dir: Path, debu
     return downloaded
 
 
-def process_downloaded_photos(downloaded: list[tuple[Path, dict]], s3_client, config: dict, target_date_range: tuple = None) -> tuple[int, int, int]:
+_HASH_CACHE_PATH = Path("/tmp/cuddelink_seen_hashes.json")
+
+
+def _load_hash_cache() -> set:
+    """Load locally cached file hashes (survives across runs on same runner)."""
+    try:
+        if _HASH_CACHE_PATH.exists():
+            data = json.loads(_HASH_CACHE_PATH.read_text())
+            print(f"[HashCache] Loaded {len(data)} known hashes from local cache")
+            return set(data)
+    except Exception:
+        pass
+    return set()
+
+
+def _save_hash_cache(hashes: set):
+    try:
+        _HASH_CACHE_PATH.write_text(json.dumps(sorted(hashes)))
+    except Exception:
+        pass
+
+
+def process_downloaded_photos(downloaded: list[tuple[Path, dict]], s3_client, config: dict, target_date_range: tuple = None) -> dict:
     """Process downloaded photos: hash, dedupe, upload to R2, save to Supabase.
 
-    Returns (uploaded, skipped_duplicate, skipped_date).
+    Returns dict with keys: r2_uploaded, supabase_saved, supabase_errors,
+    skipped_duplicate, skipped_date.
     """
-    uploaded = 0
-    skipped_dup = 0
-    skipped_date = 0
+    stats = {
+        "r2_uploaded": 0,
+        "supabase_saved": 0,
+        "supabase_errors": 0,
+        "skipped_duplicate": 0,
+        "skipped_date": 0,
+    }
+
+    hash_cache = _load_hash_cache()
 
     for img_path, meta in downloaded:
         # Calculate hash
         file_hash = hashlib.md5(img_path.read_bytes()).hexdigest()
 
-        # Check for duplicate in Supabase
+        # Check local hash cache first, then Supabase
+        if file_hash in hash_cache:
+            print(f"  Skipping duplicate (cached): {img_path.name} ({file_hash[:8]})")
+            stats["skipped_duplicate"] += 1
+            continue
+
         if check_photo_exists(config["supabase_url"], config["supabase_key"], file_hash):
             print(f"  Skipping duplicate: {img_path.name} (hash: {file_hash[:8]})")
-            skipped_dup += 1
+            hash_cache.add(file_hash)
+            stats["skipped_duplicate"] += 1
             continue
 
         # Get EXIF datetime
@@ -644,7 +721,7 @@ def process_downloaded_photos(downloaded: list[tuple[Path, dict]], s3_client, co
                 photo_date = datetime.fromisoformat(datetime_taken).date()
                 if photo_date < target_date_range[0] or photo_date > target_date_range[1]:
                     print(f"  Skipping out-of-range: {img_path.name} ({datetime_taken})")
-                    skipped_date += 1
+                    stats["skipped_date"] += 1
                     continue
             except (ValueError, TypeError):
                 pass
@@ -662,26 +739,33 @@ def process_downloaded_photos(downloaded: list[tuple[Path, dict]], s3_client, co
                 thumb_data = create_thumbnail(img_path)
                 thumb_key = f"thumbnails/{file_hash}_thumb.jpg"
                 upload_bytes_to_r2(s3_client, config["r2_bucket"], thumb_data, thumb_key)
-                print(f"  Uploaded: {img_path.name} + thumbnail ({file_hash[:8]})")
+                print(f"  R2: {img_path.name} + thumbnail ({file_hash[:8]})")
             except Exception as e:
-                print(f"  Uploaded: {img_path.name} (thumbnail failed: {e})")
+                print(f"  R2: {img_path.name} (thumbnail failed: {e})")
+
+            stats["r2_uploaded"] += 1
 
             if datetime_taken:
                 print(f"    EXIF timestamp: {datetime_taken}")
 
             # Save metadata to Supabase
-            save_to_supabase(
+            ok = save_to_supabase(
                 config["supabase_url"],
                 config["supabase_key"],
                 file_hash,
                 datetime_taken,
                 img_path.name,
             )
-            uploaded += 1
+            if ok:
+                stats["supabase_saved"] += 1
+                hash_cache.add(file_hash)
+            else:
+                stats["supabase_errors"] += 1
         else:
             print(f"  Failed to upload: {img_path.name}")
 
-    return uploaded, skipped_dup, skipped_date
+    _save_hash_cache(hash_cache)
+    return stats
 
 
 async def apply_date_filter_if_possible(page, days_back: int, debug: bool = False) -> bool:
@@ -762,9 +846,8 @@ async def async_main(args):
         region_name="auto",
     )
 
-    uploaded = 0
-    skipped_dup = 0
-    skipped_date = 0
+    stats = {"r2_uploaded": 0, "supabase_saved": 0, "supabase_errors": 0,
+             "skipped_duplicate": 0, "skipped_date": 0}
 
     # Load local URL cache to skip known CloudFront URLs before downloading
     seen_urls_path = Path("/tmp/cuddelink_seen_urls.json")
@@ -861,14 +944,14 @@ async def async_main(args):
                     start = today - timedelta(days=args.days_back)
                     target_date_range = (start, today)
 
-                uploaded, skipped_dup, skipped_date = process_downloaded_photos(
+                stats = process_downloaded_photos(
                     downloaded, s3_client, config, target_date_range
                 )
 
-                if not filtered and skipped_date > 0:
-                    pct = (skipped_date / len(downloaded)) * 100 if downloaded else 0
-                    print(f"[Filter] EXIF date filter: kept {len(downloaded) - skipped_date}, "
-                          f"skipped {skipped_date} out-of-range ({pct:.0f}%)")
+                if not filtered and stats["skipped_date"] > 0:
+                    pct = (stats["skipped_date"] / len(downloaded)) * 100 if downloaded else 0
+                    print(f"[Filter] EXIF date filter: kept {len(downloaded) - stats['skipped_date']}, "
+                          f"skipped {stats['skipped_date']} out-of-range ({pct:.0f}%)")
                     if pct > 50:
                         print("[WARNING] Most downloaded photos were outside date range. "
                               "Consider implementing UI date filter for efficiency.")
@@ -885,9 +968,15 @@ async def async_main(args):
         finally:
             await dl_browser.close()
 
-    total_skipped = skipped_dup + skipped_date
-    print(f"\n[Sync] Complete! Uploaded: {uploaded}, Skipped: {total_skipped} "
-          f"(duplicates: {skipped_dup}, out-of-range: {skipped_date})")
+    total_skipped = stats["skipped_duplicate"] + stats["skipped_date"]
+    print(f"\n[Sync] Complete! "
+          f"R2: {stats['r2_uploaded']} | "
+          f"Supabase: {stats['supabase_saved']} | "
+          f"Skipped: {total_skipped} "
+          f"(duplicates: {stats['skipped_duplicate']}, out-of-range: {stats['skipped_date']})")
+    if stats["supabase_errors"]:
+        print(f"[WARNING] Supabase errors: {stats['supabase_errors']} "
+              f"(photos in R2 but NOT in Supabase — will retry next run)")
     print(f"[Telemetry] Login attempts: {login_attempts}, "
           f"Photos collected: {len(photo_metas)}")
 
