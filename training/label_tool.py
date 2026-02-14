@@ -78,6 +78,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QInputDialog,
     QAbstractItemView,
+    QTableWidget,
+    QTableWidgetItem,
     QLayout,
     QWidgetItem,
     QDateEdit,
@@ -103,9 +105,14 @@ class SupabaseAuthDialog(QDialog):
         self._signup_mode = False
         self.result_mode = None
 
-        self.setWindowTitle("Supabase Login")
+        self.setWindowTitle("Trail Camera Organizer — Sign In")
         self.setMinimumWidth(380)
         layout = QVBoxLayout(self)
+
+        welcome = QLabel("Sign in to sync photos and labels across devices.")
+        welcome.setWordWrap(True)
+        welcome.setStyleSheet("margin-bottom: 8px;")
+        layout.addWidget(welcome)
 
         form = QFormLayout()
         self.email_edit = QLineEdit()
@@ -132,16 +139,22 @@ class SupabaseAuthDialog(QDialog):
         btn_row = QHBoxLayout()
         self.sign_in_btn = QPushButton("Sign In")
         self.sign_up_btn = QPushButton("Sign Up")
-        self.continue_btn = QPushButton("Continue Without Login")
+        self.continue_btn = QPushButton("Browse Only")
         btn_row.addWidget(self.sign_in_btn)
         btn_row.addWidget(self.sign_up_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(self.continue_btn)
         layout.addLayout(btn_row)
 
+        self.forgot_btn = QPushButton("Forgot Password?")
+        self.forgot_btn.setFlat(True)
+        self.forgot_btn.setStyleSheet("color: #4a9eff; text-decoration: underline; border: none;")
+        layout.addWidget(self.forgot_btn)
+
         self.sign_in_btn.clicked.connect(self._on_sign_in)
         self.sign_up_btn.clicked.connect(self._on_sign_up)
         self.continue_btn.clicked.connect(self._on_continue)
+        self.forgot_btn.clicked.connect(self._on_forgot_password)
 
     def _set_signup_mode(self, enabled: bool):
         self._signup_mode = enabled
@@ -186,6 +199,19 @@ class SupabaseAuthDialog(QDialog):
         else:
             msg = result.get("error", "Check details.")
             self.error_label.setText(f"Sign up failed: {msg}")
+
+    def _on_forgot_password(self):
+        email = self.email_edit.text().strip()
+        if not email:
+            self.error_label.setText("Enter your email address first.")
+            return
+        result = self.client.recover_password(email)
+        if result.get("ok"):
+            self.error_label.setStyleSheet("color: green;")
+            self.error_label.setText("Password reset email sent. Check your inbox.")
+        else:
+            self.error_label.setStyleSheet("color: red;")
+            self.error_label.setText(f"Failed: {result.get('error', 'Unknown error')}")
 
     def _on_continue(self):
         self.result_mode = "continue"
@@ -2196,6 +2222,8 @@ class TrainerWindow(QMainWindow):
         auto_site_action.triggered.connect(self.run_site_clustering)
         manage_sites_action = self.tools_menu.addAction("Manage Sites...")
         manage_sites_action.triggered.connect(self.manage_sites)
+        manage_cameras_action = self.tools_menu.addAction("Manage Cameras...")
+        manage_cameras_action.triggered.connect(self.manage_cameras)
 
         # Store AI-related actions for simple mode hiding
         self.advanced_menu_actions = [
@@ -2744,9 +2772,78 @@ class TrainerWindow(QMainWindow):
                             dest_folder.mkdir(parents=True, exist_ok=True)
                             dest_path = dest_folder / original_name
 
-                            # Download from R2
-                            photo_key = f"photos/{file_hash}.jpg"
-                            if not dest_path.exists():
+                            def _lookup_path(path_obj):
+                                try:
+                                    lock = getattr(self.db, "_lock", None)
+                                    if lock:
+                                        with lock:
+                                            cursor = self.db.conn.cursor()
+                                            cursor.execute("SELECT id, file_hash FROM photos WHERE file_path = ?", (str(path_obj),))
+                                            return cursor.fetchone()
+                                    cursor = self.db.conn.cursor()
+                                    cursor.execute("SELECT id, file_hash FROM photos WHERE file_path = ?", (str(path_obj),))
+                                    return cursor.fetchone()
+                                except Exception:
+                                    return None
+
+                            def _lookup_hash_path(fh):
+                                try:
+                                    lock = getattr(self.db, "_lock", None)
+                                    if lock:
+                                        with lock:
+                                            cursor = self.db.conn.cursor()
+                                            cursor.execute(
+                                                "SELECT file_path FROM photos WHERE file_hash = ? AND file_path IS NOT NULL AND file_path NOT LIKE 'cloud://%' LIMIT 1",
+                                                (fh,)
+                                            )
+                                            return cursor.fetchone()
+                                    cursor = self.db.conn.cursor()
+                                    cursor.execute(
+                                        "SELECT file_path FROM photos WHERE file_hash = ? AND file_path IS NOT NULL AND file_path NOT LIKE 'cloud://%' LIMIT 1",
+                                        (fh,)
+                                    )
+                                    return cursor.fetchone()
+                                except Exception:
+                                    return None
+
+                            def _disambiguate_path(path_obj, fh):
+                                base = path_obj.stem
+                                suffix = path_obj.suffix or ".jpg"
+                                candidate = path_obj.with_name(f"{base}_{fh[:8]}{suffix}")
+                                if not candidate.exists():
+                                    row = _lookup_path(candidate)
+                                    if not row:
+                                        return candidate
+                                idx = 1
+                                while True:
+                                    candidate = path_obj.with_name(f"{base}_{fh[:8]}_{idx}{suffix}")
+                                    if not candidate.exists():
+                                        row = _lookup_path(candidate)
+                                        if not row:
+                                            return candidate
+                                    idx += 1
+
+                            row = _lookup_path(dest_path)
+                            if row and row[0] != photo_id and row[1] != file_hash:
+                                dest_path = _disambiguate_path(dest_path, file_hash)
+                            elif dest_path.exists() and not row:
+                                existing = _lookup_hash_path(file_hash)
+                                if existing and existing[0]:
+                                    dest_path = Path(existing[0])
+                                else:
+                                    dest_path = _disambiguate_path(dest_path, file_hash)
+                            elif not row and not dest_path.exists():
+                                row = _lookup_path(dest_path)
+                                if row and row[0] != photo_id:
+                                    dest_path = _disambiguate_path(dest_path, file_hash)
+
+                            if dest_path.exists():
+                                # File already downloaded — just update DB path
+                                if photo_id:
+                                    self.db.update_file_path(photo_id, str(dest_path))
+                            else:
+                                # Download from R2
+                                photo_key = f"photos/{file_hash}.jpg"
                                 success = r2.download_photo(photo_key, dest_path)
                                 if not success:
                                     # Try .jpeg extension
@@ -2754,8 +2851,10 @@ class TrainerWindow(QMainWindow):
                                     success = r2.download_photo(photo_key, dest_path)
 
                                 if success and photo_id:
-                                    # Update file_path in database
                                     self.db.update_file_path(photo_id, str(dest_path))
+                                elif not success:
+                                    failed += 1
+                                    continue
 
                         downloaded += 1
                     except Exception as e:
@@ -4051,6 +4150,10 @@ class TrainerWindow(QMainWindow):
         self.tags_edit.blockSignals(True)
         self.tags_edit.setText(", ".join(display_tags))
         self.tags_edit.blockSignals(False)
+        if pending_names:
+            self.tags_edit.setStyleSheet("color: #e6d54a;")
+        else:
+            self.tags_edit.setStyleSheet("")
 
         # Update favorite checkbox
         self.favorite_checkbox.blockSignals(True)
@@ -4202,7 +4305,7 @@ class TrainerWindow(QMainWindow):
         username = self._get_current_username()
         role = self.db.get_user_role_for_photo(photo_id, username)
 
-        if role == 'owner':
+        if role in ('owner', 'editor'):
             # Owner: write directly to tags as before
             self.db.update_photo_tags(photo_id=photo_id, tags=tags)
         else:
@@ -4217,7 +4320,7 @@ class TrainerWindow(QMainWindow):
         username = self._get_current_username()
         role = self.db.get_user_role_for_photo(photo_id, username)
 
-        if role == 'owner':
+        if role in ('owner', 'editor'):
             self.db.add_tag(photo_id, tag_name)
         else:
             self.db.add_label_suggestion(photo_id, tag_name, username)
@@ -8452,7 +8555,8 @@ class TrainerWindow(QMainWindow):
                 row = cursor.fetchone()
                 if row and row[0]:
                     # date_taken format is "YYYY-MM-DD HH:MM:SS" or similar
-                    last_download = row[0][:10]  # Take just the date part
+                    dt = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+                    last_download = dt.date().isoformat()
             except Exception:
                 pass
 
@@ -8630,218 +8734,225 @@ class TrainerWindow(QMainWindow):
 
         def on_download_complete(files, error):
             self._cudde_dialog.close()
+            temp_dir = dest / ".cuddelink_tmp"
 
-            if self._cudde_cancelled:
-                return
-
-            if error:
-                if "credentials" in error.lower() or "login" in error.lower() or "invalid" in error.lower() or "password" in error.lower():
-                    reply = QMessageBox.question(
-                        self, "CuddeLink Login Failed",
-                        f"Login failed: {error}\n\nWould you like to update your credentials?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
-                        self.setup_cuddelink_credentials()
-                else:
-                    QMessageBox.warning(self, "CuddeLink", f"Download failed: {error}")
-                return
-
-            if not files:
-                QMessageBox.information(self, "CuddeLink", "No new photos found to download.")
-                return
-
-            # Filter out already-imported photos by original filename
-            new_files = []
-            skipped = 0
-            for f in files:
-                if self.db.photo_exists_by_original_name(f.name):
-                    skipped += 1
-                else:
-                    new_files.append(f)
-
-            if not new_files:
-                QMessageBox.information(self, "CuddeLink", f"All {skipped} photo(s) already imported.")
-                return
-
-            # Scan for unique camera IDs and show mapping dialog
-            camera_id_counts = {}
-            for f in new_files:
-                cam_id = extract_cuddelink_camera_id(str(f))
-                if cam_id:
-                    camera_id_counts[cam_id] = camera_id_counts.get(cam_id, 0) + 1
-
-            # Show site mapping dialog if we found camera IDs
-            site_mappings = {}  # camera_id -> site_name
-            if camera_id_counts:
-                # Load saved mappings from previous downloads
-                import json
-                saved_mappings = {}
-                saved_str = settings.value("cuddelink_site_mappings", "")
-                if saved_str:
-                    try:
-                        saved_mappings = json.loads(saved_str)
-                    except:
-                        pass
-
-                # Check if all cameras have saved mappings
-                all_mapped = all(cam_id in saved_mappings for cam_id in camera_id_counts)
-
-                if all_mapped:
-                    # Show quick confirmation with option to change
-                    summary = "Photos will be assigned to these sites:\n\n"
-                    for cam_id, count in sorted(camera_id_counts.items()):
-                        site = saved_mappings.get(cam_id, cam_id)
-                        summary += f"  • {cam_id} → {site} ({count} photos)\n"
-                    summary += "\nClick 'Import' to proceed or 'Change...' to modify."
-
-                    confirm_dialog = QMessageBox(self)
-                    confirm_dialog.setWindowTitle("Confirm Site Assignments")
-                    confirm_dialog.setText(summary)
-                    confirm_dialog.setIcon(QMessageBox.Icon.Question)
-                    import_btn = confirm_dialog.addButton("Import", QMessageBox.ButtonRole.AcceptRole)
-                    change_btn = confirm_dialog.addButton("Change...", QMessageBox.ButtonRole.ActionRole)
-                    cancel_btn_confirm = confirm_dialog.addButton(QMessageBox.StandardButton.Cancel)
-
-                    confirm_dialog.exec()
-                    clicked = confirm_dialog.clickedButton()
-
-                    if clicked == cancel_btn_confirm:
-                        temp_dir = dest / ".cuddelink_tmp"
-                        if temp_dir.exists():
-                            try:
-                                shutil.rmtree(temp_dir)
-                            except:
-                                pass
-                        return
-                    elif clicked == import_btn:
-                        # Use saved mappings directly
-                        for cam_id in camera_id_counts:
-                            site_mappings[cam_id] = saved_mappings.get(cam_id, cam_id)
-                        # Skip to import
-                        imported = self._import_files(new_files, skip_hash=True, collection=selected_collection,
-                                                     site_mappings=site_mappings)
-                        temp_dir = dest / ".cuddelink_tmp"
-                        if temp_dir.exists():
-                            try:
-                                shutil.rmtree(temp_dir)
-                            except:
-                                pass
-                        msg = f"Imported {imported} new photo(s)."
-                        if skipped > 0:
-                            msg += f"\nSkipped {skipped} duplicate(s)."
-                        QMessageBox.information(self, "CuddeLink", msg)
-                        if imported:
-                            settings.setValue("cuddelink_last_download", end_date)
-                            self.photos = self._sorted_photos(self.db.get_all_photos())
-                            self._populate_collection_filter_options()
-                            self._populate_photo_list()
-                        return
-                    # Otherwise fall through to show edit dialog
-
-                map_dialog = QDialog(self)
-                map_dialog.setWindowTitle("Camera Site Mapping")
-                map_dialog.setMinimumWidth(450)
-                map_layout = QVBoxLayout(map_dialog)
-
-                map_layout.addWidget(QLabel(
-                    f"Found {len(camera_id_counts)} camera(s) in {len(new_files)} photos.\n"
-                    "Site names are remembered from previous downloads.\n"
-                    "Change if camera was moved to a new location:"))
-
-                # Get existing sites for suggestions
-                existing_sites = sorted(set(
-                    p.get('camera_location', '').strip()
-                    for p in self.db.get_all_photos()
-                    if p.get('camera_location', '').strip()
-                ))
-
-                # Create editable rows for each camera ID
-                site_edits = {}
-                scroll = QScrollArea()
-                scroll.setWidgetResizable(True)
-                scroll_widget = QWidget()
-                scroll_layout = QFormLayout(scroll_widget)
-
-                for cam_id, count in sorted(camera_id_counts.items()):
-                    combo = QComboBox()
-                    combo.setEditable(True)
-                    combo.addItems(existing_sites)
-                    # Use saved mapping if available, otherwise use camera ID
-                    default_site = saved_mappings.get(cam_id, cam_id)
-                    combo.setCurrentText(default_site)
-                    combo.setMinimumWidth(200)
-                    site_edits[cam_id] = combo
-                    scroll_layout.addRow(f"{cam_id} ({count} photos):", combo)
-
-                scroll.setWidget(scroll_widget)
-                scroll.setMaximumHeight(300)
-                map_layout.addWidget(scroll)
-
-                # Buttons
-                btn_layout = QHBoxLayout()
-                ok_btn = QPushButton("Import")
-                ok_btn.setDefault(True)
-                cancel_btn = QPushButton("Cancel")
-                ok_btn.clicked.connect(map_dialog.accept)
-                cancel_btn.clicked.connect(map_dialog.reject)
-                btn_layout.addWidget(ok_btn)
-                btn_layout.addWidget(cancel_btn)
-                map_layout.addLayout(btn_layout)
-
-                if map_dialog.exec() != QDialog.DialogCode.Accepted:
-                    # Clean up temp files
-                    temp_dir = dest / ".cuddelink_tmp"
-                    if temp_dir.exists():
-                        try:
-                            shutil.rmtree(temp_dir)
-                        except Exception:
-                            pass
+            try:
+                if self._cudde_cancelled:
                     return
 
-                # Collect mappings
-                for cam_id, combo in site_edits.items():
-                    site_name = combo.currentText().strip()
-                    if site_name:
-                        site_mappings[cam_id] = site_name
+                if error:
+                    if "credentials" in error.lower() or "login" in error.lower() or "invalid" in error.lower() or "password" in error.lower():
+                        reply = QMessageBox.question(
+                            self, "CuddeLink Login Failed",
+                            f"Login failed: {error}\n\nWould you like to update your credentials?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        )
+                        if reply == QMessageBox.StandardButton.Yes:
+                            self.setup_cuddelink_credentials()
+                    else:
+                        QMessageBox.warning(self, "CuddeLink", f"Download failed: {error}")
+                    return
 
-                # Save mappings for future downloads (merge with existing)
-                import json
-                all_mappings = saved_mappings.copy()
-                all_mappings.update(site_mappings)
-                settings.setValue("cuddelink_site_mappings", json.dumps(all_mappings))
+                if not files:
+                    QMessageBox.information(self, "CuddeLink", "No new photos found to download.")
+                    return
 
-            imported = self._import_files(new_files, skip_hash=True, collection=selected_collection,
-                                         site_mappings=site_mappings)
-            # Clean up extracted files
-            temp_dir = dest / ".cuddelink_tmp"
-            if temp_dir.exists():
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception:
-                    pass
+                # Filter out already-imported photos by original filename
+                new_files = []
+                skipped = 0
+                for f in files:
+                    if self.db.photo_exists_by_original_name(f.name):
+                        skipped += 1
+                    else:
+                        new_files.append(f)
 
-            msg = f"Imported {imported} new photo(s)."
-            if skipped > 0:
-                msg += f"\nSkipped {skipped} duplicate(s)."
-            QMessageBox.information(self, "CuddeLink", msg)
-            if imported:
-                # Save the end date as last download date for next time
-                settings.setValue("cuddelink_last_download", end_date)
-                self.photos = self._sorted_photos(self.db.get_all_photos())
-                self._populate_collection_filter_options()  # Refresh collection dropdown
-                self._populate_photo_list()
-                if self.photos:
-                    # Find newest photo by date_taken
-                    newest_idx = 0
-                    newest_date = ""
-                    for i, p in enumerate(self.photos):
-                        dt = p.get("date_taken") or ""
-                        if dt > newest_date:
-                            newest_date = dt
-                            newest_idx = i
-                    self.index = newest_idx
-                    self.load_photo()
+                if not new_files:
+                    QMessageBox.information(self, "CuddeLink", f"All {skipped} photo(s) already imported.")
+                    return
+
+                # Scan for unique camera IDs and show mapping dialog
+                camera_id_counts = {}
+                for f in new_files:
+                    cam_id = extract_cuddelink_camera_id(str(f))
+                    if cam_id:
+                        camera_id_counts[cam_id] = camera_id_counts.get(cam_id, 0) + 1
+
+                # Show site mapping dialog if we found camera IDs
+                site_mappings = {}  # camera_id -> site_name
+                if camera_id_counts:
+                    import json
+                    site_mapping_path = Path.home() / ".trailcam" / "site_mappings.json"
+
+                    def load_site_mappings():
+                        saved = {}
+                        if site_mapping_path.exists():
+                            try:
+                                with open(site_mapping_path, "r") as f:
+                                    saved = json.load(f) or {}
+                            except Exception:
+                                saved = {}
+                        else:
+                            saved_str = settings.value("cuddelink_site_mappings", "")
+                            if saved_str:
+                                try:
+                                    saved = json.loads(saved_str) or {}
+                                except Exception:
+                                    saved = {}
+                                if saved:
+                                    site_mapping_path.parent.mkdir(parents=True, exist_ok=True)
+                                    tmp_path = site_mapping_path.with_suffix(".tmp")
+                                    with open(tmp_path, "w") as f:
+                                        json.dump(saved, f)
+                                    os.replace(tmp_path, site_mapping_path)
+                                    settings.remove("cuddelink_site_mappings")
+                        return saved
+
+                    def save_site_mappings(mappings):
+                        site_mapping_path.parent.mkdir(parents=True, exist_ok=True)
+                        tmp_path = site_mapping_path.with_suffix(".tmp")
+                        with open(tmp_path, "w") as f:
+                            json.dump(mappings, f)
+                        os.replace(tmp_path, site_mapping_path)
+
+                    saved_mappings = load_site_mappings()
+
+                    # Check if all cameras have saved mappings
+                    all_mapped = all(cam_id in saved_mappings for cam_id in camera_id_counts)
+
+                    if all_mapped:
+                        # Show quick confirmation with option to change
+                        summary = "Photos will be assigned to these sites:\n\n"
+                        for cam_id, count in sorted(camera_id_counts.items()):
+                            site = saved_mappings.get(cam_id, cam_id)
+                            summary += f"  • {cam_id} → {site} ({count} photos)\n"
+                        summary += "\nClick 'Import' to proceed or 'Change...' to modify."
+
+                        confirm_dialog = QMessageBox(self)
+                        confirm_dialog.setWindowTitle("Confirm Site Assignments")
+                        confirm_dialog.setText(summary)
+                        confirm_dialog.setIcon(QMessageBox.Icon.Question)
+                        import_btn = confirm_dialog.addButton("Import", QMessageBox.ButtonRole.AcceptRole)
+                        change_btn = confirm_dialog.addButton("Change...", QMessageBox.ButtonRole.ActionRole)
+                        cancel_btn_confirm = confirm_dialog.addButton(QMessageBox.StandardButton.Cancel)
+
+                        confirm_dialog.exec()
+                        clicked = confirm_dialog.clickedButton()
+
+                        if clicked == cancel_btn_confirm:
+                            return
+                        elif clicked == import_btn:
+                            # Use saved mappings directly
+                            for cam_id in camera_id_counts:
+                                site_mappings[cam_id] = saved_mappings.get(cam_id, cam_id)
+                            # Skip to import
+                            imported = self._import_files(new_files, skip_hash=True, collection=selected_collection,
+                                                         site_mappings=site_mappings)
+                            msg = f"Imported {imported} new photo(s)."
+                            if skipped > 0:
+                                msg += f"\nSkipped {skipped} duplicate(s)."
+                            QMessageBox.information(self, "CuddeLink", msg)
+                            if imported:
+                                settings.setValue("cuddelink_last_download", end_date)
+                                self.photos = self._sorted_photos(self.db.get_all_photos())
+                                self._populate_collection_filter_options()
+                                self._populate_photo_list()
+                            return
+                        # Otherwise fall through to show edit dialog
+
+                    map_dialog = QDialog(self)
+                    map_dialog.setWindowTitle("Camera Site Mapping")
+                    map_dialog.setMinimumWidth(450)
+                    map_layout = QVBoxLayout(map_dialog)
+
+                    map_layout.addWidget(QLabel(
+                        f"Found {len(camera_id_counts)} camera(s) in {len(new_files)} photos.\n"
+                        "Site names are remembered from previous downloads.\n"
+                        "Change if camera was moved to a new location:"))
+
+                    # Get existing sites for suggestions
+                    existing_sites = sorted(set(
+                        p.get('camera_location', '').strip()
+                        for p in self.db.get_all_photos()
+                        if p.get('camera_location', '').strip()
+                    ))
+
+                    # Create editable rows for each camera ID
+                    site_edits = {}
+                    scroll = QScrollArea()
+                    scroll.setWidgetResizable(True)
+                    scroll_widget = QWidget()
+                    scroll_layout = QFormLayout(scroll_widget)
+
+                    for cam_id, count in sorted(camera_id_counts.items()):
+                        combo = QComboBox()
+                        combo.setEditable(True)
+                        combo.addItems(existing_sites)
+                        # Use saved mapping if available, otherwise use camera ID
+                        default_site = saved_mappings.get(cam_id, cam_id)
+                        combo.setCurrentText(default_site)
+                        combo.setMinimumWidth(200)
+                        site_edits[cam_id] = combo
+                        scroll_layout.addRow(f"{cam_id} ({count} photos):", combo)
+
+                    scroll.setWidget(scroll_widget)
+                    scroll.setMaximumHeight(300)
+                    map_layout.addWidget(scroll)
+
+                    # Buttons
+                    btn_layout = QHBoxLayout()
+                    ok_btn = QPushButton("Import")
+                    ok_btn.setDefault(True)
+                    cancel_btn = QPushButton("Cancel")
+                    ok_btn.clicked.connect(map_dialog.accept)
+                    cancel_btn.clicked.connect(map_dialog.reject)
+                    btn_layout.addWidget(ok_btn)
+                    btn_layout.addWidget(cancel_btn)
+                    map_layout.addLayout(btn_layout)
+
+                    if map_dialog.exec() != QDialog.DialogCode.Accepted:
+                        # Clean up temp files
+                        return
+
+                    # Collect mappings
+                    for cam_id, combo in site_edits.items():
+                        site_name = combo.currentText().strip()
+                        if site_name:
+                            site_mappings[cam_id] = site_name
+
+                    # Save mappings for future downloads (merge with existing)
+                    all_mappings = saved_mappings.copy()
+                    all_mappings.update(site_mappings)
+                    save_site_mappings(all_mappings)
+
+                imported = self._import_files(new_files, skip_hash=True, collection=selected_collection,
+                                             site_mappings=site_mappings)
+                msg = f"Imported {imported} new photo(s)."
+                if skipped > 0:
+                    msg += f"\nSkipped {skipped} duplicate(s)."
+                QMessageBox.information(self, "CuddeLink", msg)
+                if imported:
+                    # Save the end date as last download date for next time
+                    settings.setValue("cuddelink_last_download", end_date)
+                    self.photos = self._sorted_photos(self.db.get_all_photos())
+                    self._populate_collection_filter_options()  # Refresh collection dropdown
+                    self._populate_photo_list()
+                    if self.photos:
+                        # Find newest photo by date_taken
+                        newest_idx = 0
+                        newest_date = ""
+                        for i, p in enumerate(self.photos):
+                            dt = p.get("date_taken") or ""
+                            if dt > newest_date:
+                                newest_date = dt
+                                newest_idx = i
+                        self.index = newest_idx
+                        self.load_photo()
+            finally:
+                if temp_dir.exists():
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except Exception:
+                        pass
 
             # Check for missing verification photos
             self._check_missing_verifications(new_files, start_date, end_date, settings)
@@ -10128,7 +10239,8 @@ class TrainerWindow(QMainWindow):
         """Review and approve/reject pending label suggestions from club members."""
         from PyQt6.QtWidgets import QGraphicsView
 
-        pending = self.db.get_pending_suggestions()
+        username = self._get_current_username()
+        pending = self.db.get_pending_suggestions(owner_username=username)
         if not pending:
             QMessageBox.information(self, "Label Suggestions", "No pending label suggestions to review.")
             return
@@ -16039,6 +16151,103 @@ class TrainerWindow(QMainWindow):
         rename_btn.clicked.connect(rename_site)
         view_btn.clicked.connect(view_photos)
         delete_btn.clicked.connect(delete_site)
+
+        dlg.exec()
+
+    def manage_cameras(self):
+        """Open dialog to view/create/rename/delete cameras."""
+        username = self._get_current_username()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Manage Cameras")
+        dlg.setMinimumSize(700, 450)
+        layout = QVBoxLayout(dlg)
+
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Name", "Owner", "Verified", "Permissions"])
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        def refresh_table():
+            cameras = self.db.get_all_cameras()
+            table.setRowCount(len(cameras))
+            for row, cam in enumerate(cameras):
+                name_item = QTableWidgetItem(cam.get("name", ""))
+                owner_item = QTableWidgetItem(cam.get("owner", ""))
+                verified_item = QTableWidgetItem("Yes" if cam.get("verified") else "No")
+                perm_count = self.db.get_camera_permission_count(cam.get("id"))
+                perm_item = QTableWidgetItem(str(perm_count))
+                for col, item in enumerate([name_item, owner_item, verified_item, perm_item]):
+                    item.setData(Qt.ItemDataRole.UserRole, cam)
+                    table.setItem(row, col, item)
+            table.resizeColumnsToContents()
+
+        refresh_table()
+        layout.addWidget(table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add Camera")
+        edit_btn = QPushButton("Edit")
+        delete_btn = QPushButton("Delete")
+        close_btn = QPushButton("Close")
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(delete_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        def _get_selected_camera():
+            row = table.currentRow()
+            if row < 0:
+                return None
+            item = table.item(row, 0)
+            if not item:
+                return None
+            return item.data(Qt.ItemDataRole.UserRole)
+
+        def _add_camera():
+            name, ok = QInputDialog.getText(dlg, "Add Camera", "Camera name:")
+            if ok and name.strip():
+                self.db.create_camera(name.strip(), username)
+                refresh_table()
+
+        def _edit_camera():
+            cam = _get_selected_camera()
+            if not cam:
+                return
+            if cam.get("owner") != username:
+                QMessageBox.information(dlg, "Not Allowed", "Only the camera owner can edit.")
+                return
+            new_name, ok = QInputDialog.getText(
+                dlg, "Rename Camera", "New name:", text=cam.get("name", "")
+            )
+            if ok and new_name.strip():
+                self.db.rename_camera(cam["id"], new_name.strip())
+                refresh_table()
+
+        def _delete_camera():
+            cam = _get_selected_camera()
+            if not cam:
+                return
+            if cam.get("owner") != username:
+                QMessageBox.information(dlg, "Not Allowed", "Only the camera owner can delete.")
+                return
+            confirm = QMessageBox.question(
+                dlg, "Delete Camera",
+                f"Delete '{cam.get('name', '')}'?\n\nThis will remove permissions and pending suggestions for this camera.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                self.db.delete_camera(cam["id"])
+                refresh_table()
+
+        add_btn.clicked.connect(_add_camera)
+        edit_btn.clicked.connect(_edit_camera)
+        delete_btn.clicked.connect(_delete_camera)
+        close_btn.clicked.connect(dlg.accept)
 
         dlg.exec()
 

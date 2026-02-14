@@ -3177,6 +3177,10 @@ class TrailCamDatabase:
             cols = [d[0] for d in cursor.description]
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
+    def get_all_cameras(self) -> List[Dict]:
+        """Return all cameras."""
+        return self.get_cameras()
+
     def get_camera(self, camera_id: str) -> Optional[Dict]:
         """Get a single camera by id."""
         with self._lock:
@@ -3187,6 +3191,34 @@ class TrailCamDatabase:
                 cols = [d[0] for d in cursor.description]
                 return dict(zip(cols, row))
         return None
+
+    def get_camera_for_photo(self, photo_id: int) -> Optional[Dict]:
+        """Return camera dict for a photo, if assigned."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT camera_id FROM photos WHERE id = ?", (photo_id,))
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return None
+            return self.get_camera(row[0])
+
+    def get_camera_permission(self, camera_id: str, username: str) -> Optional[str]:
+        """Return role ('owner', 'editor', 'member') or None for a user on a camera."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT role FROM camera_permissions WHERE camera_id = ? AND username = ?",
+                (camera_id, username))
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    def get_camera_permission_count(self, camera_id: str) -> int:
+        """Return number of permissions assigned to a camera."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM camera_permissions WHERE camera_id = ?", (camera_id,))
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
 
     def rename_camera(self, camera_id: str, new_name: str):
         """Rename a camera and mark as verified."""
@@ -3208,6 +3240,18 @@ class TrailCamDatabase:
             cursor.execute("DELETE FROM cameras WHERE id = ?", (merge_id,))
             self.conn.commit()
         logger.info(f"Merged camera {merge_id} into {keep_id}")
+
+    def delete_camera(self, camera_id: str):
+        """Delete a camera and related permissions/shares; tombstone suggestions."""
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM camera_permissions WHERE camera_id = ?", (camera_id,))
+            cursor.execute("DELETE FROM camera_club_shares WHERE camera_id = ?", (camera_id,))
+            cursor.execute("UPDATE label_suggestions SET deleted_at = ?, updated_at = ? WHERE camera_id = ? AND deleted_at IS NULL",
+                           (now, now, camera_id))
+            cursor.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
+            self.conn.commit()
 
     def get_user_role_for_photo(self, photo_id: int, username: str) -> str:
         """Check user's role for a photo. Returns 'owner', 'member', or 'none'.
@@ -3431,6 +3475,11 @@ class TrailCamDatabase:
             self.conn.commit()
         logger.info(f"Approved suggestion {suggestion_id} by {reviewed_by}")
 
+    def accept_suggestion(self, suggestion_id: str, reviewed_by: str) -> bool:
+        """Apply suggestion to tags table, mark as 'accepted'."""
+        self.approve_suggestion(suggestion_id, reviewed_by)
+        return True
+
     def reject_suggestion(self, suggestion_id: str, reviewed_by: str):
         """Reject a label suggestion."""
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -3442,11 +3491,22 @@ class TrailCamDatabase:
             self.conn.commit()
         logger.info(f"Rejected suggestion {suggestion_id} by {reviewed_by}")
 
-    def get_pending_suggestions(self, camera_id: str = None, limit: int = 100) -> List[Dict]:
-        """Get pending label suggestions, optionally filtered by camera."""
+    def get_pending_suggestions(self, camera_id: str = None, limit: int = 100, owner_username: str = None) -> List[Dict]:
+        """Get pending label suggestions, optionally filtered by camera or owner."""
         with self._lock:
             cursor = self.conn.cursor()
-            if camera_id:
+            if owner_username:
+                cursor.execute("""
+                    SELECT ls.*, p.file_path, p.thumbnail_path
+                    FROM label_suggestions ls
+                    JOIN photos p ON ls.photo_id = p.id
+                    JOIN camera_permissions cp ON ls.camera_id = cp.camera_id
+                    WHERE ls.status = 'pending' AND ls.deleted_at IS NULL
+                      AND cp.username = ? AND cp.role = 'owner'
+                    ORDER BY ls.created_at DESC
+                    LIMIT ?
+                """, (owner_username, limit))
+            elif camera_id:
                 cursor.execute("""
                     SELECT ls.*, p.file_path, p.thumbnail_path
                     FROM label_suggestions ls

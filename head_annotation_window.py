@@ -89,7 +89,7 @@ class HeadAnnotationView(QGraphicsView):
 
     def _set_fit_as_min_scale(self):
         """Calculate and set min_scale to the fit-to-view level."""
-        if self.original_pixmap is None:
+        if self.original_pixmap is None or self.original_pixmap.isNull():
             return
         # Temporarily fit to view to get the scale
         self.resetTransform()
@@ -102,7 +102,7 @@ class HeadAnnotationView(QGraphicsView):
         """Rebuild the scene with image and current box overlay."""
         self.scene_obj.clear()
 
-        if self.original_pixmap is None:
+        if self.original_pixmap is None or self.original_pixmap.isNull():
             return
 
         self.pixmap_item = self.scene_obj.addPixmap(self.original_pixmap)
@@ -155,7 +155,7 @@ class HeadAnnotationView(QGraphicsView):
 
     def _zoom_to_box(self):
         """Zoom and center on the current box with padding."""
-        if self.current_box is None or self.original_pixmap is None:
+        if self.current_box is None or self.original_pixmap is None or self.original_pixmap.isNull():
             return
 
         box = self.current_box
@@ -590,10 +590,18 @@ class HeadAnnotationWindow(QDialog):
         notes = self.notes_edit.toPlainText().strip() or None
 
         if box.get("head_x1") is not None:
+            x1 = max(0.0, min(1.0, float(box["head_x1"])))
+            y1 = max(0.0, min(1.0, float(box["head_y1"])))
+            x2 = max(0.0, min(1.0, float(box["head_x2"])))
+            y2 = max(0.0, min(1.0, float(box["head_y2"])))
+            box["head_x1"] = x1
+            box["head_y1"] = y1
+            box["head_x2"] = x2
+            box["head_y2"] = y2
             self.db.set_box_head_line(
                 box["id"],
-                box["head_x1"], box["head_y1"],
-                box["head_x2"], box["head_y2"],
+                x1, y1,
+                x2, y2,
                 notes
             )
         elif notes:

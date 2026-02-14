@@ -467,7 +467,7 @@ class PreviewWindow(QDialog):
         self.zoom_label = QLabel("100%")
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setMinimum(10)   # 10%
-        self.zoom_slider.setMaximum(500)  # 500%
+        self.zoom_slider.setMaximum(1000)  # 1000%
         self.zoom_slider.setValue(100)
         self.zoom_slider.setTickInterval(10)
         self.zoom_slider.valueChanged.connect(self.on_zoom_slider_changed)
@@ -498,8 +498,11 @@ class PreviewWindow(QDialog):
         path = self.db.get_photo_path(self.photo_id)
         if path and os.path.exists(path):
             pixmap = self._load_pixmap_with_enhance(path)
-            self.pixmap_item.setPixmap(pixmap)
-            self.view.zoom_fit()
+            if not pixmap.isNull():
+                self.pixmap_item.setPixmap(pixmap)
+                self.view.zoom_fit()
+            else:
+                self.pixmap_item.setPixmap(QPixmap())
         self.refresh_tag_state()
         self.refresh_notes_and_favorite()
         self.refresh_deer_metadata()

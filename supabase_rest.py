@@ -390,6 +390,18 @@ class SupabaseRestClient:
             self._clear_session()
             return False
 
+    def recover_password(self, email: str) -> Dict[str, Any]:
+        """Send a password reset email."""
+        url = f"{self.url}/auth/v1/recover"
+        payload = {"email": email}
+        try:
+            resp = requests.post(url, headers=self._get_auth_headers(), json=payload, timeout=30)
+            if resp.status_code < 300:
+                return {"ok": True}
+            return {"ok": False, "error": resp.text}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def sign_out(self) -> bool:
         """Sign out and clear session."""
         token = self._session.get("access_token")

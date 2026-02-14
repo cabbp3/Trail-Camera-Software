@@ -90,7 +90,7 @@ def run_cuddelink_download(email, password, date_from, date_to):
         update_download_state(status="extracting", message="Extracting photos...", progress=70)
 
         # Extract to temp folder first
-        temp_dir = Path.home() / "TrailCamLibrary" / ".cuddelink_temp"
+        temp_dir = get_library_path() / ".cuddelink_temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
         extracted = _extract_images(zip_path, temp_dir)
 
