@@ -46,7 +46,7 @@ def get_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+    return value.strip()
 
 
 def safe_url(url: str) -> str:
@@ -103,6 +103,8 @@ def check_photo_exists(supabase_url: str, supabase_key: str, file_hash: str) -> 
         if resp.status_code == 200:
             data = resp.json()
             return len(data) > 0
+        else:
+            print(f"[Supabase] Duplicate check failed: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"[Supabase] Warning: Could not check for duplicate: {e}")
 
@@ -250,7 +252,7 @@ def save_to_supabase(supabase_url: str, supabase_key: str, file_hash: str, datet
         if resp.status_code == 409:
             return True
         if resp.status_code >= 400:
-            print(f"    [Supabase] Save failed: {resp.status_code} {resp.text[:100]}")
+            print(f"    [Supabase] Save failed: {resp.status_code} {resp.text[:400]}")
             return False
         return True
     except Exception as e:
