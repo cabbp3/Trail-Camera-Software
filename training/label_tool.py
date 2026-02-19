@@ -889,7 +889,7 @@ class AIWorker(QThread):
 
                 if not has_existing_boxes:
                     if use_md:
-                        # Standalone MegaDetector v5
+                        # Standalone MegaDetector v6
                         detections = self.detector.detect(file_path)
                         cat_map = {"animal": "ai_animal", "person": "ai_person", "vehicle": "ai_vehicle"}
                         for det in detections:
@@ -3781,7 +3781,7 @@ class TrainerWindow(QMainWindow):
         det_layout.addWidget(det_desc)
 
         current_det = user_config.get_detector_choice()
-        det_md = QRadioButton("Original MegaDetector v5 (standalone)")
+        det_md = QRadioButton("MegaDetector v6 (standalone, faster)")
         det_sn = QRadioButton("SpeciesNet MegaDetector (built-in)")
         if current_det == "megadetector":
             det_md.setChecked(True)
@@ -4175,16 +4175,21 @@ class TrainerWindow(QMainWindow):
         self._set_int_field(self.ab_min, deer.get("abnormal_points_min"))
         self._set_int_field(self.ab_max, deer.get("abnormal_points_max"))
 
-        # species: use stored tags only (suggestions require user approval)
+        # species: use box species when boxes exist, else use stored tags (suggestions require user approval)
         species_options = set(SPECIES_OPTIONS)
         try:
             species_options.update(self.db.list_custom_species())
         except Exception as e:
             logger.debug(f"Failed to list custom species: {e}")
-        # Collect ALL species tags for this photo
+        has_subject_boxes = any(not self._is_head_box(b) for b in self.current_boxes) if self.current_boxes else False
         current_species = [t for t in tags if t in species_options]
-        # Show first species in combo, all in label
-        species = current_species[0] if current_species else ""
+        if has_subject_boxes:
+            species = ""
+            if 0 <= self.current_box_index < len(self.current_boxes):
+                species = self.current_boxes[self.current_box_index].get("species") or ""
+        else:
+            # Show first species in combo, all in label
+            species = current_species[0] if current_species else ""
         self.species_combo.blockSignals(True)
         self.species_combo.setCurrentText(species)
         self.species_combo.blockSignals(False)
@@ -4356,7 +4361,7 @@ class TrainerWindow(QMainWindow):
             pass
 
         # For photos WITHOUT boxes, species selection replaces the current species tag
-        # For photos WITH boxes, _persist_boxes handles tag sync
+        # For photos WITH boxes, tags are derived from box species (soft rollup)
         has_subject_boxes = any(not self._is_head_box(b) for b in self.current_boxes) if self.current_boxes else False
 
         if not has_subject_boxes:
@@ -4371,12 +4376,24 @@ class TrainerWindow(QMainWindow):
                 # Preserve Verification if no new species selected
                 tags.append("Verification")
         else:
-            # Has boxes - add species if not present (boxes handle the real sync)
-            if species and species not in tags:
-                user_removed_species = tags_text and species not in tags_text
-                if not user_removed_species:
-                    if species in species_set or len(species) >= 3:
-                        tags.append(species)
+            # Has boxes - box species is the source of truth
+            subject_boxes = [b for b in (self.current_boxes or []) if not self._is_head_box(b)]
+            if species:
+                if len(subject_boxes) == 1:
+                    subject_boxes[0]["species"] = species
+                elif self.queue_mode:
+                    for b in subject_boxes:
+                        if not b.get("species"):
+                            b["species"] = species
+            # Persist box changes before deriving tags
+            try:
+                self.db.set_boxes(pid, self.current_boxes)
+            except Exception as exc:
+                logger.error(f"Box save failed: {exc}")
+            # Derive tags from boxes (soft rollup) and remove photo-level species tags
+            non_species_tags = [t for t in tags if t not in species_set and t not in ("Empty", "Verification")]
+            box_species = [b.get("species") for b in subject_boxes if b.get("species") and b.get("species") != "Unknown"]
+            tags = non_species_tags + sorted(set(box_species))
 
         # Add sex tag if applicable
         if sex.lower() in ("buck", "doe") and sex not in tags:
@@ -4386,9 +4403,14 @@ class TrainerWindow(QMainWindow):
         if real_species:
             tags = [t for t in tags if t not in ("Empty", "Unknown")]
         # If Empty is in tags, it should be the ONLY tag (clear everything else)
-        # Verification is treated like other suggestions - not exclusive
         if "Empty" in tags:
             tags = ["Empty"]
+            if self.current_boxes:
+                self.current_boxes = []
+                try:
+                    self.db.set_boxes(pid, [])
+                except Exception as exc:
+                    logger.error(f"Box clear failed: {exc}")
         self._save_tags_role_aware(pid, tags)
         # Update UI to reflect tag changes (block signals to prevent re-triggering save)
         self.tags_edit.blockSignals(True)
@@ -4841,75 +4863,46 @@ class TrainerWindow(QMainWindow):
 
     # --- Detection helpers ---
     def _get_megadetector(self):
-        """Load and cache MegaDetector model from persistent storage."""
+        """Load and cache MegaDetector v6 model."""
         if hasattr(self, "_megadetector") and self._megadetector is not None:
             return self._megadetector
 
-        # Use persistent model path instead of temp directory
-        from pathlib import Path
-        model_path = Path.home() / '.trailcam' / 'md_v5a.0.1.pt'
-
-        # Fall back to older version if newer not available
-        if not model_path.exists():
-            model_path = Path.home() / '.trailcam' / 'md_v5a.0.0.pt'
-
         try:
-            from megadetector.detection import run_detector
-
-            if model_path.exists():
-                # Use direct path to avoid temp directory downloads
-                logger.info(f"Loading MegaDetector from: {model_path}")
-                self._megadetector = run_detector.load_detector(str(model_path))
-            else:
-                # Fall back to auto-download (will use temp, but at least works)
-                logger.warning(f"MegaDetector model not found at {model_path}, using auto-download")
-                self._megadetector = run_detector.load_detector('MDV5A')
-
-            self._megadetector_available = True
+            from ai_detection import MegaDetectorV6
+            self._megadetector = MegaDetectorV6()
+            self._megadetector_available = self._megadetector.is_available
+            if not self._megadetector_available:
+                self._megadetector_error = self._megadetector.error_message
+                self._megadetector = None
+                return None
             return self._megadetector
-        except ImportError as e:
-            logger.error(f"MegaDetector package not installed: {e}")
-            self._megadetector_available = False
-            self._megadetector_error = "MegaDetector package not installed. Install with: pip install megadetector"
-            return None
         except Exception as e:
-            logger.error(f"Failed to load MegaDetector: {e}")
+            logger.error(f"Failed to load MegaDetector v6: {e}")
             self._megadetector_available = False
             self._megadetector_error = str(e)
+            self._megadetector = None
             return None
 
     def _detect_boxes_megadetector(self, path: str, conf_thresh: float = 0.2):
-        """Detect animals/people/vehicles using MegaDetector."""
-        print(f"[MD DEBUG] _detect_boxes_megadetector called for: {path}")
+        """Detect animals/people/vehicles using MegaDetector v6."""
         model = self._get_megadetector()
         if model is None:
-            print("[MD DEBUG] Model is None!")
             return []
-        print("[MD DEBUG] Model loaded, running detection...")
         try:
-            from megadetector.visualization import visualization_utils as vis_utils
-            image = vis_utils.load_image(path)
-            result = model.generate_detections_one_image(image)
-            all_detections = result.get('detections', [])
-            print(f"[MD DEBUG] Raw detections: {len(all_detections)}")
-            detections = [d for d in all_detections if d['conf'] >= conf_thresh]
-            print(f"[MD DEBUG] After filtering (conf >= {conf_thresh}): {len(detections)}")
+            detections = model.detect(path)
+            cat_map = {"animal": "ai_animal", "person": "ai_person", "vehicle": "ai_vehicle"}
             boxes = []
             for det in detections:
-                # MegaDetector format: [x, y, width, height] normalized 0-1
-                # category: 1=animal, 2=person, 3=vehicle
-                x, y, w, h = det['bbox']
-                category = det['category']
-                conf = det['conf']
-                label_map = {1: 'ai_animal', 2: 'ai_person', 3: 'ai_vehicle'}
-                label = label_map.get(int(category), 'ai_subject')
+                if det.confidence < conf_thresh:
+                    continue
+                x, y, w, h = det.bbox
                 boxes.append({
-                    'label': label,
+                    'label': cat_map.get(det.category, 'ai_subject'),
                     'x1': x,
                     'y1': y,
                     'x2': x + w,
                     'y2': y + h,
-                    'confidence': conf
+                    'confidence': det.confidence
                 })
             return boxes
         except Exception as e:
@@ -10695,8 +10688,8 @@ class TrainerWindow(QMainWindow):
         detector_obj = None
         if det_choice == "megadetector":
             try:
-                from ai_detection import MegaDetectorV5
-                detector_obj = MegaDetectorV5()
+                from ai_detection import MegaDetectorV6
+                detector_obj = MegaDetectorV6()
                 if not detector_obj.is_available:
                     detector_obj = None
             except Exception:

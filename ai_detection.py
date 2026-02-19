@@ -319,10 +319,150 @@ class MegaDetectorV6:
                         bbox=bbox
                     ))
 
-            return detections
+            return self._filter_overlapping(detections)
         except Exception as e:
             print(f"Error detecting in {image_path}: {e}")
             return []
+
+    @staticmethod
+    def _filter_overlapping(detections: List[Detection],
+                            iou_threshold: float = 0.15,
+                            abs_conf_floor: float = 0.10) -> List[Detection]:
+        """Post-process: remove junk detections and deduplicate overlapping boxes.
+
+        Pipeline:
+          0. Absolute floor: remove detections with 0 < confidence < abs_conf_floor
+             (confidence == 0, None, or missing treated as "unknown", kept)
+          1. Group remaining detections by IoU > iou_threshold (union-find)
+          2. Pairwise prune: within each group, if two boxes overlap by IoU > 0.75,
+             keep the higher-confidence one
+          3. Frankenstein filter: in groups of 3+, remove composite boxes whose
+             4 edges are borrowed from 2+ other boxes
+        """
+        if len(detections) < 2:
+            return detections
+
+        # Step 0: Absolute confidence floor (junk removal)
+        detections = [
+            d for d in detections
+            if not (d.confidence is not None and d.confidence > 0 and d.confidence < abs_conf_floor)
+        ]
+        if len(detections) < 2:
+            return detections
+
+        # Build overlap groups using union-find
+        n = len(detections)
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if _compute_iou(detections[i], detections[j]) > iou_threshold:
+                    union(i, j)
+
+        # Group by root
+        groups = {}
+        for i in range(n):
+            root = find(i)
+            groups.setdefault(root, []).append(i)
+
+        kept = []
+        for indices in groups.values():
+            if len(indices) == 1:
+                # No overlap — keep as-is
+                kept.append(detections[indices[0]])
+            else:
+                # Pairwise prune: drop lower-confidence boxes with high IoU
+                pruned = []
+                for idx in sorted(indices, key=lambda i: detections[i].confidence or 0, reverse=True):
+                    if any(_compute_iou(detections[idx], detections[j]) > 0.75 for j in pruned):
+                        continue
+                    pruned.append(idx)
+
+                # Composite edge-match filter (groups of 3+ only)
+                if len(pruned) >= 3:
+                    survivors = []
+                    for idx in pruned:
+                        others = [detections[j] for j in pruned if j != idx]
+                        if not _is_composite_box(detections[idx], others):
+                            survivors.append(idx)
+                    if not survivors:
+                        survivors = [max(pruned, key=lambda i: detections[i].confidence or 0)]
+                    pruned = survivors
+
+                for i in pruned:
+                    kept.append(detections[i])
+
+        return kept
+
+
+def _is_composite_box(candidate: Detection, others: List[Detection]) -> bool:
+    """Detect Frankenstein composites by matching edges from multiple other boxes."""
+    if len(others) < 2:
+        return False
+
+    x1, y1 = candidate.bbox[0], candidate.bbox[1]
+    x2, y2 = x1 + candidate.bbox[2], y1 + candidate.bbox[3]
+    w = max(1e-6, x2 - x1)
+    h = max(1e-6, y2 - y1)
+    tol_x = max(0.02, 0.05 * w)
+    tol_y = max(0.02, 0.05 * h)
+
+    edges = [
+        ("x1", x1, tol_x),
+        ("y1", y1, tol_y),
+        ("x2", x2, tol_x),
+        ("y2", y2, tol_y),
+    ]
+
+    donors = []
+    matches = 0
+    for edge_name, edge_val, tol in edges:
+        matched = False
+        for idx, other in enumerate(others):
+            ox1, oy1 = other.bbox[0], other.bbox[1]
+            ox2, oy2 = ox1 + other.bbox[2], oy1 + other.bbox[3]
+            other_val = {"x1": ox1, "y1": oy1, "x2": ox2, "y2": oy2}[edge_name]
+            if abs(edge_val - other_val) <= tol:
+                donors.append(idx)
+                matches += 1
+                matched = True
+                break
+        if not matched:
+            continue
+
+    if matches < 4:
+        return False
+    if len(set(donors)) < 2:
+        return False
+    return True
+
+
+def _compute_iou(a: Detection, b: Detection) -> float:
+    """Compute IoU between two Detections."""
+    ax1, ay1 = a.bbox[0], a.bbox[1]
+    ax2, ay2 = ax1 + a.bbox[2], ay1 + a.bbox[3]
+    bx1, by1 = b.bbox[0], b.bbox[1]
+    bx2, by2 = bx1 + b.bbox[2], by1 + b.bbox[3]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
 
 
 class MegaDetectorV6ONNX:
@@ -559,7 +699,7 @@ class AIDetectionManager:
     """Manages AI detection pipeline"""
 
     def __init__(self, confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD):
-        self.detector = MegaDetectorV5(confidence_threshold=confidence_threshold)
+        self.detector = MegaDetectorV6(confidence_threshold=confidence_threshold)
         self.wildlife_client = WildlifeAIClient()
         self.confidence_threshold = confidence_threshold
     
