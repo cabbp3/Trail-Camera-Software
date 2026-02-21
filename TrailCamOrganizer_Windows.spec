@@ -4,10 +4,26 @@ PyInstaller spec file for Trail Camera Organizer - Windows build
 """
 
 import sys
+import glob
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
+
+# Bundle Visual C++ runtime DLLs so the app works on machines without VC++ installed
+vcruntime_dlls = []
+if sys.platform == 'win32':
+    # Find vcruntime and msvcp DLLs from Python's install directory
+    python_dir = Path(sys.executable).parent
+    for pattern in ['vcruntime*.dll', 'msvcp*.dll', 'concrt*.dll', 'vcomp*.dll']:
+        for dll in python_dir.glob(pattern):
+            vcruntime_dlls.append((str(dll), '.'))
+    # Also check Windows system directory
+    system32 = Path(r'C:\Windows\System32')
+    for pattern in ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll']:
+        dll = system32 / pattern
+        if dll.exists() and not any(pattern in str(d) for d in vcruntime_dlls):
+            vcruntime_dlls.append((str(dll), '.'))
 
 # Collect PyQt6 completely
 pyqt6_datas, pyqt6_binaries, pyqt6_hiddenimports = collect_all('PyQt6')
@@ -38,8 +54,9 @@ datas = [
 ]
 datas += pyqt6_datas
 
-# Collect binaries
+# Collect binaries (including VC++ runtime for machines without it installed)
 binaries = []
+binaries += vcruntime_dlls
 binaries += pyqt6_binaries
 
 # Hidden imports
