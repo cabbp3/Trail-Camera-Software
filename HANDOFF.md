@@ -1,5 +1,33 @@
 # HANDOFF - Session Notes for Next Claude
 
+**Latest Update:** Feb 21, 2026
+
+## Latest Session Summary (Feb 21, 2026)
+
+### Code Changes Committed
+Commit: `c6b2daa` — "Fix box/sex review behavior and AI deer sex eligibility"
+
+Files changed:
+- `training/label_tool.py`
+- `database.py`
+
+Key fixes:
+- **Box-first labeling:** When boxes exist, tags are derived from box species (soft rollup). Photo-level species tags are removed in that case; tags come from boxes.
+- **Queue mode labeling:** In species review queue, selecting a species now fills **all unlabeled subject boxes** when there are multiple boxes.
+- **Load precedence:** When boxes exist, species combo loads from the current box (not photo tags), preventing empty tags from wiping box species.
+- **Empty tag behavior:** If “Empty” is set, boxes are cleared **and** the DB boxes are cleared immediately.
+- **Buck/Doe review queue overwrite fix:** `_accept_as`, `_reject`, `_unknown` now update a single box via `Database.update_box_fields()` instead of full `set_boxes()` (prevents other boxes losing labels).
+- **Suggestion clear guard:** Only clears photo-level suggestion when **all deer boxes** on that photo have been reviewed.
+- **AI deer eligibility for buck/doe suggestions:** Buck/doe prediction now includes boxes where `ai_suggested_species == "Deer"`.
+- **AI duplicate box dedup:** `Database.set_boxes()` skips inserting AI boxes that match existing AI boxes (IoU > 0.8, same label).
+
+### Known Behavior / Debug Notes
+- Buck/Doe review queue only shows boxes with `sex_conf > 0`. Current DB shows **0** boxes with `sex_conf > 0` and **~1,300** boxes with `ai_suggested_species='Deer'` and no sex. This means the **sex prediction step isn’t writing** yet for those boxes. Run **Tools → “Suggest Buck/Doe on Deer Photos”** to generate sex_conf and populate the queue.
+
+### Local Untracked (not committed)
+- `models/*.onnx.backup_*` (model backups)
+- `tools/cleanup_box_species_tags.py` (one-off cleanup script)
+
 **Last Updated:** Feb 2, 2026
 **Last Deep Dive:** Feb 2, 2026
 
