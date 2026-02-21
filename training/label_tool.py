@@ -5488,9 +5488,10 @@ class TrainerWindow(QMainWindow):
             # Build new tags list:
             # - Keep non-species tags (any custom tags not in SPECIES_OPTIONS)
             # - Replace species tags with current box species
-            # - BUT preserve Verification tag (special case - it's a species but shouldn't be auto-removed)
+            # - BUT preserve Empty/Verification tags (photo-level labels that shouldn't be auto-removed)
             species_set = set(SPECIES_OPTIONS)
             had_verification = "Verification" in current_tags
+            had_empty = "Empty" in current_tags
             new_tags = [t for t in current_tags if t not in species_set]  # Keep non-species tags
 
             if box_species:
@@ -5501,6 +5502,10 @@ class TrainerWindow(QMainWindow):
             # that should never be removed by box species sync
             if had_verification and "Verification" not in new_tags:
                 new_tags.append("Verification")
+
+            # Preserve Empty tag when no boxes exist (Empty photos have boxes cleared)
+            if had_empty and not box_species and "Empty" not in new_tags:
+                new_tags.append("Empty")
 
             if set(new_tags) != set(current_tags):
                 self.db.update_photo_tags(pid, new_tags)
@@ -11244,9 +11249,9 @@ class TrainerWindow(QMainWindow):
             added_tags[pid].append(species_tag)
 
             # Handle boxes based on species
-            if species_tag == "Verification":
-                # Verification photos should have no detection boxes - delete them
-                self.db.set_boxes(pid, [])  # Empty list deletes all boxes
+            if species_tag in ("Verification", "Empty"):
+                # Verification/Empty photos should have no detection boxes - delete them
+                self.db.set_boxes(pid, [])
             else:
                 # For other species, update all boxes to have this species
                 # This prevents _persist_boxes from overwriting the tag with box species
