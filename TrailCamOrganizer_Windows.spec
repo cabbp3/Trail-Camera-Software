@@ -18,12 +18,20 @@ if sys.platform == 'win32':
     for pattern in ['vcruntime*.dll', 'msvcp*.dll', 'concrt*.dll', 'vcomp*.dll']:
         for dll in python_dir.glob(pattern):
             vcruntime_dlls.append((str(dll), '.'))
-    # Also check Windows system directory
+    # Also check Windows system directory for VC++ and OpenSSL DLLs
     system32 = Path(r'C:\Windows\System32')
-    for pattern in ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll']:
+    for pattern in ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll',
+                     'libcrypto-3-x64.dll', 'libcrypto-3.dll',
+                     'libssl-3-x64.dll', 'libssl-3.dll']:
         dll = system32 / pattern
         if dll.exists() and not any(pattern in str(d) for d in vcruntime_dlls):
             vcruntime_dlls.append((str(dll), '.'))
+    # Also look for OpenSSL DLLs in Python's DLLs directory
+    python_dlls_dir = python_dir / 'DLLs'
+    if python_dlls_dir.exists():
+        for pattern in ['libcrypto*.dll', 'libssl*.dll']:
+            for dll in python_dlls_dir.glob(pattern):
+                vcruntime_dlls.append((str(dll), '.'))
 
 # Collect PyQt6 completely
 pyqt6_datas, pyqt6_binaries, pyqt6_hiddenimports = collect_all('PyQt6')
