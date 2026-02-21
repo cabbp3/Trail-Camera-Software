@@ -2224,9 +2224,25 @@ class TrailCamDatabase:
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
             # Get existing active (non-tombstoned) boxes
-            cursor.execute("SELECT id, sync_id FROM annotation_boxes WHERE photo_id = ? AND deleted_at IS NULL",
-                          (photo_id,))
-            existing = {row[0]: row[1] for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT id, sync_id, label, x1, y1, x2, y2 FROM annotation_boxes "
+                "WHERE photo_id = ? AND deleted_at IS NULL",
+                (photo_id,),
+            )
+            existing_rows = cursor.fetchall()
+            existing = {row[0]: row[1] for row in existing_rows}
+            existing_ai = []
+            for row in existing_rows:
+                label = row[2] or ""
+                if label.startswith("ai_"):
+                    existing_ai.append({
+                        "id": row[0],
+                        "label": label,
+                        "x1": row[3],
+                        "y1": row[4],
+                        "x2": row[5],
+                        "y2": row[6],
+                    })
 
             # Deduplicate incoming boxes by (label, rounded coordinates)
             seen = set()
@@ -2239,6 +2255,21 @@ class TrailCamDatabase:
                     seen.add(key)
                     unique_boxes.append(b)
 
+            def _iou(box_a, box_b):
+                ax1, ay1, ax2, ay2 = box_a["x1"], box_a["y1"], box_a["x2"], box_a["y2"]
+                bx1, by1, bx2, by2 = box_b["x1"], box_b["y1"], box_b["x2"], box_b["y2"]
+                inter_x1 = max(ax1, bx1)
+                inter_y1 = max(ay1, by1)
+                inter_x2 = min(ax2, bx2)
+                inter_y2 = min(ay2, by2)
+                if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+                    return 0.0
+                inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                a_area = max(0.0, (ax2 - ax1) * (ay2 - ay1))
+                b_area = max(0.0, (bx2 - bx1) * (by2 - by1))
+                union_area = a_area + b_area - inter_area
+                return inter_area / union_area if union_area > 0 else 0.0
+
             incoming_ids = set()
             for b in unique_boxes:
                 box_id = b.get("id")
@@ -2248,6 +2279,7 @@ class TrailCamDatabase:
                 sex = b.get("sex", "")
                 sex_conf = b.get("sex_conf")
                 ai_suggested = b.get("ai_suggested_species", "")
+                label = b.get("label", "")
 
                 if box_id and box_id in existing:
                     # UPDATE existing box (preserves sync_id)
@@ -2258,7 +2290,7 @@ class TrailCamDatabase:
                         head_x1=?, head_y1=?, head_x2=?, head_y2=?, head_notes=?,
                         ai_suggested_species=?
                         WHERE id = ?""",
-                        (b.get("label", ""), float(b["x1"]), float(b["y1"]),
+                        (label, float(b["x1"]), float(b["y1"]),
                          float(b["x2"]), float(b["y2"]),
                          float(conf) if conf is not None else None,
                          species if species else None,
@@ -2271,6 +2303,24 @@ class TrailCamDatabase:
                          ai_suggested if ai_suggested else None,
                          box_id))
                 else:
+                    # Deduplicate AI boxes against existing AI boxes with high IoU (preserve labeled boxes)
+                    if label.startswith("ai_"):
+                        new_box = {
+                            "x1": float(b["x1"]),
+                            "y1": float(b["y1"]),
+                            "x2": float(b["x2"]),
+                            "y2": float(b["y2"]),
+                        }
+                        matched_id = None
+                        for e in existing_ai:
+                            if e["label"] != label:
+                                continue
+                            if _iou(new_box, e) > 0.8:
+                                matched_id = e["id"]
+                                break
+                        if matched_id:
+                            incoming_ids.add(matched_id)
+                            continue
                     # INSERT new box with sync_id
                     sync_id = b.get("sync_id") or str(_uuid.uuid4())
                     cursor.execute("""INSERT INTO annotation_boxes
@@ -2278,7 +2328,7 @@ class TrailCamDatabase:
                          sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes,
                          ai_suggested_species, sync_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (photo_id, b.get("label", ""), float(b["x1"]), float(b["y1"]),
+                        (photo_id, label, float(b["x1"]), float(b["y1"]),
                          float(b["x2"]), float(b["y2"]),
                          float(conf) if conf is not None else None,
                          species if species else None,
@@ -2336,6 +2386,27 @@ class TrailCamDatabase:
                     box["sync_id"] = row[17]
                 out.append(box)
             return out
+
+    def update_box_fields(self, box_id: int, **fields) -> None:
+        """Update specific fields on a single annotation box by id."""
+        if not box_id:
+            return
+        allowed = {
+            "label", "x1", "y1", "x2", "y2", "confidence",
+            "species", "species_conf", "sex", "sex_conf",
+            "head_x1", "head_y1", "head_x2", "head_y2", "head_notes",
+            "ai_suggested_species",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys()) + ", updated_at = ?"
+        values = list(updates.values()) + [now, box_id]
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(f"UPDATE annotation_boxes SET {set_clause} WHERE id = ?", values)
+            self.conn.commit()
 
     def set_box_species(self, box_id: int, species: str, confidence: float = None):
         """Set species classification for a specific box."""

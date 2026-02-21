@@ -85,6 +85,7 @@ from PyQt6.QtWidgets import (
     QDateEdit,
     QTabWidget,
     QGridLayout,
+    QGroupBox,
     QRadioButton,
 )
 import PyQt6  # used for plugin path detection
@@ -8102,14 +8103,15 @@ class TrainerWindow(QMainWindow):
 
         for box in boxes:
             species = (box.get("species") or "").lower()
+            ai_species = (box.get("ai_suggested_species") or "").lower()
             label = (box.get("label") or "").lower()
 
             # Skip if already has sex prediction
             if box.get("sex"):
                 continue
 
-            # Identify deer boxes (by species)
-            if species == "deer":
+            # Identify deer boxes (by species or AI suggestion)
+            if species == "deer" or ai_species == "deer":
                 deer_boxes.append(box)
 
             # Track head boxes for potential association
@@ -9767,7 +9769,8 @@ class TrainerWindow(QMainWindow):
             has_deer_without_sex = False
             for box in boxes:
                 species = (box.get("species") or "").lower()
-                if species == "deer" and not box.get("sex"):
+                ai_species = (box.get("ai_suggested_species") or "").lower()
+                if (species == "deer" or ai_species == "deer") and not box.get("sex"):
                     has_deer_without_sex = True
                     break
             if has_deer_without_sex:
@@ -9782,12 +9785,28 @@ class TrainerWindow(QMainWindow):
         detector, names = self._get_detector_for_suggestions()
 
         total_boxes = 0
-        for p in photos_to_process:
+        progress = QProgressDialog(
+            f"Running buck/doe predictions on {len(photos_to_process)} photos...",
+            "Cancel", 0, len(photos_to_process), self
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        for i, p in enumerate(photos_to_process):
+            if progress.wasCanceled():
+                break
+            progress.setValue(i)
+            progress.setLabelText(
+                f"Processing photo {i + 1} of {len(photos_to_process)}..."
+            )
+            QApplication.processEvents()
             # Auto-detect boxes if none exist (enables head crops)
             self._ensure_detection_boxes(p, detector=detector, names=names)
             # Run per-box sex prediction
             box_count = self._predict_sex_for_deer_boxes(p)
             total_boxes += box_count
+
+        progress.setValue(len(photos_to_process))
 
         msg = f"Suggested buck/doe for {total_boxes} deer box(es) across {len(photos_to_process)} photo(s)."
         msg += "\nUse 'Review Buck/Doe Suggestions' to verify."
@@ -12524,24 +12543,22 @@ class TrainerWindow(QMainWindow):
             # Update the box's sex field and set species to Deer
             if box and pid:
                 box_id = box.get("id")
-                # Get all boxes for this photo and update the matching one
-                all_boxes = self.db.get_boxes(pid)
-                for b in all_boxes:
-                    # Match by ID first, fallback to coordinates (IDs change when boxes are updated)
-                    matched = False
-                    if box_id and b.get("id") == box_id:
-                        matched = True
-                    elif (abs(b.get("x1", 0) - box.get("x1", -1)) < 0.01 and
-                          abs(b.get("y1", 0) - box.get("y1", -1)) < 0.01 and
-                          abs(b.get("x2", 0) - box.get("x2", -1)) < 0.01 and
-                          abs(b.get("y2", 0) - box.get("y2", -1)) < 0.01):
-                        matched = True
-                    if matched:
-                        b["sex"] = sex_tag
-                        b["sex_conf"] = None  # Clear confidence = reviewed
-                        b["species"] = "Deer"  # Auto-set species to Deer
-                        break  # Only update the specific box
-                self.db.set_boxes(pid, all_boxes)
+                if not box_id:
+                    all_boxes = self.db.get_boxes(pid)
+                    for b in all_boxes:
+                        if (abs(b.get("x1", 0) - box.get("x1", -1)) < 0.01 and
+                            abs(b.get("y1", 0) - box.get("y1", -1)) < 0.01 and
+                            abs(b.get("x2", 0) - box.get("x2", -1)) < 0.01 and
+                            abs(b.get("y2", 0) - box.get("y2", -1)) < 0.01):
+                            box_id = b.get("id")
+                            break
+                if box_id:
+                    self.db.update_box_fields(
+                        box_id,
+                        sex=sex_tag,
+                        sex_conf=None,
+                        species="Deer",
+                    )
                 # Add Deer tag if not present
                 tags = set(self.db.get_tags(pid))
                 if "Deer" not in tags:
@@ -12549,8 +12566,18 @@ class TrainerWindow(QMainWindow):
                 # Also add Buck/Doe tag
                 if sex_tag in ("Buck", "Doe") and sex_tag not in tags:
                     self.db.add_tag(pid, sex_tag)
-                # Clear species suggestion (removes from species review queue)
-                self.db.set_suggested_tag(pid, None, None)
+                # Clear species suggestion only if all boxes have been reviewed
+                try:
+                    remaining = self.db.get_boxes(pid)
+                    all_reviewed = True
+                    for b in remaining:
+                        if b.get("species", "").lower() == "deer" and (b.get("sex_conf") is not None):
+                            all_reviewed = False
+                            break
+                    if all_reviewed:
+                        self.db.set_suggested_tag(pid, None, None)
+                except Exception:
+                    pass
             # Track for cleanup
             reviewed_data[pid] = sex_tag
             _mark_reviewed(item, sex_tag)
@@ -12576,22 +12603,21 @@ class TrainerWindow(QMainWindow):
             # Clear the box's sex suggestion (mark as reviewed/rejected)
             if box and pid:
                 box_id = box.get("id")
-                all_boxes = self.db.get_boxes(pid)
-                for b in all_boxes:
-                    # Match by ID first, fallback to coordinates (IDs change when boxes are updated)
-                    matched = False
-                    if box_id and b.get("id") == box_id:
-                        matched = True
-                    elif (abs(b.get("x1", 0) - box.get("x1", -1)) < 0.01 and
-                          abs(b.get("y1", 0) - box.get("y1", -1)) < 0.01 and
-                          abs(b.get("x2", 0) - box.get("x2", -1)) < 0.01 and
-                          abs(b.get("y2", 0) - box.get("y2", -1)) < 0.01):
-                        matched = True
-                    if matched:
-                        b["sex"] = None
-                        b["sex_conf"] = None
-                        break  # Only update the specific box
-                self.db.set_boxes(pid, all_boxes)
+                if not box_id:
+                    all_boxes = self.db.get_boxes(pid)
+                    for b in all_boxes:
+                        if (abs(b.get("x1", 0) - box.get("x1", -1)) < 0.01 and
+                            abs(b.get("y1", 0) - box.get("y1", -1)) < 0.01 and
+                            abs(b.get("x2", 0) - box.get("x2", -1)) < 0.01 and
+                            abs(b.get("y2", 0) - box.get("y2", -1)) < 0.01):
+                            box_id = b.get("id")
+                            break
+                if box_id:
+                    self.db.update_box_fields(
+                        box_id,
+                        sex=None,
+                        sex_conf=None,
+                    )
             reviewed_data[pid] = "REJECTED"
             _mark_reviewed(item, "REJECTED")
             _next_unreviewed()
@@ -12613,29 +12639,38 @@ class TrainerWindow(QMainWindow):
             # Set sex to Unknown and species to Deer
             if box and pid:
                 box_id = box.get("id")
-                all_boxes = self.db.get_boxes(pid)
-                for b in all_boxes:
-                    # Match by ID first, fallback to coordinates (IDs change when boxes are updated)
-                    matched = False
-                    if box_id and b.get("id") == box_id:
-                        matched = True
-                    elif (abs(b.get("x1", 0) - box.get("x1", -1)) < 0.01 and
-                          abs(b.get("y1", 0) - box.get("y1", -1)) < 0.01 and
-                          abs(b.get("x2", 0) - box.get("x2", -1)) < 0.01 and
-                          abs(b.get("y2", 0) - box.get("y2", -1)) < 0.01):
-                        matched = True
-                    if matched:
-                        b["sex"] = "Unknown"
-                        b["sex_conf"] = None
-                        b["species"] = "Deer"  # Auto-set species to Deer
-                        break  # Only update the specific box
-                self.db.set_boxes(pid, all_boxes)
+                if not box_id:
+                    all_boxes = self.db.get_boxes(pid)
+                    for b in all_boxes:
+                        if (abs(b.get("x1", 0) - box.get("x1", -1)) < 0.01 and
+                            abs(b.get("y1", 0) - box.get("y1", -1)) < 0.01 and
+                            abs(b.get("x2", 0) - box.get("x2", -1)) < 0.01 and
+                            abs(b.get("y2", 0) - box.get("y2", -1)) < 0.01):
+                            box_id = b.get("id")
+                            break
+                if box_id:
+                    self.db.update_box_fields(
+                        box_id,
+                        sex="Unknown",
+                        sex_conf=None,
+                        species="Deer",
+                    )
                 # Add Deer tag if not present
                 tags = set(self.db.get_tags(pid))
                 if "Deer" not in tags:
                     self.db.add_tag(pid, "Deer")
-                # Clear species suggestion (removes from species review queue)
-                self.db.set_suggested_tag(pid, None, None)
+                # Clear species suggestion only if all boxes have been reviewed
+                try:
+                    remaining = self.db.get_boxes(pid)
+                    all_reviewed = True
+                    for b in remaining:
+                        if b.get("species", "").lower() == "deer" and (b.get("sex_conf") is not None):
+                            all_reviewed = False
+                            break
+                    if all_reviewed:
+                        self.db.set_suggested_tag(pid, None, None)
+                except Exception:
+                    pass
             reviewed_data[pid] = "UNKNOWN"
             _mark_reviewed(item, "Deer (Unknown)")
             _next_unreviewed()
