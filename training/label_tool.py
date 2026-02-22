@@ -13959,7 +13959,11 @@ class TrainerWindow(QMainWindow):
                     except Exception:
                         continue
                 try:
-                    return datetime.fromisoformat(val)
+                    parsed = datetime.fromisoformat(val)
+                    # Strip timezone info to avoid naive vs aware comparison errors
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.replace(tzinfo=None)
+                    return parsed
                 except Exception:
                     return None
 
