@@ -164,6 +164,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='icon.ico' if Path('icon.ico').exists() else None,
+    contents_directory='_internal',
 )
 
 coll = COLLECT(
