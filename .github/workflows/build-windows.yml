@@ -53,6 +53,11 @@ jobs:
       run: |
         pyinstaller TrailCamOrganizer_Windows.spec --clean
 
+    - name: Generate manifest for delta updates
+      run: |
+        python build_manifest.py dist/TrailCamOrganizer dist/TrailCamOrganizer/manifest.json
+        copy dist\TrailCamOrganizer\manifest.json manifest-windows.json
+
     - name: Create ZIP archive
       run: |
         Compress-Archive -Path dist/TrailCamOrganizer -DestinationPath TrailCamOrganizer-Windows.zip
@@ -68,7 +73,9 @@ jobs:
       with:
         tag_name: ${{ github.event.inputs.version }}
         name: Trail Camera Organizer ${{ github.event.inputs.version }}
-        files: TrailCamOrganizer-Windows.zip
+        files: |
+          TrailCamOrganizer-Windows.zip
+          manifest-windows.json
         draft: false
         prerelease: false
         body: |
