@@ -5836,6 +5836,9 @@ class TrainerWindow(QMainWindow):
             dt = p.get("date_taken") or ""
             try:
                 parsed = datetime.fromisoformat(dt)
+                # Strip timezone info to avoid naive vs aware comparison errors
+                if parsed.tzinfo is not None:
+                    parsed = parsed.replace(tzinfo=None)
             except Exception:
                 parsed = None
             return (parsed or datetime.min, p.get("file_path") or "")
