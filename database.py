@@ -767,9 +767,8 @@ class TrailCamDatabase:
             add_column(table, "abnormal_points_max", "abnormal_points_max INTEGER")
             if table == "deer_additional":
                 add_column(table, "age_class", "age_class TEXT")
-            if table == "deer_metadata":
-                add_column(table, "broken_antler_side", "broken_antler_side TEXT")
-                add_column(table, "broken_antler_note", "broken_antler_note TEXT")
+            add_column(table, "broken_antler_side", "broken_antler_side TEXT")
+            add_column(table, "broken_antler_note", "broken_antler_note TEXT")
         # Buck profile tables: ensure exists
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS buck_profiles (
