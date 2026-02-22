@@ -111,7 +111,7 @@ hiddenimports += collect_submodules('boto3')
 hiddenimports += collect_submodules('botocore')
 
 a = Analysis(
-    ['main.py'],
+    ['trainer_main.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
