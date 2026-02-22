@@ -471,7 +471,15 @@ def download_update(download_url: str, progress_callback=None) -> Path:
         Path to downloaded file
     """
     try:
-        response = requests.get(download_url, stream=True, timeout=30)
+        # Use a session to follow redirects properly (GitHub uses redirects for release assets)
+        session = requests.Session()
+        response = session.get(
+            download_url,
+            stream=True,
+            timeout=(10, 300),  # (connect timeout, read timeout)
+            allow_redirects=True,
+            headers={"Accept": "application/octet-stream"}
+        )
         response.raise_for_status()
 
         total_size = int(response.headers.get('content-length', 0))
@@ -485,12 +493,26 @@ def download_update(download_url: str, progress_callback=None) -> Path:
 
         downloaded = 0
         with open(temp_file, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
+            for chunk in response.iter_content(chunk_size=65536):
                 if chunk:
                     f.write(chunk)
                     downloaded += len(chunk)
                     if progress_callback and total_size:
                         progress_callback(downloaded, total_size)
+
+        # Verify we actually got a zip file and not an HTML error page
+        if temp_file.stat().st_size < 1_000_000:
+            # Release zip should be >100MB — something went wrong
+            with open(temp_file, 'rb') as f:
+                header = f.read(4)
+            if header[:2] != b'PK':  # ZIP magic bytes
+                content_preview = temp_file.read_text(errors='replace')[:200]
+                logger.error(f"Download is not a valid ZIP. Size: {temp_file.stat().st_size}, "
+                           f"Preview: {content_preview}")
+                raise Exception(
+                    f"Download failed — received {temp_file.stat().st_size} bytes "
+                    f"instead of the expected ZIP file. The server may be temporarily unavailable."
+                )
 
         return temp_file
 
