@@ -37,7 +37,7 @@ from dialogs import (
 
 logger = logging.getLogger(__name__)
 
-from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QCoreApplication, QSettings, QPoint, QRect, QSize, QThread, QDate, QEventLoop
+from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal, QCoreApplication, QSettings, QPoint, QRect, QSize, QThread, QDate, QEventLoop, QEvent
 from PyQt6.QtGui import QPixmap, QIcon, QAction, QPen, QShortcut, QKeySequence, QColor, QBrush, QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -244,8 +244,11 @@ class CheckableComboBox(QComboBox):
     def add_item(self, text: str, data=None, checked: bool = False):
         """Add a checkable item."""
         item = QStandardItem(text)
-        item.setCheckable(True)
+        item.setCheckable(True)  # Initialize checkbox visual + check state
         item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        # Remove UserCheckable flag so Qt delegate won't auto-toggle on click.
+        # Checkbox still renders because CheckStateRole data is set.
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
         item.setData(data if data is not None else text, Qt.ItemDataRole.UserRole)
         self._model.appendRow(item)
         self._update_display()
@@ -263,12 +266,13 @@ class CheckableComboBox(QComboBox):
         self._model.clear()
 
     def _on_item_pressed(self, index):
-        """Handle item click - toggle checkbox."""
+        """Handle item click — toggle checkbox and apply 'All' logic."""
         item = self._model.itemFromIndex(index)
         if item is None:
             return
 
         self._updating = True
+        # Manually toggle (Qt won't auto-toggle since ItemIsUserCheckable is removed)
         if item.checkState() == Qt.CheckState.Checked:
             item.setCheckState(Qt.CheckState.Unchecked)
         else:
@@ -282,8 +286,7 @@ class CheckableComboBox(QComboBox):
                     Qt.CheckState.Checked if all_checked else Qt.CheckState.Unchecked
                 )
         else:
-            # If any item is unchecked, uncheck "All"
-            # If all items are checked, check "All"
+            # Update "All" row: checked only if all items are checked
             all_checked = all(
                 self._model.item(i).checkState() == Qt.CheckState.Checked
                 for i in range(1, self._model.rowCount())
@@ -641,7 +644,7 @@ SEX_TAGS = {"buck", "doe"}
 
 # Master list of valid species labels - matches SPECIES_OPTIONS (excluding empty string)
 VALID_SPECIES = set(s for s in SPECIES_OPTIONS if s)
-SEX_OPTIONS = ["", "Buck", "Doe", "Unknown"]
+SEX_OPTIONS = ["", "Buck", "Doe", "Unknown", "Unexamined"]
 AGE_OPTIONS = ["", "1.5", "2.5", "3.5", "4.5", "5.5+", "Fawn", "Mature", "Unknown"]
 
 # Simple modern QSS theme for a cleaner, less “Win95” look
@@ -1247,8 +1250,8 @@ class AIWorker(QThread):
             label = (box.get("label") or "").lower()
             ai_species = (box.get("ai_suggested_species") or "").lower()
 
-            # Skip if already has sex prediction
-            if box.get("sex") and box.get("sex") != "Unknown":
+            # Skip if sex already confirmed by user (Buck, Doe, or Unknown = deliberate choice)
+            if box.get("sex") in ("Buck", "Doe", "Unknown"):
                 continue
 
             # Identify deer boxes (by species or AI suggestion)
@@ -1481,8 +1484,10 @@ class TrainerWindow(QMainWindow):
             self.sex_buttons[label] = btn
             sex_row.addWidget(btn)
             btn.clicked.connect(lambda checked, lbl=label: self._on_sex_clicked(lbl, checked))
-        # default Unknown
-        self.sex_buttons["Unknown"].setChecked(True)
+        # No button checked by default = "Unexamined" (soft label)
+        self.sex_status_label = QLabel("Unexamined")
+        self.sex_status_label.setStyleSheet("color: #999; font-style: italic; font-size: 11px;")
+        sex_row.addWidget(self.sex_status_label)
         # Sex suggestion display
         sex_row.addSpacing(12)
         self.sex_suggest_label = QLabel("Suggested: —")
@@ -1718,6 +1723,20 @@ class TrainerWindow(QMainWindow):
         sex_row_widget.setLayout(sex_row)
         form.addRow("Sex (buck/doe):", sex_row_widget)
         form.addRow("Deer ID:", self.deer_id_edit)
+        # Uncategorized buck quick buttons (Small / Medium / Mature)
+        uncat_row = QHBoxLayout()
+        uncat_row.setSpacing(4)
+        for size_label in ("Small", "Medium", "Mature"):
+            btn = QPushButton(size_label)
+            btn.setMinimumHeight(24)
+            btn.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+            btn.setProperty("uncat_size", size_label)
+            btn.clicked.connect(self._on_uncat_buck_clicked)
+            uncat_row.addWidget(btn)
+        uncat_row.addStretch()
+        uncat_container = QWidget()
+        uncat_container.setLayout(uncat_row)
+        form.addRow("Unknown buck:", uncat_container)
         bulk_row = QHBoxLayout()
         bulk_row.addWidget(self.merge_btn)
         bulk_row.addWidget(self.bulk_buck_btn)
@@ -1906,6 +1925,7 @@ class TrainerWindow(QMainWindow):
         self.photo_list_widget.setAlternatingRowColors(True)
         self.photo_list_widget.setMinimumWidth(220)
         self.photo_list_widget.setStyleSheet("QListWidget { font-size: 11px; }")
+        self.photo_list_widget.installEventFilter(self)
         self.photo_list_widget.itemSelectionChanged.connect(self.on_photo_selection_changed)
         QShortcut(QKeySequence.StandardKey.SelectAll, self.photo_list_widget, activated=self.select_all_photos)
         QShortcut(QKeySequence("Ctrl+Shift+Down"), self.photo_list_widget, activated=self.select_to_end)
@@ -1918,37 +1938,32 @@ class TrainerWindow(QMainWindow):
         self.suggest_filter_combo = QComboBox()
         self.suggest_filter_combo.setMinimumWidth(100)
         self.suggest_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
-        # Site filter
-        self.site_filter_combo = QComboBox()
+        # Site filter (multi-select)
+        self.site_filter_combo = CheckableComboBox()
         self.site_filter_combo.setMinimumWidth(100)
-        self.site_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.site_filter_combo.view().setMinimumWidth(200)
-        self.site_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
+        self.site_filter_combo.selectionChanged.connect(self._populate_photo_list)
         # Species filter (multi-select)
         self.species_filter_combo = CheckableComboBox()
         self.species_filter_combo.setMinimumWidth(120)
         self.species_filter_combo.view().setMinimumWidth(200)
         self.species_filter_combo.selectionChanged.connect(self._populate_photo_list)
-        # Sex filter
-        self.sex_filter_combo = QComboBox()
-        self.sex_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        # Sex filter (multi-select)
+        self.sex_filter_combo = CheckableComboBox()
         self.sex_filter_combo.view().setMinimumWidth(150)
-        self.sex_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
-        # Deer ID filter
-        self.deer_id_filter_combo = QComboBox()
-        self.deer_id_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.sex_filter_combo.selectionChanged.connect(self._populate_photo_list)
+        # Deer ID filter (multi-select)
+        self.deer_id_filter_combo = CheckableComboBox()
         self.deer_id_filter_combo.view().setMinimumWidth(200)
-        self.deer_id_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
-        # Year filter (antler year: May-April)
-        self.year_filter_combo = QComboBox()
-        self.year_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.deer_id_filter_combo.selectionChanged.connect(self._populate_photo_list)
+        # Year filter (multi-select, antler year: May-April)
+        self.year_filter_combo = CheckableComboBox()
         self.year_filter_combo.view().setMinimumWidth(120)
-        self.year_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
-        # Collection/Farm filter
-        self.collection_filter_combo = QComboBox()
-        self.collection_filter_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.year_filter_combo.selectionChanged.connect(self._populate_photo_list)
+        # Collection/Farm filter (multi-select)
+        self.collection_filter_combo = CheckableComboBox()
         self.collection_filter_combo.view().setMinimumWidth(150)
-        self.collection_filter_combo.currentIndexChanged.connect(self._populate_photo_list)
+        self.collection_filter_combo.selectionChanged.connect(self._populate_photo_list)
         # Sort order
         self.sort_combo = QComboBox()
         self.sort_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -2163,6 +2178,8 @@ class TrainerWindow(QMainWindow):
         sex_suggest_action.triggered.connect(self.run_sex_suggestions_on_deer)
         verification_action = self.tools_menu.addAction("Detect Verification Photos...")
         verification_action.triggered.connect(self.detect_verification_photos)
+        bulk_archive_action = self.tools_menu.addAction("Bulk Archive by Species...")
+        bulk_archive_action.triggered.connect(self._bulk_archive_dialog)
 
         # === REVIEW QUEUES (grouped together) ===
         self.tools_menu.addSeparator()
@@ -2214,6 +2231,20 @@ class TrainerWindow(QMainWindow):
         self.tools_menu.addSeparator()
         profiles_action = self.tools_menu.addAction("Buck Profiles")
         profiles_action.triggered.connect(self.open_buck_profiles_list)
+
+        # Deer ID migration review queue (only shown if queue file exists)
+        self._deer_migration_action = None
+        try:
+            queue_path = Path.home() / ".trailcam" / "deer_id_migration_queue.json"
+            if queue_path.exists():
+                import json
+                queue = json.loads(queue_path.read_text())
+                if queue:
+                    self._deer_migration_action = self.tools_menu.addAction(
+                        f"Review Deer ID Assignments ({len(queue)} photos)...")
+                    self._deer_migration_action.triggered.connect(self._open_deer_migration_review)
+        except Exception:
+            pass
 
         # === SITE MANAGEMENT ===
         self.tools_menu.addSeparator()
@@ -2446,37 +2477,17 @@ class TrainerWindow(QMainWindow):
 
     def _reset_filters_to_defaults(self):
         """Reset all filters to their default state (show all non-archived photos)."""
-        # Block signals to prevent multiple photo list rebuilds
-        self.collection_filter_combo.blockSignals(True)
-        self.collection_filter_combo.setCurrentIndex(0)  # "All Collections"
-        self.collection_filter_combo.blockSignals(False)
+        # Multi-select filters: select all (no filtering)
+        for combo in [self.species_filter_combo, self.sex_filter_combo,
+                      self.deer_id_filter_combo, self.site_filter_combo,
+                      self.year_filter_combo, self.collection_filter_combo]:
+            if hasattr(combo, 'select_all'):
+                combo.select_all()
 
-        if hasattr(self.species_filter_combo, 'select_all'):
-            self.species_filter_combo.select_all()
-        else:
-            self.species_filter_combo.blockSignals(True)
-            self.species_filter_combo.setCurrentIndex(0)
-            self.species_filter_combo.blockSignals(False)
-
+        # Single-select filters: reset to index 0
         self.archive_filter_combo.blockSignals(True)
-        self.archive_filter_combo.setCurrentIndex(0)  # "Active" (non-archived) - index 0
+        self.archive_filter_combo.setCurrentIndex(0)  # "Active" (non-archived)
         self.archive_filter_combo.blockSignals(False)
-
-        self.sex_filter_combo.blockSignals(True)
-        self.sex_filter_combo.setCurrentIndex(0)  # "All"
-        self.sex_filter_combo.blockSignals(False)
-
-        self.site_filter_combo.blockSignals(True)
-        self.site_filter_combo.setCurrentIndex(0)  # "All Sites"
-        self.site_filter_combo.blockSignals(False)
-
-        self.year_filter_combo.blockSignals(True)
-        self.year_filter_combo.setCurrentIndex(0)  # "All Years"
-        self.year_filter_combo.blockSignals(False)
-
-        self.deer_id_filter_combo.blockSignals(True)
-        self.deer_id_filter_combo.setCurrentIndex(0)  # "All"
-        self.deer_id_filter_combo.blockSignals(False)
 
         self.suggest_filter_combo.blockSignals(True)
         self.suggest_filter_combo.setCurrentIndex(0)  # "All"
@@ -3715,6 +3726,10 @@ class TrainerWindow(QMainWindow):
     def closeEvent(self, event):
         """Save settings and push to cloud before closing."""
         try:
+            # Save any pending photo changes before shutdown
+            if self.save_timer.isActive():
+                self.save_timer.stop()
+            self.save_current()
             self._save_settings()
 
             # Create daily backup if one hasn't been made today
@@ -4066,6 +4081,15 @@ class TrainerWindow(QMainWindow):
         if not self.photos:
             return
         self._loading_photo_data = True  # Prevent auto-advance during load
+        try:
+            self._load_photo_inner()
+        except Exception as e:
+            logger.error(f"Error in load_photo: {e}")
+        finally:
+            self._loading_photo_data = False  # Always reset, even on error
+
+    def _load_photo_inner(self):
+        """Inner load_photo logic, wrapped by load_photo() for safety."""
         # Ensure index is within bounds
         if self.index < 0 or self.index >= len(self.photos):
             self.index = max(0, min(self.index, len(self.photos) - 1))
@@ -4161,20 +4185,26 @@ class TrainerWindow(QMainWindow):
         self.favorite_checkbox.setChecked(bool(photo.get("favorite")))
         self.favorite_checkbox.blockSignals(False)
 
-        deer = self.db.get_deer_metadata(pid)
+        # Deer metadata now comes from per-box data via _load_box_data().
+        # Populate dropdown, then clear fields — _load_box_data() fills them for the selected box.
         self._populate_deer_id_dropdown()
-        self.deer_id_edit.setCurrentText(deer.get("deer_id") or "")
-        self.age_combo.setCurrentText(deer.get("age_class") or "")
-        self._set_int_field(self.left_min, deer.get("left_points_min"))
-        self.left_uncertain.setChecked(deer.get("left_points_uncertain", False))
-        self._set_int_field(self.right_min, deer.get("right_points_min"))
-        self.right_uncertain.setChecked(deer.get("right_points_uncertain", False))
-        self._set_int_field(self.left_ab_min, deer.get("left_ab_points_min"))
-        self.left_ab_unc.setChecked(deer.get("left_ab_points_uncertain", False))
-        self._set_int_field(self.right_ab_min, deer.get("right_ab_points_min"))
-        self.right_ab_unc.setChecked(deer.get("right_ab_points_uncertain", False))
-        self._set_int_field(self.ab_min, deer.get("abnormal_points_min"))
-        self._set_int_field(self.ab_max, deer.get("abnormal_points_max"))
+        has_subject_boxes_for_deer = any(not self._is_head_box(b) for b in self.current_boxes) if self.current_boxes else False
+        if not has_subject_boxes_for_deer:
+            # No subject boxes — clear all deer fields
+            self.deer_id_edit.blockSignals(True)
+            self.deer_id_edit.setCurrentText("")
+            self.deer_id_edit.blockSignals(False)
+            self.age_combo.setCurrentText("")
+            self._set_int_field(self.left_min, None)
+            self.left_uncertain.setChecked(False)
+            self._set_int_field(self.right_min, None)
+            self.right_uncertain.setChecked(False)
+            self._set_int_field(self.left_ab_min, None)
+            self.left_ab_unc.setChecked(False)
+            self._set_int_field(self.right_ab_min, None)
+            self.right_ab_unc.setChecked(False)
+            self._set_int_field(self.ab_min, None)
+            self._set_int_field(self.ab_max, None)
 
         # species: use box species when boxes exist, else use stored tags (suggestions require user approval)
         species_options = set(SPECIES_OPTIONS)
@@ -4204,7 +4234,7 @@ class TrainerWindow(QMainWindow):
             if t.lower() in ("buck", "doe"):
                 sex = t.capitalize()
         if sex not in ("Buck", "Doe", "Unknown"):
-            sex = "Unknown"
+            sex = "Unexamined"
         self._set_sex(sex)
 
         # Set camera location
@@ -4216,29 +4246,19 @@ class TrainerWindow(QMainWindow):
         # Apply profile autofill for this buck/season if present
         self._apply_buck_profile_to_ui()
         # Default species/sex when a buck ID exists
-        if deer.get("deer_id"):
+        if self.deer_id_edit.currentText().strip():
             if not (self.species_combo.currentText().strip()):
                 self.species_combo.blockSignals(True)
                 self.species_combo.setCurrentText("Deer")
                 self.species_combo.blockSignals(False)
             current_sex = self._get_sex()
-            if current_sex == "Unknown":
+            if current_sex == "Unexamined":
                 self._set_sex("Buck")
         self._load_previews()
         self._update_suggestion_display(photo)
         self._update_sex_suggestion_display(photo)
-        # Load additional buck (second deer)
-        extras = self.db.get_additional_deer(pid)
-        if extras:
-            ex = extras[0]
-            self.add_buck_toggle.setChecked(True)
-            self.add_deer_id_edit.setCurrentText(ex.get("deer_id") or "")
-            self.add_age_combo.setCurrentText(ex.get("age_class") or "")
-            self._set_int_field(self.add_left_min, ex.get("left_points_min"))
-            self._set_int_field(self.add_right_min, ex.get("right_points_min"))
-            self.add_left_uncertain.setChecked(ex.get("left_points_uncertain", False))
-            self.add_right_uncertain.setChecked(ex.get("right_points_uncertain", False))
-        else:
+        # Second buck toggle — hide by default; per-box deer IDs handle multi-buck now
+        if hasattr(self, 'add_buck_toggle'):
             self.add_buck_toggle.setChecked(False)
             self.add_deer_id_edit.setCurrentText("")
             self.add_age_combo.setCurrentText("")
@@ -4256,8 +4276,6 @@ class TrainerWindow(QMainWindow):
 
         # Preload thumbnails for nearby photos in the filtered list
         self._preload_nearby_thumbnails()
-
-        self._loading_photo_data = False  # Done loading, allow auto-advance
 
     def _preload_nearby_thumbnails(self, buffer: int = 10):
         """Preload thumbnails for photos adjacent to current one in filtered list.
@@ -4348,7 +4366,12 @@ class TrainerWindow(QMainWindow):
         # Get tags from UI field, or from database if field is empty/hidden
         tags_text = self.tags_edit.text().strip()
         if tags_text:
-            tags = [t.strip() for t in tags_text.split(",") if t.strip()]
+            # Strip trailing '?' from suggestion-display tags (e.g., "Empty?") before saving
+            tags = []
+            for raw in tags_text.split(","):
+                cleaned = raw.strip().rstrip("?").strip()
+                if cleaned:
+                    tags.append(cleaned)
         else:
             # Field is empty (likely hidden in simple mode) - get from database
             tags = self.db.get_tags(pid)
@@ -4423,66 +4446,40 @@ class TrainerWindow(QMainWindow):
                 box["species"] = None
                 box["species_conf"] = None
             self._draw_boxes()  # Refresh overlay
-        self.db.set_deer_metadata(
-            photo_id=pid,
-            deer_id=deer_id or None,
-            age_class=age or None,
-            left_points_min=self._to_int(self.left_min.text()),
-            right_points_min=self._to_int(self.right_min.text()),
-            left_points_uncertain=self.left_uncertain.isChecked(),
-            right_points_uncertain=self.right_uncertain.isChecked(),
-            left_ab_points_min=self._to_int(self.left_ab_min.text()),
-            right_ab_points_min=self._to_int(self.right_ab_min.text()),
-            left_ab_points_uncertain=self.left_ab_unc.isChecked(),
-            right_ab_points_uncertain=self.right_ab_unc.isChecked(),
-            abnormal_points_min=self._to_int(self.ab_min.text()),
-            abnormal_points_max=self._to_int(self.ab_max.text()),
-        )
         self.db.update_photo_attributes(
             photo_id=pid,
             camera_location=self.camera_combo.currentText().strip(),
             key_characteristics=self._normalize_tags_text(self.char_edit.toPlainText()),
         )
         self.db.set_notes(pid, self.notes_edit.toPlainText())
-        # Save boxes
+        # Save boxes (includes per-box deer_id, age_class, antler data)
         try:
             self.db.set_boxes(pid, self.current_boxes)
         except Exception as exc:
             logger.error(f"Box save failed: {exc}")
-        # Save second buck if toggled
-        extras = []
-        if self.add_buck_toggle.isChecked():
-            add_id = self.add_deer_id_edit.currentText().strip()
-            if add_id:
-                extras.append({
-                    "deer_id": add_id,
-                    "age_class": self.add_age_combo.currentText().strip() or None,
-                    "left_points_min": self._to_int(self.add_left_min.text()),
-                    "right_points_min": self._to_int(self.add_right_min.text()),
-                    "left_points_uncertain": self.add_left_uncertain.isChecked(),
-                    "right_points_uncertain": self.add_right_uncertain.isChecked(),
-                    "left_ab_points_min": None,
-                    "right_ab_points_min": None,
-                    "left_ab_points_uncertain": False,
-                    "right_ab_points_uncertain": False,
-                    "abnormal_points_min": None,
-                    "abnormal_points_max": None,
-                })
-        self.db.set_additional_deer(pid, extras)
-        # Only clear suggestion if a NEW species tag was added (not already saved)
+        # Mirror primary box deer data to deer_metadata for backwards compat
+        self._mirror_box_deer_to_metadata(pid)
+        # Derive deer_additional from non-primary boxes with deer_ids
+        self._derive_deer_additional_from_boxes(pid)
+        # Clear suggestion if a NEW species tag was added, OR if current species
+        # matches the suggestion (user is confirming the AI suggestion)
         original_species = getattr(self, "_original_saved_species", set())
         is_new_species = species and species not in original_species
-        if is_new_species:
+        suggested = photo.get("suggested_tag", "")
+        matches_suggestion = species and species == suggested
+        if is_new_species or matches_suggestion:
             # Official tag applied; clear suggestion
             self.db.set_suggested_tag(pid, None, None)
-            # Bump to session recent species list
-            if species in self._session_recent_species:
-                self._session_recent_species.remove(species)
-            self._session_recent_species.insert(0, species)
-            self._session_recent_species = self._session_recent_species[:20]  # Keep max 20
-            # Note: Custom species addition disabled - using fixed species list
-            # Update original species so subsequent saves don't re-trigger
-            self._original_saved_species.add(species)
+            photo["suggested_tag"] = None
+            photo["suggested_confidence"] = None
+            if is_new_species:
+                # Bump to session recent species list
+                if species in self._session_recent_species:
+                    self._session_recent_species.remove(species)
+                self._session_recent_species.insert(0, species)
+                self._session_recent_species = self._session_recent_species[:20]  # Keep max 20
+                # Update original species so subsequent saves don't re-trigger
+                self._original_saved_species.add(species)
         # Refresh camera location dropdown if new location was added
         cam_loc = self.camera_combo.currentText().strip()
         if cam_loc and self.camera_combo.findText(cam_loc) == -1:
@@ -4544,6 +4541,87 @@ class TrainerWindow(QMainWindow):
         self.save_current()
         self.next_photo()
 
+    def _mirror_box_deer_to_metadata(self, photo_id: int):
+        """Mirror primary box's deer data to deer_metadata for backwards compat."""
+        subject_boxes = [b for b in (self.current_boxes or []) if not self._is_head_box(b)]
+        if not subject_boxes:
+            # No subject boxes — write empty deer_metadata
+            self.db.set_deer_metadata(photo_id=photo_id)
+            return
+
+        # Find primary box: check stored primary_box_id first
+        deer_meta = self.db.get_deer_metadata(photo_id)
+        stored_primary = deer_meta.get("primary_box_id")
+        primary_box = None
+
+        if stored_primary:
+            # Check if stored primary still exists and has a deer_id
+            for b in subject_boxes:
+                if b.get("id") == stored_primary and b.get("deer_id"):
+                    primary_box = b
+                    break
+
+        if not primary_box:
+            # Fall back to lowest-index subject box with a deer_id
+            for b in subject_boxes:
+                if b.get("deer_id"):
+                    primary_box = b
+                    break
+
+        if primary_box:
+            self.db.set_deer_metadata(
+                photo_id=photo_id,
+                deer_id=primary_box.get("deer_id"),
+                age_class=primary_box.get("age_class"),
+                left_points_min=primary_box.get("left_points_min"),
+                right_points_min=primary_box.get("right_points_min"),
+                left_points_uncertain=primary_box.get("left_points_uncertain", False),
+                right_points_uncertain=primary_box.get("right_points_uncertain", False),
+                left_ab_points_min=primary_box.get("left_ab_points_min"),
+                right_ab_points_min=primary_box.get("right_ab_points_min"),
+                left_ab_points_uncertain=primary_box.get("left_ab_points_uncertain", False),
+                right_ab_points_uncertain=primary_box.get("right_ab_points_uncertain", False),
+                abnormal_points_min=primary_box.get("abnormal_points_min"),
+                abnormal_points_max=primary_box.get("abnormal_points_max"),
+            )
+            # Update primary_box_id and source marker
+            try:
+                cursor = self.db.conn.cursor()
+                cursor.execute(
+                    "UPDATE deer_metadata SET deer_id_source='box', primary_box_id=? WHERE photo_id=?",
+                    (primary_box.get("id"), photo_id))
+                self.db.conn.commit()
+            except Exception:
+                pass
+        else:
+            # No box has deer_id — write empty
+            self.db.set_deer_metadata(photo_id=photo_id)
+
+    def _derive_deer_additional_from_boxes(self, photo_id: int):
+        """Derive deer_additional from non-primary boxes with deer_ids."""
+        subject_boxes = [b for b in (self.current_boxes or []) if not self._is_head_box(b)]
+        deer_meta = self.db.get_deer_metadata(photo_id)
+        primary_box_id = deer_meta.get("primary_box_id")
+
+        extras = []
+        for b in subject_boxes:
+            if b.get("deer_id") and b.get("id") != primary_box_id:
+                extras.append({
+                    "deer_id": b["deer_id"],
+                    "age_class": b.get("age_class"),
+                    "left_points_min": b.get("left_points_min"),
+                    "right_points_min": b.get("right_points_min"),
+                    "left_points_uncertain": b.get("left_points_uncertain", False),
+                    "right_points_uncertain": b.get("right_points_uncertain", False),
+                    "left_ab_points_min": b.get("left_ab_points_min"),
+                    "right_ab_points_min": b.get("right_ab_points_min"),
+                    "left_ab_points_uncertain": b.get("left_ab_points_uncertain", False),
+                    "right_ab_points_uncertain": b.get("right_ab_points_uncertain", False),
+                    "abnormal_points_min": b.get("abnormal_points_min"),
+                    "abnormal_points_max": b.get("abnormal_points_max"),
+                })
+        self.db.set_additional_deer(photo_id, extras)
+
     def schedule_save(self):
         """Debounced autosave."""
         self.save_timer.start(300)
@@ -4554,6 +4632,8 @@ class TrainerWindow(QMainWindow):
             return
         self._in_species_changed = True
         try:
+            # If current photo falls out of active filters, keep index (avoid jump to top)
+            self._preserve_index_on_filter_miss = True
             # Save immediately instead of debouncing to ensure tag changes are saved
             self.save_timer.stop()
 
@@ -4620,44 +4700,64 @@ class TrainerWindow(QMainWindow):
     def prev_photo(self):
         if not self.photos:
             return
-        # Always save current box data before navigating
-        self._save_current_box_data()
-        if self.save_timer.isActive():
-            self.save_timer.stop()
-        self.save_current()
-        # Navigate within filtered photos only
-        filtered_indices = self._get_filtered_indices()
-        if not filtered_indices:
-            return
+        if getattr(self, '_navigating', False):
+            return  # Already navigating, prevent double-advance
+        self._navigating = True
         try:
-            current_pos = filtered_indices.index(self.index)
-            new_pos = (current_pos - 1) % len(filtered_indices)
-            self.index = filtered_indices[new_pos]
-        except ValueError:
-            # Current index not in filtered list, go to first filtered photo
-            self.index = filtered_indices[0]
-        self.load_photo()
+            # Always save current box data before navigating
+            self._save_current_box_data()
+            if self.save_timer.isActive():
+                self.save_timer.stop()
+            self.save_current()
+            # Capture visual position BEFORE recomputing filters
+            current_row = self.photo_list_widget.currentRow()
+            # Navigate within filtered photos only
+            filtered_indices = self._get_filtered_indices()
+            if not filtered_indices:
+                return
+            try:
+                current_pos = filtered_indices.index(self.index)
+                new_pos = (current_pos - 1) % len(filtered_indices)
+                self.index = filtered_indices[new_pos]
+            except ValueError:
+                # Current photo dropped out of filter — use visual position
+                target_row = max(current_row - 1, 0)
+                target_row = min(target_row, len(filtered_indices) - 1)
+                self.index = filtered_indices[target_row]
+            self.load_photo()
+        finally:
+            self._navigating = False
 
     def next_photo(self):
         if not self.photos:
             return
-        # Always save current box data before navigating
-        self._save_current_box_data()
-        if self.save_timer.isActive():
-            self.save_timer.stop()
-        self.save_current()
-        # Navigate within filtered photos only
-        filtered_indices = self._get_filtered_indices()
-        if not filtered_indices:
-            return
+        if getattr(self, '_navigating', False):
+            return  # Already navigating, prevent double-advance
+        self._navigating = True
         try:
-            current_pos = filtered_indices.index(self.index)
-            new_pos = (current_pos + 1) % len(filtered_indices)
-            self.index = filtered_indices[new_pos]
-        except ValueError:
-            # Current index not in filtered list, go to first filtered photo
-            self.index = filtered_indices[0]
-        self.load_photo()
+            # Always save current box data before navigating
+            self._save_current_box_data()
+            if self.save_timer.isActive():
+                self.save_timer.stop()
+            self.save_current()
+            # Capture visual position BEFORE recomputing filters
+            current_row = self.photo_list_widget.currentRow()
+            # Navigate within filtered photos only
+            filtered_indices = self._get_filtered_indices()
+            if not filtered_indices:
+                return
+            try:
+                current_pos = filtered_indices.index(self.index)
+                new_pos = (current_pos + 1) % len(filtered_indices)
+                self.index = filtered_indices[new_pos]
+            except ValueError:
+                # Current photo dropped out of filter — use visual position
+                # The item that was below slides into current_row in the new list
+                target_row = min(current_row, len(filtered_indices) - 1)
+                self.index = filtered_indices[target_row]
+            self.load_photo()
+        finally:
+            self._navigating = False
 
     def keyPressEvent(self, event):
         """Allow Up/Down to navigate photos even when focus is in form fields (except multiline notes)."""
@@ -4672,6 +4772,18 @@ class TrainerWindow(QMainWindow):
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event):
+        """Intercept Up/Down on the photo list to prevent default selection jump."""
+        if obj is getattr(self, "photo_list_widget", None):
+            if event.type() == QEvent.Type.KeyPress and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                if event.key() == Qt.Key.Key_Up:
+                    self.prev_photo()
+                    return True
+                if event.key() == Qt.Key.Key_Down:
+                    self.next_photo()
+                    return True
+        return super().eventFilter(obj, event)
 
     def _setup_nav_shortcuts(self):
         """Install Up/Down shortcuts that work even when form fields have focus."""
@@ -5096,13 +5208,14 @@ class TrainerWindow(QMainWindow):
         deer_id = self.deer_id_edit.currentText().strip()
         if species.lower() == "deer":
             sex = self._get_sex()
-            # If deer_id is set, auto-set to Buck
-            if deer_id and sex == "Unknown":
+            # If deer_id is set, auto-set to Buck (only if unexamined, not if user chose Unknown)
+            if deer_id and sex == "Unexamined":
                 sex = "Buck"
                 self._set_sex("Buck")
             box["sex"] = sex
-            # Clear sex_conf when user has confirmed sex (not Unknown) - removes from review queue
-            if sex in ("Buck", "Doe"):
+            # Clear sex_conf when user has confirmed sex - removes from review queue
+            # Buck, Doe, Unknown are all confirmed decisions; Unexamined is not
+            if sex in ("Buck", "Doe", "Unknown"):
                 box["sex_conf"] = None
         else:
             box["sex"] = None
@@ -5114,11 +5227,17 @@ class TrainerWindow(QMainWindow):
         # Save age
         box["age_class"] = self.age_combo.currentText().strip()
 
-        # Save antler points
+        # Save antler points (typical + abnormal)
         box["left_points_min"] = self._get_int_field(self.left_min)
         box["right_points_min"] = self._get_int_field(self.right_min)
         box["left_points_uncertain"] = self.left_uncertain.isChecked()
         box["right_points_uncertain"] = self.right_uncertain.isChecked()
+        box["left_ab_points_min"] = self._get_int_field(self.left_ab_min) if hasattr(self, 'left_ab_min') else None
+        box["right_ab_points_min"] = self._get_int_field(self.right_ab_min) if hasattr(self, 'right_ab_min') else None
+        box["left_ab_points_uncertain"] = self.left_ab_unc.isChecked() if hasattr(self, 'left_ab_unc') else False
+        box["right_ab_points_uncertain"] = self.right_ab_unc.isChecked() if hasattr(self, 'right_ab_unc') else False
+        box["abnormal_points_min"] = self._get_int_field(self.ab_min) if hasattr(self, 'ab_min') else None
+        box["abnormal_points_max"] = self._get_int_field(self.ab_max) if hasattr(self, 'ab_max') else None
 
         # Persist boxes to database
         self._persist_boxes()
@@ -5142,9 +5261,9 @@ class TrainerWindow(QMainWindow):
         self.species_combo.setCurrentText(box.get("species", ""))
 
         # Load sex
-        sex = box.get("sex", "Unknown")
-        if sex not in ("Buck", "Doe"):
-            sex = "Unknown"
+        sex = box.get("sex", "")
+        if sex not in ("Buck", "Doe", "Unknown"):
+            sex = "Unexamined"
         self._set_sex(sex)
 
         # Load deer ID
@@ -5153,11 +5272,23 @@ class TrainerWindow(QMainWindow):
         # Load age
         self.age_combo.setCurrentText(box.get("age_class", ""))
 
-        # Load antler points
+        # Load antler points (typical + abnormal)
         self._set_int_field(self.left_min, box.get("left_points_min"))
         self._set_int_field(self.right_min, box.get("right_points_min"))
         self.left_uncertain.setChecked(box.get("left_points_uncertain", False))
         self.right_uncertain.setChecked(box.get("right_points_uncertain", False))
+        if hasattr(self, 'left_ab_min'):
+            self._set_int_field(self.left_ab_min, box.get("left_ab_points_min"))
+        if hasattr(self, 'right_ab_min'):
+            self._set_int_field(self.right_ab_min, box.get("right_ab_points_min"))
+        if hasattr(self, 'left_ab_unc'):
+            self.left_ab_unc.setChecked(box.get("left_ab_points_uncertain", False))
+        if hasattr(self, 'right_ab_unc'):
+            self.right_ab_unc.setChecked(box.get("right_ab_points_uncertain", False))
+        if hasattr(self, 'ab_min'):
+            self._set_int_field(self.ab_min, box.get("abnormal_points_min"))
+        if hasattr(self, 'ab_max'):
+            self._set_int_field(self.ab_max, box.get("abnormal_points_max"))
 
         # Unblock signals
         self.species_combo.blockSignals(False)
@@ -5449,12 +5580,12 @@ class TrainerWindow(QMainWindow):
                 species = photo.get("suggested_tag", "")
                 if species:
                     species = f"{species}?"  # Add ? to indicate it's a suggestion
-            # Build label with species and sex
-            if species and sex and sex != "Unknown":
+            # Build label with species and sex (hide "Unexamined" soft label)
+            if species and sex and sex != "Unexamined":
                 label_text = f"Subject {box_num}: {species} ({sex})"
             elif species:
                 label_text = f"Subject {box_num}: {species}"
-            elif sex and sex != "Unknown":
+            elif sex and sex != "Unexamined":
                 label_text = f"Subject {box_num}: ({sex})"
             else:
                 label_text = f"Subject {box_num}"
@@ -6006,14 +6137,33 @@ class TrainerWindow(QMainWindow):
         for label, btn in self.sex_buttons.items():
             if btn.isChecked():
                 return label
-        return "Unknown"
+        return "Unexamined"
 
     def _set_sex(self, value: str):
-        val = value if value in self.sex_buttons else "Unknown"
-        for label, btn in self.sex_buttons.items():
-            btn.blockSignals(True)
-            btn.setChecked(label == val)
-            btn.blockSignals(False)
+        if value in self.sex_buttons:
+            for label, btn in self.sex_buttons.items():
+                btn.blockSignals(True)
+                btn.setChecked(label == value)
+                btn.blockSignals(False)
+        else:
+            # Unexamined or unrecognized — uncheck all buttons
+            for btn in self.sex_buttons.values():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+        self._update_sex_status_label()
+
+    def _update_sex_status_label(self):
+        """Show 'Unexamined' soft label when no sex button is checked."""
+        if not hasattr(self, 'sex_status_label'):
+            return
+        sex = self._get_sex()
+        if sex == "Unexamined":
+            self.sex_status_label.setText("Unexamined")
+            self.sex_status_label.setVisible(True)
+        else:
+            self.sex_status_label.setText("")
+            self.sex_status_label.setVisible(False)
 
     def _toggle_previews(self, visible: bool):
         """Show/hide the preview strip to save space."""
@@ -6322,6 +6472,7 @@ class TrainerWindow(QMainWindow):
             for btn in self.sex_buttons.values():
                 btn.setChecked(False)
 
+        self._update_sex_status_label()
         self._sync_species_on_sex()
         self.save_current()
 
@@ -6498,9 +6649,15 @@ class TrainerWindow(QMainWindow):
         self.save_current()
 
     def _populate_deer_id_dropdown(self):
-        """Fill deer ID dropdown from existing IDs."""
+        """Fill deer ID dropdown from existing IDs (box-level + photo-level for compat)."""
         try:
             ids = set()
+            # Collect from box-level deer_ids (primary source)
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT DISTINCT deer_id FROM annotation_boxes WHERE deer_id IS NOT NULL AND deer_id != '' AND deleted_at IS NULL")
+            for row in cursor.fetchall():
+                ids.add(row[0])
+            # Also collect from deer_metadata/deer_additional for backwards compat
             for photo in self._get_all_photos_cached():
                 meta = self.db.get_deer_metadata(photo["id"])
                 did = meta.get("deer_id") or ""
@@ -6525,6 +6682,8 @@ class TrainerWindow(QMainWindow):
 
     def _populate_additional_deer_dropdown(self):
         """Keep the second-buck dropdown in sync with known IDs."""
+        if not hasattr(self, 'add_deer_id_edit'):
+            return
         try:
             ids = set()
             for photo in self._get_all_photos_cached():
@@ -6571,7 +6730,8 @@ class TrainerWindow(QMainWindow):
         """Fill the species filter combo with counts (contextual to other filters)."""
         if not hasattr(self, "species_filter_combo"):
             return
-        # Save current selections
+        # Save current selections (track if we had items to distinguish first load vs repopulate)
+        had_items = self.species_filter_combo._model.rowCount() > 0
         current_selections = self.species_filter_combo.get_checked_data() if hasattr(self.species_filter_combo, 'get_checked_data') else []
         self.species_filter_combo._updating = True
         self.species_filter_combo.clear()
@@ -6598,8 +6758,8 @@ class TrainerWindow(QMainWindow):
         except Exception:
             self.species_filter_combo.add_item("Unlabeled", "__unlabeled__", checked=True)
             self.species_filter_combo.add_item("Deer", "Deer", checked=True)
-        # Restore previous selections if any were deselected
-        if current_selections:
+        # Restore previous selections (on repopulate, even if empty = all unchecked)
+        if had_items:
             self.species_filter_combo.set_checked_data(current_selections)
         self.species_filter_combo._updating = False
         self.species_filter_combo._update_display()
@@ -6608,46 +6768,66 @@ class TrainerWindow(QMainWindow):
         """Fill the sex filter combo with counts (contextual to other filters)."""
         if not hasattr(self, "sex_filter_combo"):
             return
-        current = self.sex_filter_combo.currentData()
-        self.sex_filter_combo.blockSignals(True)
+        had_items = self.sex_filter_combo._model.rowCount() > 0
+        current_selections = self.sex_filter_combo.get_checked_data()
+        self.sex_filter_combo._updating = True
         self.sex_filter_combo.clear()
-        self.sex_filter_combo.addItem("All", "")
+        self.sex_filter_combo.add_item("All Sex", "", checked=True)
+        self.sex_filter_combo.set_all_text("All Sex")
         try:
             context_photos = self._get_context_filtered_photos(exclude_filter='sex')
             buck_count = 0
             doe_count = 0
             unknown_count = 0
+            unexamined_count = 0
+            # Collect deer photos without Buck/Doe tags to check box-level sex
+            deer_no_sex_ids = []
             for photo in context_photos:
                 tags = set(self.db.get_tags(photo["id"]))
                 if "Buck" in tags:
                     buck_count += 1
                 elif "Doe" in tags:
                     doe_count += 1
-                elif "Unknown" in tags:
-                    unknown_count += 1
-            # Only add options with photos in current context
+                elif "Deer" in tags:
+                    # Deer photo without Buck/Doe tag — check box sex
+                    deer_no_sex_ids.append(photo["id"])
+            # Batch check box sex for deer photos without Buck/Doe tags (single SQL query)
+            if deer_no_sex_ids:
+                sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
+                for pid in deer_no_sex_ids:
+                    box_sex = sex_map.get(pid)
+                    if box_sex == "Unknown":
+                        unknown_count += 1
+                    else:
+                        unexamined_count += 1
             if buck_count > 0:
-                self.sex_filter_combo.addItem(f"Buck ({buck_count})", "Buck")
+                self.sex_filter_combo.add_item(f"Buck ({buck_count})", "Buck", checked=True)
             if doe_count > 0:
-                self.sex_filter_combo.addItem(f"Doe ({doe_count})", "Doe")
+                self.sex_filter_combo.add_item(f"Doe ({doe_count})", "Doe", checked=True)
             if unknown_count > 0:
-                self.sex_filter_combo.addItem(f"Unknown ({unknown_count})", "Unknown")
+                self.sex_filter_combo.add_item(f"Unknown ({unknown_count})", "Unknown", checked=True)
+            if unexamined_count > 0:
+                self.sex_filter_combo.add_item(f"Unexamined ({unexamined_count})", "Unexamined", checked=True)
         except Exception:
-            self.sex_filter_combo.addItem("Buck", "Buck")
-            self.sex_filter_combo.addItem("Doe", "Doe")
-            self.sex_filter_combo.addItem("Unknown", "Unknown")
-        idx = self.sex_filter_combo.findData(current)
-        self.sex_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
-        self.sex_filter_combo.blockSignals(False)
+            self.sex_filter_combo.add_item("Buck", "Buck", checked=True)
+            self.sex_filter_combo.add_item("Doe", "Doe", checked=True)
+            self.sex_filter_combo.add_item("Unknown", "Unknown", checked=True)
+            self.sex_filter_combo.add_item("Unexamined", "Unexamined", checked=True)
+        if had_items:
+            self.sex_filter_combo.set_checked_data(current_selections)
+        self.sex_filter_combo._updating = False
+        self.sex_filter_combo._update_display()
 
     def _populate_deer_id_filter_options(self):
         """Fill the deer ID filter combo with deer IDs (contextual to other filters)."""
         if not hasattr(self, "deer_id_filter_combo"):
             return
-        current = self.deer_id_filter_combo.currentData()
-        self.deer_id_filter_combo.blockSignals(True)
+        had_items = self.deer_id_filter_combo._model.rowCount() > 0
+        current_selections = self.deer_id_filter_combo.get_checked_data()
+        self.deer_id_filter_combo._updating = True
         self.deer_id_filter_combo.clear()
-        self.deer_id_filter_combo.addItem("All Deer IDs", "")
+        self.deer_id_filter_combo.add_item("All Deer IDs", "", checked=True)
+        self.deer_id_filter_combo.set_all_text("All Deer IDs")
         try:
             context_photos = self._get_context_filtered_photos(exclude_filter='deer_id')
             id_counts = {}
@@ -6661,31 +6841,32 @@ class TrainerWindow(QMainWindow):
                     id_counts[deer_id] = id_counts.get(deer_id, 0) + 1
                 else:
                     no_id_count += 1
-            # Only add options with photos in current context
             if has_id_count > 0:
-                self.deer_id_filter_combo.addItem(f"Has ID ({has_id_count})", "__has_id__")
+                self.deer_id_filter_combo.add_item(f"Has ID ({has_id_count})", "__has_id__", checked=True)
             if no_id_count > 0:
-                self.deer_id_filter_combo.addItem(f"No ID ({no_id_count})", "__no_id__")
+                self.deer_id_filter_combo.add_item(f"No ID ({no_id_count})", "__no_id__", checked=True)
             for did in sorted(id_counts.keys()):
-                self.deer_id_filter_combo.addItem(f"{did} ({id_counts[did]})", did)
+                self.deer_id_filter_combo.add_item(f"{did} ({id_counts[did]})", did, checked=True)
         except Exception:
-            self.deer_id_filter_combo.addItem("Has ID", "__has_id__")
-            self.deer_id_filter_combo.addItem("No ID", "__no_id__")
-        idx = self.deer_id_filter_combo.findData(current)
-        self.deer_id_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
-        self.deer_id_filter_combo.blockSignals(False)
+            self.deer_id_filter_combo.add_item("Has ID", "__has_id__", checked=True)
+            self.deer_id_filter_combo.add_item("No ID", "__no_id__", checked=True)
+        if had_items:
+            self.deer_id_filter_combo.set_checked_data(current_selections)
+        self.deer_id_filter_combo._updating = False
+        self.deer_id_filter_combo._update_display()
 
     def _populate_site_filter_options(self):
         """Fill the site filter combo with locations (contextual to other filters)."""
         if not hasattr(self, "site_filter_combo"):
             return
-        current = self.site_filter_combo.currentData()
-        self.site_filter_combo.blockSignals(True)
+        had_items = self.site_filter_combo._model.rowCount() > 0
+        current_selections = self.site_filter_combo.get_checked_data()
+        self.site_filter_combo._updating = True
         self.site_filter_combo.clear()
-        self.site_filter_combo.addItem("All locations", None)
+        self.site_filter_combo.add_item("All Locations", "", checked=True)
+        self.site_filter_combo.set_all_text("All Locations")
         try:
             context_photos = self._get_context_filtered_photos(exclude_filter='site')
-            # Count photos by camera_location
             location_counts = {}
             unassigned_count = 0
             for photo in context_photos:
@@ -6695,31 +6876,30 @@ class TrainerWindow(QMainWindow):
                     location_counts[loc] = location_counts.get(loc, 0) + 1
                 else:
                     unassigned_count += 1
-            # Add unassigned first if any
             if unassigned_count > 0:
-                self.site_filter_combo.addItem(f"Unassigned ({unassigned_count})", "__unassigned__")
-            # Add sorted locations with counts
+                self.site_filter_combo.add_item(f"Unassigned ({unassigned_count})", "__unassigned__", checked=True)
             for loc in sorted(location_counts.keys()):
                 count = location_counts[loc]
-                label = f"{loc} ({count})"
-                self.site_filter_combo.addItem(label, loc)
+                self.site_filter_combo.add_item(f"{loc} ({count})", loc, checked=True)
         except Exception:
-            self.site_filter_combo.addItem("Unassigned", "__unassigned__")
-        idx = self.site_filter_combo.findData(current)
-        self.site_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
-        self.site_filter_combo.blockSignals(False)
+            self.site_filter_combo.add_item("Unassigned", "__unassigned__", checked=True)
+        if had_items:
+            self.site_filter_combo.set_checked_data(current_selections)
+        self.site_filter_combo._updating = False
+        self.site_filter_combo._update_display()
 
     def _populate_year_filter_options(self):
         """Fill the year filter combo with years (contextual to other filters)."""
         if not hasattr(self, "year_filter_combo"):
             return
-        current = self.year_filter_combo.currentData()
-        self.year_filter_combo.blockSignals(True)
+        had_items = self.year_filter_combo._model.rowCount() > 0
+        current_selections = self.year_filter_combo.get_checked_data()
+        self.year_filter_combo._updating = True
         self.year_filter_combo.clear()
-        self.year_filter_combo.addItem("All Years", None)
+        self.year_filter_combo.add_item("All Years", "", checked=True)
+        self.year_filter_combo.set_all_text("All Years")
         try:
             context_photos = self._get_context_filtered_photos(exclude_filter='year')
-            # Count photos by antler year
             year_counts = {}
             for photo in context_photos:
                 date_taken = photo.get("date_taken")
@@ -6727,28 +6907,29 @@ class TrainerWindow(QMainWindow):
                     season_year = TrailCamDatabase.compute_season_year(date_taken)
                     if season_year:
                         year_counts[season_year] = year_counts.get(season_year, 0) + 1
-            # Add sorted years (newest first) with counts and display format
             for year in sorted(year_counts.keys(), reverse=True):
                 count = year_counts[year]
                 label = f"{year}-{year + 1} ({count})"
-                self.year_filter_combo.addItem(label, year)
+                self.year_filter_combo.add_item(label, year, checked=True)
         except Exception:
             pass
-        idx = self.year_filter_combo.findData(current)
-        self.year_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
-        self.year_filter_combo.blockSignals(False)
+        if had_items:
+            self.year_filter_combo.set_checked_data(current_selections)
+        self.year_filter_combo._updating = False
+        self.year_filter_combo._update_display()
 
     def _populate_collection_filter_options(self):
         """Fill the collection filter combo (contextual to other filters)."""
         if not hasattr(self, "collection_filter_combo"):
             return
-        current = self.collection_filter_combo.currentData()
-        self.collection_filter_combo.blockSignals(True)
+        had_items = self.collection_filter_combo._model.rowCount() > 0
+        current_selections = self.collection_filter_combo.get_checked_data()
+        self.collection_filter_combo._updating = True
         self.collection_filter_combo.clear()
-        self.collection_filter_combo.addItem("All Collections", None)
+        self.collection_filter_combo.add_item("All Collections", "", checked=True)
+        self.collection_filter_combo.set_all_text("All Collections")
         try:
             context_photos = self._get_context_filtered_photos(exclude_filter='collection')
-            # Count photos by collection
             collection_counts = {}
             unassigned_count = 0
             for photo in context_photos:
@@ -6757,17 +6938,16 @@ class TrainerWindow(QMainWindow):
                     collection_counts[coll] = collection_counts.get(coll, 0) + 1
                 else:
                     unassigned_count += 1
-            # Add collections sorted by count (descending)
             for coll, count in sorted(collection_counts.items(), key=lambda x: -x[1]):
-                self.collection_filter_combo.addItem(f"{coll} ({count})", coll)
-            # Add unassigned option
+                self.collection_filter_combo.add_item(f"{coll} ({count})", coll, checked=True)
             if unassigned_count > 0:
-                self.collection_filter_combo.addItem(f"Unassigned ({unassigned_count})", "__unassigned__")
+                self.collection_filter_combo.add_item(f"Unassigned ({unassigned_count})", "__unassigned__", checked=True)
         except Exception:
             pass
-        idx = self.collection_filter_combo.findData(current)
-        self.collection_filter_combo.setCurrentIndex(idx if idx != -1 else 0)
-        self.collection_filter_combo.blockSignals(False)
+        if had_items:
+            self.collection_filter_combo.set_checked_data(current_selections)
+        self.collection_filter_combo._updating = False
+        self.collection_filter_combo._update_display()
 
     def _filtered_photos(self):
         """Apply all filters to in-memory photo list."""
@@ -6819,11 +6999,21 @@ class TrainerWindow(QMainWindow):
                     needs_tags = True
 
         if hasattr(self, "sex_filter_combo"):
-            if self.sex_filter_combo.currentData():
+            if hasattr(self.sex_filter_combo, 'get_checked_data'):
+                sel = self.sex_filter_combo.get_checked_data()
+                tot = self.sex_filter_combo._model.rowCount() - 1 if hasattr(self.sex_filter_combo, '_model') else 0
+                if sel and len(sel) < tot:
+                    needs_tags = True
+            elif self.sex_filter_combo.currentData():
                 needs_tags = True
 
         if hasattr(self, "deer_id_filter_combo"):
-            if self.deer_id_filter_combo.currentData():
+            if hasattr(self.deer_id_filter_combo, 'get_checked_data'):
+                sel = self.deer_id_filter_combo.get_checked_data()
+                tot = self.deer_id_filter_combo._model.rowCount() - 1 if hasattr(self.deer_id_filter_combo, '_model') else 0
+                if sel and len(sel) < tot:
+                    needs_deer = True
+            elif self.deer_id_filter_combo.currentData():
                 needs_deer = True
 
         if sort_key == "species":
@@ -6875,11 +7065,23 @@ class TrainerWindow(QMainWindow):
                             filtered.append((idx, p))
                     result = filtered
 
-        # Apply sex filter
-        if hasattr(self, "sex_filter_combo"):
-            sex_flt = self.sex_filter_combo.currentData()
-            if sex_flt:
+        # Apply sex filter (multi-select)
+        if hasattr(self, "sex_filter_combo") and hasattr(self.sex_filter_combo, 'get_checked_data'):
+            selected_sex = self.sex_filter_combo.get_checked_data()
+            total_sex = self.sex_filter_combo._model.rowCount() - 1 if hasattr(self.sex_filter_combo, '_model') else 0
+            if selected_sex and len(selected_sex) < total_sex:
                 filtered = []
+                selected_set = set(selected_sex)
+                need_box_check = "Unknown" in selected_set or "Unexamined" in selected_set
+                # Batch-load box sex for deer photos without Buck/Doe tags
+                sex_map = {}
+                if need_box_check:
+                    deer_no_sex_ids = [p["id"] for _, p in result
+                                       if "Deer" in set(tags_map.get(p["id"], []))
+                                       and "Buck" not in set(tags_map.get(p["id"], []))
+                                       and "Doe" not in set(tags_map.get(p["id"], []))]
+                    if deer_no_sex_ids:
+                        sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
                 for idx, p in result:
                     tags = set(tags_map.get(p["id"], []))
                     photo_sex = ""
@@ -6887,27 +7089,31 @@ class TrainerWindow(QMainWindow):
                         photo_sex = "Buck"
                     elif "Doe" in tags:
                         photo_sex = "Doe"
-                    elif "Unknown" in tags:
-                        photo_sex = "Unknown"
-                    if photo_sex == sex_flt:
+                    elif "Deer" in tags and need_box_check:
+                        box_sex = sex_map.get(p["id"])
+                        photo_sex = "Unknown" if box_sex == "Unknown" else "Unexamined"
+                    if photo_sex in selected_set:
                         filtered.append((idx, p))
                 result = filtered
 
-        # Apply deer ID filter
-        if hasattr(self, "deer_id_filter_combo"):
-            deer_flt = self.deer_id_filter_combo.currentData()
-            if deer_flt:
+        # Apply deer ID filter (multi-select)
+        if hasattr(self, "deer_id_filter_combo") and hasattr(self.deer_id_filter_combo, 'get_checked_data'):
+            selected_ids = self.deer_id_filter_combo.get_checked_data()
+            total_ids = self.deer_id_filter_combo._model.rowCount() - 1 if hasattr(self.deer_id_filter_combo, '_model') else 0
+            if selected_ids and len(selected_ids) < total_ids:
                 filtered = []
+                selected_set = set(selected_ids)
+                has_id_selected = "__has_id__" in selected_set
+                no_id_selected = "__no_id__" in selected_set
+                specific_ids = selected_set - {"__has_id__", "__no_id__", ""}
                 for idx, p in result:
                     meta = deer_map.get(p["id"], {})
                     deer_id = meta.get("deer_id") or ""
-                    if deer_flt == "__has_id__":
-                        if deer_id:
-                            filtered.append((idx, p))
-                    elif deer_flt == "__no_id__":
-                        if not deer_id:
-                            filtered.append((idx, p))
-                    elif deer_id == deer_flt:
+                    if deer_id and deer_id in specific_ids:
+                        filtered.append((idx, p))
+                    elif deer_id and has_id_selected and deer_id not in specific_ids:
+                        filtered.append((idx, p))
+                    elif not deer_id and no_id_selected:
                         filtered.append((idx, p))
                 result = filtered
 
@@ -6925,47 +7131,49 @@ class TrainerWindow(QMainWindow):
                         filtered.append((idx, p))
                 result = filtered
 
-        # Apply site filter (check camera_location field)
-        if hasattr(self, "site_filter_combo"):
-            site_flt = self.site_filter_combo.currentData()
-            if site_flt is not None:
+        # Apply site filter (multi-select)
+        if hasattr(self, "site_filter_combo") and hasattr(self.site_filter_combo, 'get_checked_data'):
+            selected_sites = self.site_filter_combo.get_checked_data()
+            total_sites = self.site_filter_combo._model.rowCount() - 1 if hasattr(self.site_filter_combo, '_model') else 0
+            if selected_sites and len(selected_sites) < total_sites:
                 filtered = []
+                selected_set = set(selected_sites)
                 for idx, p in result:
                     camera_loc = p.get("camera_location")
                     camera_loc = camera_loc.strip() if camera_loc else None
-                    if site_flt == "__unassigned__":
-                        # Unassigned = no camera_location set
-                        if not camera_loc:
-                            filtered.append((idx, p))
-                    elif camera_loc == site_flt:
-                        # Match camera_location string
+                    if "__unassigned__" in selected_set and not camera_loc:
+                        filtered.append((idx, p))
+                    elif camera_loc and camera_loc in selected_set:
                         filtered.append((idx, p))
                 result = filtered
 
-        # Apply year filter (antler year: May-April)
-        if hasattr(self, "year_filter_combo"):
-            year_flt = self.year_filter_combo.currentData()
-            if year_flt is not None:
+        # Apply year filter (multi-select, antler year: May-April)
+        if hasattr(self, "year_filter_combo") and hasattr(self.year_filter_combo, 'get_checked_data'):
+            selected_years = self.year_filter_combo.get_checked_data()
+            total_years = self.year_filter_combo._model.rowCount() - 1 if hasattr(self.year_filter_combo, '_model') else 0
+            if selected_years and len(selected_years) < total_years:
                 filtered = []
+                selected_set = set(selected_years)
                 for idx, p in result:
                     date_taken = p.get("date_taken")
                     if date_taken:
                         season_year = TrailCamDatabase.compute_season_year(date_taken)
-                        if season_year == year_flt:
+                        if season_year in selected_set:
                             filtered.append((idx, p))
                 result = filtered
 
-        # Apply collection filter
-        if hasattr(self, "collection_filter_combo"):
-            coll_flt = self.collection_filter_combo.currentData()
-            if coll_flt is not None:
+        # Apply collection filter (multi-select)
+        if hasattr(self, "collection_filter_combo") and hasattr(self.collection_filter_combo, 'get_checked_data'):
+            selected_colls = self.collection_filter_combo.get_checked_data()
+            total_colls = self.collection_filter_combo._model.rowCount() - 1 if hasattr(self.collection_filter_combo, '_model') else 0
+            if selected_colls and len(selected_colls) < total_colls:
                 filtered = []
+                selected_set = set(selected_colls)
                 for idx, p in result:
                     photo_coll = p.get("collection") or ""
-                    if coll_flt == "__unassigned__":
-                        if not photo_coll:
-                            filtered.append((idx, p))
-                    elif photo_coll == coll_flt:
+                    if "__unassigned__" in selected_set and not photo_coll:
+                        filtered.append((idx, p))
+                    elif photo_coll and photo_coll in selected_set:
                         filtered.append((idx, p))
                 result = filtered
 
@@ -7036,11 +7244,21 @@ class TrainerWindow(QMainWindow):
                     needs_tags = True
 
         if exclude_filter != 'sex' and hasattr(self, "sex_filter_combo"):
-            if self.sex_filter_combo.currentData():
+            if hasattr(self.sex_filter_combo, 'get_checked_data'):
+                sel = self.sex_filter_combo.get_checked_data()
+                tot = self.sex_filter_combo._model.rowCount() - 1 if hasattr(self.sex_filter_combo, '_model') else 0
+                if sel and len(sel) < tot:
+                    needs_tags = True
+            elif self.sex_filter_combo.currentData():
                 needs_tags = True
 
         if exclude_filter != 'deer_id' and hasattr(self, "deer_id_filter_combo"):
-            if self.deer_id_filter_combo.currentData():
+            if hasattr(self.deer_id_filter_combo, 'get_checked_data'):
+                sel = self.deer_id_filter_combo.get_checked_data()
+                tot = self.deer_id_filter_combo._model.rowCount() - 1 if hasattr(self.deer_id_filter_combo, '_model') else 0
+                if sel and len(sel) < tot:
+                    needs_deer = True
+            elif self.deer_id_filter_combo.currentData():
                 needs_deer = True
 
         tags_map = {}
@@ -7082,11 +7300,23 @@ class TrainerWindow(QMainWindow):
                             filtered.append(p)
                     result = filtered
 
-        # Apply sex filter
-        if exclude_filter != 'sex' and hasattr(self, "sex_filter_combo"):
-            sex_flt = self.sex_filter_combo.currentData()
-            if sex_flt:
+        # Apply sex filter (multi-select)
+        if exclude_filter != 'sex' and hasattr(self, "sex_filter_combo") and hasattr(self.sex_filter_combo, 'get_checked_data'):
+            selected_sex = self.sex_filter_combo.get_checked_data()
+            total_sex = self.sex_filter_combo._model.rowCount() - 1 if hasattr(self.sex_filter_combo, '_model') else 0
+            if selected_sex and len(selected_sex) < total_sex:
                 filtered = []
+                selected_set = set(selected_sex)
+                need_box_check = "Unknown" in selected_set or "Unexamined" in selected_set
+                # Batch-load box sex for deer photos without Buck/Doe tags
+                sex_map = {}
+                if need_box_check:
+                    deer_no_sex_ids = [p["id"] for p in result
+                                       if "Deer" in set(tags_map.get(p["id"], []))
+                                       and "Buck" not in set(tags_map.get(p["id"], []))
+                                       and "Doe" not in set(tags_map.get(p["id"], []))]
+                    if deer_no_sex_ids:
+                        sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
                 for p in result:
                     tags = set(tags_map.get(p["id"], []))
                     photo_sex = ""
@@ -7094,27 +7324,31 @@ class TrainerWindow(QMainWindow):
                         photo_sex = "Buck"
                     elif "Doe" in tags:
                         photo_sex = "Doe"
-                    elif "Unknown" in tags:
-                        photo_sex = "Unknown"
-                    if photo_sex == sex_flt:
+                    elif "Deer" in tags and need_box_check:
+                        box_sex = sex_map.get(p["id"])
+                        photo_sex = "Unknown" if box_sex == "Unknown" else "Unexamined"
+                    if photo_sex in selected_set:
                         filtered.append(p)
                 result = filtered
 
-        # Apply deer ID filter
-        if exclude_filter != 'deer_id' and hasattr(self, "deer_id_filter_combo"):
-            deer_flt = self.deer_id_filter_combo.currentData()
-            if deer_flt:
+        # Apply deer ID filter (multi-select)
+        if exclude_filter != 'deer_id' and hasattr(self, "deer_id_filter_combo") and hasattr(self.deer_id_filter_combo, 'get_checked_data'):
+            selected_ids = self.deer_id_filter_combo.get_checked_data()
+            total_ids = self.deer_id_filter_combo._model.rowCount() - 1 if hasattr(self.deer_id_filter_combo, '_model') else 0
+            if selected_ids and len(selected_ids) < total_ids:
                 filtered = []
+                selected_set = set(selected_ids)
+                has_id_selected = "__has_id__" in selected_set
+                no_id_selected = "__no_id__" in selected_set
+                specific_ids = selected_set - {"__has_id__", "__no_id__", ""}
                 for p in result:
                     meta = deer_map.get(p["id"], {})
                     deer_id = meta.get("deer_id") or ""
-                    if deer_flt == "__has_id__":
-                        if deer_id:
-                            filtered.append(p)
-                    elif deer_flt == "__no_id__":
-                        if not deer_id:
-                            filtered.append(p)
-                    elif deer_id == deer_flt:
+                    if deer_id and deer_id in specific_ids:
+                        filtered.append(p)
+                    elif deer_id and has_id_selected and deer_id not in specific_ids:
+                        filtered.append(p)
+                    elif not deer_id and no_id_selected:
                         filtered.append(p)
                 result = filtered
 
@@ -7132,45 +7366,49 @@ class TrainerWindow(QMainWindow):
                         filtered.append(p)
                 result = filtered
 
-        # Apply site filter
-        if exclude_filter != 'site' and hasattr(self, "site_filter_combo"):
-            site_flt = self.site_filter_combo.currentData()
-            if site_flt is not None:
+        # Apply site filter (multi-select)
+        if exclude_filter != 'site' and hasattr(self, "site_filter_combo") and hasattr(self.site_filter_combo, 'get_checked_data'):
+            selected_sites = self.site_filter_combo.get_checked_data()
+            total_sites = self.site_filter_combo._model.rowCount() - 1 if hasattr(self.site_filter_combo, '_model') else 0
+            if selected_sites and len(selected_sites) < total_sites:
                 filtered = []
+                selected_set = set(selected_sites)
                 for p in result:
                     camera_loc = p.get("camera_location")
                     camera_loc = camera_loc.strip() if camera_loc else None
-                    if site_flt == "__unassigned__":
-                        if not camera_loc:
-                            filtered.append(p)
-                    elif camera_loc == site_flt:
+                    if "__unassigned__" in selected_set and not camera_loc:
+                        filtered.append(p)
+                    elif camera_loc and camera_loc in selected_set:
                         filtered.append(p)
                 result = filtered
 
-        # Apply year filter
-        if exclude_filter != 'year' and hasattr(self, "year_filter_combo"):
-            year_flt = self.year_filter_combo.currentData()
-            if year_flt is not None:
+        # Apply year filter (multi-select)
+        if exclude_filter != 'year' and hasattr(self, "year_filter_combo") and hasattr(self.year_filter_combo, 'get_checked_data'):
+            selected_years = self.year_filter_combo.get_checked_data()
+            total_years = self.year_filter_combo._model.rowCount() - 1 if hasattr(self.year_filter_combo, '_model') else 0
+            if selected_years and len(selected_years) < total_years:
                 filtered = []
+                selected_set = set(selected_years)
                 for p in result:
                     date_taken = p.get("date_taken")
                     if date_taken:
                         season_year = TrailCamDatabase.compute_season_year(date_taken)
-                        if season_year == year_flt:
+                        if season_year in selected_set:
                             filtered.append(p)
                 result = filtered
 
-        # Apply collection filter
-        if exclude_filter != 'collection' and hasattr(self, "collection_filter_combo"):
-            coll_flt = self.collection_filter_combo.currentData()
-            if coll_flt is not None:
+        # Apply collection filter (multi-select)
+        if exclude_filter != 'collection' and hasattr(self, "collection_filter_combo") and hasattr(self.collection_filter_combo, 'get_checked_data'):
+            selected_colls = self.collection_filter_combo.get_checked_data()
+            total_colls = self.collection_filter_combo._model.rowCount() - 1 if hasattr(self.collection_filter_combo, '_model') else 0
+            if selected_colls and len(selected_colls) < total_colls:
                 filtered = []
+                selected_set = set(selected_colls)
                 for p in result:
                     photo_coll = p.get("collection") or ""
-                    if coll_flt == "__unassigned__":
-                        if not photo_coll:
-                            filtered.append(p)
-                    elif photo_coll == coll_flt:
+                    if "__unassigned__" in selected_set and not photo_coll:
+                        filtered.append(p)
+                    elif photo_coll and photo_coll in selected_set:
                         filtered.append(p)
                 result = filtered
 
@@ -7235,7 +7473,7 @@ class TrainerWindow(QMainWindow):
         if deer_id:
             if not self.species_combo.currentText().strip():
                 self.species_combo.setCurrentText("Deer")
-            if self._get_sex() == "Unknown":
+            if self._get_sex() == "Unexamined":
                 self._set_sex("Buck")
 
     def _populate_photo_list(self):
@@ -7259,7 +7497,7 @@ class TrainerWindow(QMainWindow):
         # UNLESS we're navigating to a specific photo (e.g., from Properties button)
         jumped = False
         if filtered_indices and self.index not in filtered_indices:
-            if not getattr(self, '_navigating_to_specific_photo', False):
+            if not getattr(self, '_navigating_to_specific_photo', False) and not getattr(self, '_preserve_index_on_filter_miss', False):
                 self.index = filtered_indices[0]
                 jumped = True
 
@@ -7289,7 +7527,7 @@ class TrainerWindow(QMainWindow):
             target_item.setSelected(True)
             self.photo_list_widget.scrollToItem(target_item)
             self.photo_list_widget.setFocus()
-        elif self.photo_list_widget.count() > 0:
+        elif self.photo_list_widget.count() > 0 and not getattr(self, '_preserve_index_on_filter_miss', False):
             first_item = self.photo_list_widget.item(0)
             self.photo_list_widget.setCurrentItem(first_item)
             first_item.setSelected(True)
@@ -7301,11 +7539,17 @@ class TrainerWindow(QMainWindow):
         # Load photo if we jumped to a different one (but not during init)
         if jumped and filtered_indices and hasattr(self, 'preview_layout'):
             self.load_photo()
+        # One-shot flag reset
+        if getattr(self, '_preserve_index_on_filter_miss', False):
+            self._preserve_index_on_filter_miss = False
 
     def on_photo_selection_changed(self):
         """Load the first selected photo; keep selection aligned."""
         # Guard against calls during init before UI is fully built
         if not hasattr(self, 'preview_layout'):
+            return
+        # Don't interfere with programmatic navigation (next_photo/prev_photo)
+        if getattr(self, '_navigating', False):
             return
         selected = self.photo_list_widget.selectedItems()
         if not selected:
@@ -7313,10 +7557,11 @@ class TrainerWindow(QMainWindow):
         idx = selected[0].data(Qt.ItemDataRole.UserRole)
         if idx is None:
             return
-        # Save pending changes before switching photos
+        # Always save current photo before switching — not just when timer is pending
+        self._save_current_box_data()
         if self.save_timer.isActive():
             self.save_timer.stop()
-            self.save_current()
+        self.save_current()
         self.index = idx
         self.load_photo()
 
@@ -7495,6 +7740,202 @@ class TrainerWindow(QMainWindow):
                 self.db.unarchive_photo(pid)
                 photo["archived"] = 0
                 self._populate_photo_list()
+
+    # ── Bulk Archive by Species ──
+
+    def _compute_bulk_archive_candidates(self, selected_species: set, does_only: bool):
+        """Return (to_archive, skipped_multi, skipped_fav) photo ID lists."""
+        to_archive = []
+        skipped_multi = []
+        skipped_fav = []
+
+        active_photos = [p for p in self.photos if not p.get("archived")]
+        photo_ids = [p["id"] for p in active_photos if p.get("id")]
+        tags_map = self.db.get_all_tags_batch(photo_ids)
+
+        for p in active_photos:
+            pid = p.get("id")
+            if not pid:
+                continue
+            tags = set(tags_map.get(pid, []))
+            species_tags = tags & VALID_SPECIES
+
+            if not species_tags:
+                continue
+
+            if not species_tags.issubset(selected_species):
+                if species_tags & selected_species:
+                    skipped_multi.append(pid)
+                continue
+
+            if does_only and "Deer" in species_tags:
+                if "Buck" in tags or "Doe" not in tags:
+                    continue
+
+            if p.get("favorite"):
+                skipped_fav.append(pid)
+                continue
+
+            to_archive.append(pid)
+
+        return to_archive, skipped_multi, skipped_fav
+
+    def _bulk_archive_dialog(self):
+        """Open dialog to bulk-archive photos by species selection."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Bulk Archive by Species")
+        dlg.setMinimumWidth(420)
+        layout = QVBoxLayout(dlg)
+
+        # Instructions
+        info = QLabel(
+            "Select species to archive. Only photos containing\n"
+            "exclusively the selected species will be archived.\n"
+            "Photos with additional species are kept safe."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Get species counts for active photos
+        active_photos = [p for p in self.photos if not p.get("archived")]
+        photo_ids = [p["id"] for p in active_photos if p.get("id")]
+        tags_map = self.db.get_all_tags_batch(photo_ids)
+        species_counts = {}
+        for pid in photo_ids:
+            tags = set(tags_map.get(pid, []))
+            for sp in tags & VALID_SPECIES:
+                species_counts[sp] = species_counts.get(sp, 0) + 1
+
+        # Species checkboxes in 2-column grid
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        grid = QGridLayout(scroll_widget)
+        grid.setSpacing(4)
+
+        checkboxes = {}
+        sorted_species = sorted(species_counts.keys())
+        for i, sp in enumerate(sorted_species):
+            cb = QCheckBox(f"{sp} ({species_counts[sp]})")
+            cb.setProperty("species", sp)
+            checkboxes[sp] = cb
+            grid.addWidget(cb, i // 2, i % 2)
+
+        scroll.setWidget(scroll_widget)
+        scroll.setMaximumHeight(250)
+        layout.addWidget(scroll)
+
+        # Does-only checkbox
+        does_only_cb = QCheckBox("Does only (exclude any Buck photos)")
+        does_only_cb.setEnabled("Deer" in checkboxes)
+        layout.addWidget(does_only_cb)
+
+        # Preview labels
+        layout.addSpacing(8)
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(line)
+
+        preview_label = QLabel("Select species above to see preview.")
+        preview_label.setWordWrap(True)
+        layout.addWidget(preview_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        preview_btn = QPushButton("Preview List")
+        preview_btn.setEnabled(False)
+        archive_btn = QPushButton("Archive")
+        archive_btn.setEnabled(False)
+        cancel_btn = QPushButton("Cancel")
+        btn_layout.addWidget(preview_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(archive_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        cancel_btn.clicked.connect(dlg.reject)
+
+        # State
+        candidates = {"to_archive": [], "skipped_multi": [], "skipped_fav": []}
+
+        def update_preview():
+            selected = {sp for sp, cb in checkboxes.items() if cb.isChecked()}
+            does_only_cb.setEnabled("Deer" in selected)
+            if "Deer" not in selected:
+                does_only_cb.setChecked(False)
+            if not selected:
+                preview_label.setText("Select species above to see preview.")
+                archive_btn.setEnabled(False)
+                preview_btn.setEnabled(False)
+                return
+            to_archive, skipped_multi, skipped_fav = self._compute_bulk_archive_candidates(
+                selected, does_only_cb.isChecked()
+            )
+            candidates["to_archive"] = to_archive
+            candidates["skipped_multi"] = skipped_multi
+            candidates["skipped_fav"] = skipped_fav
+
+            parts = [f"{len(to_archive)} photos will be archived"]
+            if skipped_multi:
+                parts.append(f"{len(skipped_multi)} skipped (have other species)")
+            if skipped_fav:
+                parts.append(f"{len(skipped_fav)} skipped (favorites)")
+            preview_label.setText("\n".join(parts))
+            archive_btn.setEnabled(len(to_archive) > 0)
+            preview_btn.setEnabled(len(to_archive) > 0)
+
+        for cb in checkboxes.values():
+            cb.toggled.connect(update_preview)
+        does_only_cb.toggled.connect(update_preview)
+
+        def show_preview():
+            ids = candidates["to_archive"]
+            if not ids:
+                return
+            id_set = set(ids)
+            lines = []
+            for p in self.photos:
+                if p.get("id") in id_set:
+                    fname = os.path.basename(p.get("file_path", "?"))
+                    date = (p.get("date_taken") or "")[:10]
+                    tags = ", ".join(tags_map.get(p["id"], []))
+                    lines.append(f"{date}  {fname}  [{tags}]")
+            preview_dlg = QDialog(dlg)
+            preview_dlg.setWindowTitle(f"Preview: {len(lines)} photos to archive")
+            preview_dlg.setMinimumSize(500, 400)
+            pl = QVBoxLayout(preview_dlg)
+            text = QTextEdit()
+            text.setReadOnly(True)
+            text.setPlainText("\n".join(lines))
+            pl.addWidget(text)
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(preview_dlg.accept)
+            pl.addWidget(close_btn)
+            preview_dlg.exec()
+
+        preview_btn.clicked.connect(show_preview)
+
+        def do_archive():
+            ids = candidates["to_archive"]
+            if not ids:
+                return
+            self.db.archive_photos(ids)
+            id_set = set(ids)
+            archived = 0
+            for p in self.photos:
+                if p.get("id") in id_set and not p.get("favorite"):
+                    p["archived"] = 1
+                    archived += 1
+            self._populate_photo_list()
+            dlg.accept()
+            QMessageBox.information(
+                self, "Bulk Archive",
+                f"Archived {archived} photos.\nThey can be restored from the Archive filter."
+            )
+
+        archive_btn.clicked.connect(do_archive)
+
+        dlg.exec()
 
     def _select_range(self, start: int, end: int):
         if self.photo_list_widget.count() == 0:
@@ -9980,19 +10421,15 @@ class TrainerWindow(QMainWindow):
                 break
 
         if not found:
-            # Photo not in current filter - try loading with all photos
-            self.collection_filter_combo.blockSignals(True)
-            self.collection_filter_combo.setCurrentText("All Collections")
-            self.collection_filter_combo.blockSignals(False)
+            # Photo not in current filter - reset all multi-select filters
+            for combo in [self.species_filter_combo, self.sex_filter_combo,
+                          self.deer_id_filter_combo, self.site_filter_combo,
+                          self.year_filter_combo, self.collection_filter_combo]:
+                if hasattr(combo, 'select_all'):
+                    combo.select_all()
             self.archive_filter_combo.blockSignals(True)
             self.archive_filter_combo.setCurrentText("All Photos")
             self.archive_filter_combo.blockSignals(False)
-            if hasattr(self.species_filter_combo, 'select_all'):
-                self.species_filter_combo.select_all()
-            else:
-                self.species_filter_combo.blockSignals(True)
-                self.species_filter_combo.setCurrentText("All Species")
-                self.species_filter_combo.blockSignals(False)
             self._populate_photo_list()
 
             for i, p in enumerate(self.photos):
@@ -13906,12 +14343,12 @@ class TrainerWindow(QMainWindow):
             if not self.species_combo.currentText().strip():
                 self.species_combo.setCurrentText("Deer")
             self.species_combo.blockSignals(False)
-            if self._get_sex() == "Unknown":
+            if self._get_sex() == "Unexamined":
                 self._set_sex("Buck")
         else:
-            # If cleared back to unknown, default species to Deer
+            # If cleared back to unexamined, default species to Deer
             self.species_combo.blockSignals(True)
-            if self._get_sex() == "Unknown" and not self.species_combo.currentText().strip():
+            if self._get_sex() in ("Unknown", "Unexamined") and not self.species_combo.currentText().strip():
                 self.species_combo.setCurrentText("Deer")
             self.species_combo.blockSignals(False)
         # Autosave when user has typed at least 3 chars (avoid saving partial IDs), OR when field is cleared
@@ -14034,6 +14471,9 @@ class TrainerWindow(QMainWindow):
             return
         species = btn.text()
 
+        # Stop any pending debounced save (we'll save immediately)
+        self.save_timer.stop()
+
         # Update the current box's species directly
         if hasattr(self, "current_boxes") and self.current_boxes:
             if self.current_box_index < len(self.current_boxes):
@@ -14044,6 +14484,9 @@ class TrainerWindow(QMainWindow):
         self.species_combo.blockSignals(True)
         self.species_combo.setCurrentText(species)
         self.species_combo.blockSignals(False)
+
+        # Prevent jump-to-top if this label causes photo to fall out of current filter
+        self._preserve_index_on_filter_miss = True
 
         # Save immediately
         self.save_current()
@@ -14203,6 +14646,28 @@ class TrainerWindow(QMainWindow):
         if self.photos:
             self.index = 0
             self.load_photo()
+
+    def _on_uncat_buck_clicked(self):
+        """Set deer ID to 'Uncategorized {Size} {YY}' based on photo season (April 1 break)."""
+        btn = self.sender()
+        if not btn:
+            return
+        size_label = btn.property("uncat_size")
+        # Determine season year from current photo date (April 1 break)
+        photo = self._current_photo()
+        yy = "25"  # fallback
+        if photo and photo.get("date_taken"):
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(photo["date_taken"].replace("Z", "+00:00"))
+                season_year = dt.year if dt.month >= 4 else dt.year - 1
+                yy = f"{season_year % 100:02d}"
+            except Exception:
+                pass
+        deer_id = f"Uncategorized {size_label} {yy}"
+        self.deer_id_edit.setCurrentText(deer_id)
+        self._apply_buck_profile_to_ui()
+        self._bump_recent_buck(deer_id)
 
     def _on_quick_buck_clicked(self):
         btn = self.sender()
@@ -15666,6 +16131,66 @@ class TrainerWindow(QMainWindow):
         reader = StampReader(self.db, self)
         reader.exec()
 
+    def _open_deer_migration_review(self):
+        """Open dialog to review deer ID assignments for multi-box photos."""
+        import json
+        from pathlib import Path
+
+        queue_path = Path.home() / ".trailcam" / "deer_id_migration_queue.json"
+        if not queue_path.exists():
+            QMessageBox.information(self, "Deer ID Review", "No photos need review.")
+            return
+
+        queue = json.loads(queue_path.read_text())
+        if not queue:
+            QMessageBox.information(self, "Deer ID Review", "No photos need review.")
+            queue_path.unlink(missing_ok=True)
+            return
+
+        # Navigate to first photo in queue for manual assignment
+        first = queue[0]
+        photo_id = first.get("photo_id")
+        deer_id = first.get("deer_id", "")
+        reason = first.get("reason", "")
+
+        # Find the photo and navigate to it
+        for i, p in enumerate(self.photos):
+            if p.get("id") == photo_id:
+                self.index = i
+                self.load_photo()
+                QMessageBox.information(
+                    self, "Deer ID Review",
+                    f"Photo has deer ID '{deer_id}' but {reason}.\n\n"
+                    f"Please assign the deer ID to the correct box tab, then click "
+                    f"Tools → Review Deer ID Assignments again for the next photo.\n\n"
+                    f"{len(queue)} photos remaining."
+                )
+                # Remove this entry from queue
+                queue.pop(0)
+                if queue:
+                    queue_path.write_text(json.dumps(queue, indent=2))
+                else:
+                    queue_path.unlink(missing_ok=True)
+                # Update menu item count
+                if self._deer_migration_action:
+                    if queue:
+                        self._deer_migration_action.setText(
+                            f"Review Deer ID Assignments ({len(queue)} photos)...")
+                    else:
+                        self._deer_migration_action.setVisible(False)
+                return
+
+        # Photo not found in current list (may be archived)
+        queue.pop(0)
+        if queue:
+            queue_path.write_text(json.dumps(queue, indent=2))
+            QMessageBox.warning(self, "Deer ID Review",
+                               f"Photo {photo_id} not found (may be archived). Skipping.\n"
+                               f"{len(queue)} photos remaining.")
+        else:
+            queue_path.unlink(missing_ok=True)
+            QMessageBox.information(self, "Deer ID Review", "All photos reviewed!")
+
     def open_buck_profiles_list(self):
         """List all buck profiles and open one."""
         ids = sorted({d for d in self._all_deer_ids() if d})
@@ -15719,29 +16244,8 @@ class TrainerWindow(QMainWindow):
         self.zoom_slider.setValue(percent)
         self.zoom_slider.blockSignals(False)
 
-    def _populate_deer_id_dropdown(self):
-        """Fill deer ID dropdown from existing IDs."""
-        try:
-            ids = set()
-            for photo in self.db.get_all_photos():
-                meta = self.db.get_deer_metadata(photo["id"])
-                if meta.get("deer_id"):
-                    ids.add(meta["deer_id"])
-                for add in self.db.get_additional_deer(photo["id"]):
-                    if add.get("deer_id"):
-                        ids.add(add["deer_id"])
-            sorted_ids = sorted(ids)
-        except Exception:
-            sorted_ids = []
-        current = self.deer_id_edit.currentText() if isinstance(self.deer_id_edit, QComboBox) else ""
-        self.deer_id_edit.blockSignals(True)
-        self.deer_id_edit.clear()
-        self.deer_id_edit.addItem("")
-        for did in sorted_ids:
-            self.deer_id_edit.addItem(did)
-        if current:
-            self.deer_id_edit.setCurrentText(current)
-        self.deer_id_edit.blockSignals(False)
+    # NOTE: _populate_deer_id_dropdown is defined earlier (around line 6578) and includes
+    # box-level deer_ids. This duplicate was removed to avoid shadowing.
 
     # ========== Verification Photo Detection ==========
 
@@ -15860,13 +16364,20 @@ class TrainerWindow(QMainWindow):
             count = len([p for p in all_photos if p.get('collection') == coll])
             collection_combo.addItem(f"{coll} ({count} photos)", coll)
 
-        # Default to current filter if set
+        # Default to current filter if exactly one collection selected
         if hasattr(self, "collection_filter_combo"):
-            current = self.collection_filter_combo.currentData()
-            if current:
-                idx = collection_combo.findData(current)
-                if idx >= 0:
-                    collection_combo.setCurrentIndex(idx)
+            if hasattr(self.collection_filter_combo, 'get_checked_data'):
+                current_selections = self.collection_filter_combo.get_checked_data()
+                if len(current_selections) == 1:
+                    idx = collection_combo.findData(current_selections[0])
+                    if idx >= 0:
+                        collection_combo.setCurrentIndex(idx)
+            else:
+                current = self.collection_filter_combo.currentData()
+                if current:
+                    idx = collection_combo.findData(current)
+                    if idx >= 0:
+                        collection_combo.setCurrentIndex(idx)
 
         layout.addWidget(collection_combo)
         layout.addSpacing(10)
@@ -16163,10 +16674,15 @@ class TrainerWindow(QMainWindow):
                 return
             site_id = item.data(Qt.ItemDataRole.UserRole)
             dlg.accept()
-            # Set site filter and refresh
-            idx = self.site_filter_combo.findData(site_id)
-            if idx >= 0:
-                self.site_filter_combo.setCurrentIndex(idx)
+            # Set site filter to show only the selected site
+            if hasattr(self.site_filter_combo, 'set_checked_data'):
+                self.site_filter_combo.set_checked_data([site_id])
+                self.site_filter_combo._update_display()
+                self.site_filter_combo.selectionChanged.emit()
+            else:
+                idx = self.site_filter_combo.findData(site_id)
+                if idx >= 0:
+                    self.site_filter_combo.setCurrentIndex(idx)
 
         def delete_site():
             item = site_list.currentItem()

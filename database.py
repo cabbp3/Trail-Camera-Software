@@ -683,6 +683,7 @@ class TrailCamDatabase:
         self._ensure_deer_columns()
         self._ensure_box_columns()
         self._ensure_sync_tracking()
+        self._migrate_deer_metadata_to_boxes()
         self._ensure_roles_schema()
 
     def _ensure_photo_columns(self):
@@ -769,6 +770,10 @@ class TrailCamDatabase:
                 add_column(table, "age_class", "age_class TEXT")
             add_column(table, "broken_antler_side", "broken_antler_side TEXT")
             add_column(table, "broken_antler_note", "broken_antler_note TEXT")
+        # Box-level migration tracking columns on deer_metadata
+        add_column("deer_metadata", "deer_id_source", "deer_id_source TEXT")
+        add_column("deer_metadata", "primary_box_id", "primary_box_id INTEGER")
+        add_column("deer_metadata", "migrated_at", "migrated_at TEXT")
         # Buck profile tables: ensure exists
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS buck_profiles (
@@ -856,6 +861,42 @@ class TrailCamDatabase:
         # Tombstone support for soft-delete sync
         if "deleted_at" not in cols:
             cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN deleted_at TEXT")
+        # Per-box deer metadata columns (deer_id is now box-level, not photo-level)
+        if "deer_id" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN deer_id TEXT")
+        if "age_class" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN age_class TEXT")
+        if "left_points_min" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN left_points_min INTEGER")
+        if "right_points_min" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN right_points_min INTEGER")
+        if "left_points_uncertain" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN left_points_uncertain INTEGER DEFAULT 0")
+        if "right_points_uncertain" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN right_points_uncertain INTEGER DEFAULT 0")
+        if "left_ab_points_min" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN left_ab_points_min INTEGER")
+        if "right_ab_points_min" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN right_ab_points_min INTEGER")
+        if "left_ab_points_uncertain" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN left_ab_points_uncertain INTEGER DEFAULT 0")
+        if "right_ab_points_uncertain" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN right_ab_points_uncertain INTEGER DEFAULT 0")
+        if "abnormal_points_min" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN abnormal_points_min INTEGER")
+        if "abnormal_points_max" not in cols:
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN abnormal_points_max INTEGER")
+        # One-time migration: reset old "Unknown" sex defaults to NULL (now means "Unexamined")
+        # Before this change, "Unknown" was the auto-checked default — not a deliberate user choice.
+        # Only runs once: after migration, no boxes should have sex="Unknown" unless user explicitly sets it.
+        cursor.execute("PRAGMA table_info(annotation_boxes)")
+        box_cols = {row[1] for row in cursor.fetchall()}
+        if "sex_migrated_v2" not in box_cols:
+            count = cursor.execute("SELECT COUNT(*) FROM annotation_boxes WHERE sex = 'Unknown'").fetchone()[0]
+            if count > 0:
+                cursor.execute("UPDATE annotation_boxes SET sex = NULL WHERE sex = 'Unknown'")
+                logger.info(f"Migration: reset {count} old 'Unknown' sex defaults to Unexamined (NULL)")
+            cursor.execute("ALTER TABLE annotation_boxes ADD COLUMN sex_migrated_v2 INTEGER DEFAULT 1")
         self.conn.commit()
 
     def _ensure_sync_tracking(self):
@@ -930,6 +971,124 @@ class TrailCamDatabase:
                 END
             """)
 
+        self.conn.commit()
+
+    def _migrate_deer_metadata_to_boxes(self):
+        """One-time migration: copy deer_metadata to annotation_boxes for single-box photos."""
+        import json
+        from pathlib import Path
+
+        cursor = self.conn.cursor()
+
+        # Check if migration already done
+        cursor.execute("PRAGMA table_info(sync_state)")
+        ss_cols = {row[1] for row in cursor.fetchall()}
+        if "deer_box_migration_done" not in ss_cols:
+            cursor.execute("ALTER TABLE sync_state ADD COLUMN deer_box_migration_done INTEGER DEFAULT 0")
+            self.conn.commit()
+
+        cursor.execute("SELECT deer_box_migration_done FROM sync_state WHERE id = 1")
+        row = cursor.fetchone()
+        if row and row[0]:
+            return  # Already migrated
+
+        # Get all photos with deer_metadata that has a deer_id
+        cursor.execute("""
+            SELECT dm.photo_id, dm.deer_id, dm.age_class,
+                   dm.left_points_min, dm.right_points_min,
+                   dm.left_points_uncertain, dm.right_points_uncertain,
+                   dm.left_ab_points_min, dm.right_ab_points_min,
+                   dm.left_ab_points_uncertain, dm.right_ab_points_uncertain,
+                   dm.abnormal_points_min, dm.abnormal_points_max
+            FROM deer_metadata dm
+            WHERE dm.deer_id IS NOT NULL AND dm.deer_id != ''
+              AND (dm.migrated_at IS NULL)
+        """)
+        deer_rows = cursor.fetchall()
+
+        if not deer_rows:
+            cursor.execute("UPDATE sync_state SET deer_box_migration_done = 1 WHERE id = 1")
+            self.conn.commit()
+            return
+
+        review_queue = []
+        migrated_count = 0
+
+        for dr in deer_rows:
+            photo_id = dr[0]
+            deer_id = dr[1]
+
+            # Check for deer_additional records
+            cursor.execute("SELECT COUNT(*) FROM deer_additional WHERE photo_id = ?", (photo_id,))
+            additional_count = cursor.fetchone()[0]
+
+            # Get non-head subject boxes
+            cursor.execute("""
+                SELECT id FROM annotation_boxes
+                WHERE photo_id = ? AND deleted_at IS NULL
+                  AND (label NOT LIKE '%head%' AND label NOT LIKE '%deer_head%')
+            """, (photo_id,))
+            subject_boxes = cursor.fetchall()
+
+            if len(subject_boxes) == 1 and additional_count == 0:
+                # Single box, no additional deer — safe to migrate
+                box_id = subject_boxes[0][0]
+                # Check if box already has a deer_id (idempotency)
+                cursor.execute("SELECT deer_id FROM annotation_boxes WHERE id = ?", (box_id,))
+                existing = cursor.fetchone()
+                if existing and existing[0]:
+                    # Already has deer_id, skip
+                    pass
+                else:
+                    cursor.execute("""
+                        UPDATE annotation_boxes SET
+                            deer_id=?, age_class=?,
+                            left_points_min=?, right_points_min=?,
+                            left_points_uncertain=?, right_points_uncertain=?,
+                            left_ab_points_min=?, right_ab_points_min=?,
+                            left_ab_points_uncertain=?, right_ab_points_uncertain=?,
+                            abnormal_points_min=?, abnormal_points_max=?
+                        WHERE id = ?
+                    """, (dr[1], dr[2], dr[3], dr[4], dr[5], dr[6],
+                          dr[7], dr[8], dr[9], dr[10], dr[11], dr[12], box_id))
+                # Mark deer_metadata as migrated
+                now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute("""
+                    UPDATE deer_metadata SET deer_id_source='box', primary_box_id=?, migrated_at=?
+                    WHERE photo_id = ?
+                """, (box_id, now, photo_id))
+                migrated_count += 1
+            else:
+                # Multiple boxes, additional deer, or no boxes — flag for review
+                reason = []
+                if len(subject_boxes) != 1:
+                    reason.append(f"{len(subject_boxes)} subject boxes")
+                if additional_count > 0:
+                    reason.append(f"{additional_count} deer_additional records")
+                review_queue.append({
+                    "photo_id": photo_id,
+                    "deer_id": deer_id,
+                    "reason": ", ".join(reason),
+                })
+
+            # Commit in batches of 100
+            if migrated_count % 100 == 0:
+                self.conn.commit()
+
+        # Final commit
+        self.conn.commit()
+
+        # Write review queue if any
+        if review_queue:
+            queue_path = Path.home() / ".trailcam" / "deer_id_migration_queue.json"
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            queue_path.write_text(json.dumps(review_queue, indent=2))
+            logger.info(f"Deer ID migration: {migrated_count} migrated, {len(review_queue)} need review ({queue_path})")
+        else:
+            logger.info(f"Deer ID migration: {migrated_count} migrated, 0 need review")
+
+        # Mark done
+        cursor.execute("UPDATE sync_state SET deer_box_migration_done = 1 WHERE id = 1")
         self.conn.commit()
 
     def _ensure_roles_schema(self):
@@ -1559,6 +1718,35 @@ class TrailCamDatabase:
                 tags_map.setdefault(pid, []).append(row["tag_name"])
             return tags_map
 
+    def get_deer_sex_batch(self, photo_ids: List[int]) -> Dict[int, str]:
+        """Get the confirmed sex for deer boxes across many photos in one query.
+
+        Returns photo_id -> sex mapping. For photos with multiple deer boxes,
+        prefers definitive sex (Buck/Doe) over Unknown/empty.
+        Only includes deer boxes (species='deer' or unspecified ai_animal boxes).
+        """
+        if not photo_ids:
+            return {}
+        with self._lock:
+            cursor = self.conn.cursor()
+            placeholders = ",".join(["?"] * len(photo_ids))
+            cursor.execute(
+                f"SELECT photo_id, sex FROM annotation_boxes "
+                f"WHERE photo_id IN ({placeholders}) "
+                f"AND (deleted_at IS NULL) "
+                f"AND (LOWER(species) = 'deer' OR (species IS NULL AND label = 'ai_animal')) "
+                f"AND sex IS NOT NULL AND sex != ''",
+                photo_ids
+            )
+            result: Dict[int, str] = {}
+            for row in cursor.fetchall():
+                pid = row["photo_id"]
+                sex = row["sex"]
+                # Prefer definitive (Buck/Doe) over Unknown
+                if pid not in result or sex in ("Buck", "Doe"):
+                    result[pid] = sex
+            return result
+
     def get_all_distinct_tags(self) -> List[str]:
         """Get all distinct tag names across all photos. Thread-safe."""
         with self._lock:
@@ -1922,6 +2110,9 @@ class TrailCamDatabase:
               AND EXISTS (SELECT 1 FROM deer_additional d2 WHERE d2.photo_id = deer_additional.photo_id AND d2.deer_id = ?)
         """, (source_id, target_id))
         cursor.execute("UPDATE deer_additional SET deer_id = ? WHERE deer_id = ?", (target_id, source_id))
+        # Update box-level deer IDs
+        cursor.execute("UPDATE annotation_boxes SET deer_id = ? WHERE deer_id = ? AND deleted_at IS NULL",
+                       (target_id, source_id))
         # Move profiles
         cursor.execute("UPDATE OR IGNORE buck_profiles SET deer_id = ? WHERE deer_id = ?", (target_id, source_id))
         cursor.execute("UPDATE OR IGNORE buck_profile_seasons SET deer_id = ? WHERE deer_id = ?", (target_id, source_id))
@@ -1970,6 +2161,12 @@ class TrailCamDatabase:
                 cursor.execute(f"""
                     UPDATE deer_additional SET deer_id = ?
                     WHERE deer_id = ? AND photo_id IN ({placeholders})
+                """, [new_id, old_id] + photo_ids)
+
+                # Update box-level deer IDs for these photos
+                cursor.execute(f"""
+                    UPDATE annotation_boxes SET deer_id = ?
+                    WHERE deer_id = ? AND photo_id IN ({placeholders}) AND deleted_at IS NULL
                 """, [new_id, old_id] + photo_ids)
 
             # Update buck_profile_seasons for specified seasons
@@ -2280,6 +2477,20 @@ class TrailCamDatabase:
                 ai_suggested = b.get("ai_suggested_species", "")
                 label = b.get("label", "")
 
+                # Extract deer metadata fields
+                deer_id = b.get("deer_id", "")
+                age_class = b.get("age_class", "")
+                lp_min = b.get("left_points_min")
+                rp_min = b.get("right_points_min")
+                lp_unc = 1 if b.get("left_points_uncertain") else 0
+                rp_unc = 1 if b.get("right_points_uncertain") else 0
+                lab_min = b.get("left_ab_points_min")
+                rab_min = b.get("right_ab_points_min")
+                lab_unc = 1 if b.get("left_ab_points_uncertain") else 0
+                rab_unc = 1 if b.get("right_ab_points_uncertain") else 0
+                ab_min = b.get("abnormal_points_min")
+                ab_max = b.get("abnormal_points_max")
+
                 if box_id and box_id in existing:
                     # UPDATE existing box (preserves sync_id)
                     incoming_ids.add(box_id)
@@ -2287,7 +2498,13 @@ class TrailCamDatabase:
                         label=?, x1=?, y1=?, x2=?, y2=?, confidence=?,
                         species=?, species_conf=?, sex=?, sex_conf=?,
                         head_x1=?, head_y1=?, head_x2=?, head_y2=?, head_notes=?,
-                        ai_suggested_species=?
+                        ai_suggested_species=?,
+                        deer_id=?, age_class=?,
+                        left_points_min=?, right_points_min=?,
+                        left_points_uncertain=?, right_points_uncertain=?,
+                        left_ab_points_min=?, right_ab_points_min=?,
+                        left_ab_points_uncertain=?, right_ab_points_uncertain=?,
+                        abnormal_points_min=?, abnormal_points_max=?
                         WHERE id = ?""",
                         (label, float(b["x1"]), float(b["y1"]),
                          float(b["x2"]), float(b["y2"]),
@@ -2300,6 +2517,11 @@ class TrailCamDatabase:
                          b.get("head_x2"), b.get("head_y2"),
                          b.get("head_notes") or None,
                          ai_suggested if ai_suggested else None,
+                         deer_id if deer_id else None,
+                         age_class if age_class else None,
+                         lp_min, rp_min, lp_unc, rp_unc,
+                         lab_min, rab_min, lab_unc, rab_unc,
+                         ab_min, ab_max,
                          box_id))
                 else:
                     # Deduplicate AI boxes against existing AI boxes with high IoU (preserve labeled boxes)
@@ -2325,8 +2547,15 @@ class TrailCamDatabase:
                     cursor.execute("""INSERT INTO annotation_boxes
                         (photo_id, label, x1, y1, x2, y2, confidence, species, species_conf,
                          sex, sex_conf, head_x1, head_y1, head_x2, head_y2, head_notes,
-                         ai_suggested_species, sync_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                         ai_suggested_species, sync_id,
+                         deer_id, age_class,
+                         left_points_min, right_points_min,
+                         left_points_uncertain, right_points_uncertain,
+                         left_ab_points_min, right_ab_points_min,
+                         left_ab_points_uncertain, right_ab_points_uncertain,
+                         abnormal_points_min, abnormal_points_max)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (photo_id, label, float(b["x1"]), float(b["y1"]),
                          float(b["x2"]), float(b["y2"]),
                          float(conf) if conf is not None else None,
@@ -2338,7 +2567,12 @@ class TrailCamDatabase:
                          b.get("head_x2"), b.get("head_y2"),
                          b.get("head_notes") or None,
                          ai_suggested if ai_suggested else None,
-                         sync_id))
+                         sync_id,
+                         deer_id if deer_id else None,
+                         age_class if age_class else None,
+                         lp_min, rp_min, lp_unc, rp_unc,
+                         lab_min, rab_min, lab_unc, rab_unc,
+                         ab_min, ab_max))
 
             # Soft-delete boxes not in incoming set
             for box_id in existing:
@@ -2354,7 +2588,13 @@ class TrailCamDatabase:
             cursor.execute("""
                 SELECT id, label, x1, y1, x2, y2, confidence, species, species_conf,
                        head_x1, head_y1, head_x2, head_y2, head_notes, sex, sex_conf,
-                       ai_suggested_species, sync_id
+                       ai_suggested_species, sync_id,
+                       deer_id, age_class,
+                       left_points_min, right_points_min,
+                       left_points_uncertain, right_points_uncertain,
+                       left_ab_points_min, right_ab_points_min,
+                       left_ab_points_uncertain, right_ab_points_uncertain,
+                       abnormal_points_min, abnormal_points_max
                 FROM annotation_boxes WHERE photo_id = ? AND deleted_at IS NULL
             """, (photo_id,))
             out = []
@@ -2383,6 +2623,27 @@ class TrailCamDatabase:
                     box["ai_suggested_species"] = row[16]
                 if row[17]:
                     box["sync_id"] = row[17]
+                # Per-box deer metadata
+                if row[18]:
+                    box["deer_id"] = row[18]
+                if row[19]:
+                    box["age_class"] = row[19]
+                if row[20] is not None:
+                    box["left_points_min"] = row[20]
+                if row[21] is not None:
+                    box["right_points_min"] = row[21]
+                box["left_points_uncertain"] = bool(row[22]) if row[22] is not None else False
+                box["right_points_uncertain"] = bool(row[23]) if row[23] is not None else False
+                if row[24] is not None:
+                    box["left_ab_points_min"] = row[24]
+                if row[25] is not None:
+                    box["right_ab_points_min"] = row[25]
+                box["left_ab_points_uncertain"] = bool(row[26]) if row[26] is not None else False
+                box["right_ab_points_uncertain"] = bool(row[27]) if row[27] is not None else False
+                if row[28] is not None:
+                    box["abnormal_points_min"] = row[28]
+                if row[29] is not None:
+                    box["abnormal_points_max"] = row[29]
                 out.append(box)
             return out
 
@@ -2395,6 +2656,12 @@ class TrailCamDatabase:
             "species", "species_conf", "sex", "sex_conf",
             "head_x1", "head_y1", "head_x2", "head_y2", "head_notes",
             "ai_suggested_species",
+            "deer_id", "age_class",
+            "left_points_min", "right_points_min",
+            "left_points_uncertain", "right_points_uncertain",
+            "left_ab_points_min", "right_ab_points_min",
+            "left_ab_points_uncertain", "right_ab_points_uncertain",
+            "abnormal_points_min", "abnormal_points_max",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -3280,6 +3547,11 @@ class TrailCamDatabase:
                 "SELECT role FROM camera_permissions WHERE camera_id = ? AND username = ?",
                 (camera_id, username))
             row = cursor.fetchone()
+            if not row and username:
+                cursor.execute(
+                    "SELECT role FROM camera_permissions WHERE camera_id = ? AND LOWER(username) = ?",
+                    (camera_id, username.strip().lower()))
+                row = cursor.fetchone()
             return row[0] if row else None
 
     def get_camera_permission_count(self, camera_id: str) -> int:
