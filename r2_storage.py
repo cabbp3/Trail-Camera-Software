@@ -363,6 +363,28 @@ class R2Storage:
             logger.warning(f"R2 check_exists unexpected error for {r2_key}: {e}")
             return False
 
+    def get_uploaded_photo_hashes(self) -> set:
+        """Return set of file_hashes that exist in R2 photos/ prefix.
+
+        Uses one paginated list_objects_v2 call instead of per-photo HEAD requests.
+        Strips extension from key to extract hash, so both .jpg and .jpeg are found.
+        """
+        if not self.is_configured():
+            return set()
+        try:
+            hashes = set()
+            paginator = self.client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix="photos/"):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]  # e.g. "photos/abc123.jpg"
+                    name = key.split("/", 1)[1] if "/" in key else key
+                    file_hash = name.rsplit(".", 1)[0] if "." in name else name
+                    hashes.add(file_hash)
+            return hashes
+        except Exception as e:
+            logger.error(f"Failed to list uploaded photo hashes: {e}")
+            return set()
+
     def get_bucket_stats(self) -> dict:
         """Get basic bucket statistics."""
         if not self.is_configured():

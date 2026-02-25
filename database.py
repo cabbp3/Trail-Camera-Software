@@ -1535,6 +1535,16 @@ class TrailCamDatabase:
                           (thumbnail_path, photo_id))
             self.conn.commit()
 
+    def get_photos_by_ids(self, photo_ids: List[int]) -> List[Dict]:
+        """Get multiple photos by ID in one query. Thread-safe."""
+        if not photo_ids:
+            return []
+        with self._lock:
+            placeholders = ",".join(["?"] * len(photo_ids))
+            cursor = self.conn.cursor()
+            cursor.execute(f"SELECT * FROM photos WHERE id IN ({placeholders})", photo_ids)
+            return [dict(row) for row in cursor.fetchall()]
+
     def update_file_path(self, photo_id: int, file_path: str):
         """Update the file_path for a photo (used after downloading from cloud)."""
         with self._lock:

@@ -3197,6 +3197,8 @@ class TrainerWindow(QMainWindow):
         try:
             # Get photos where file_path starts with cloud://
             cloud_only_photos = self.db.get_cloud_only_photos()
+            # Don't prompt for archived photos — user deliberately deleted those
+            cloud_only_photos = [p for p in cloud_only_photos if not p.get("archived")]
 
             if not cloud_only_photos:
                 return  # All photos are downloaded
@@ -3618,8 +3620,12 @@ class TrainerWindow(QMainWindow):
                 self.current_pixmap = pix
                 self.scene.addPixmap(pix)
                 self.view.zoom_fit()
-                # Add "Cloud Photo" overlay text
-                text_item = self.scene.addText("[Cloud Photo - Thumbnail Only]")
+                # Add overlay text — distinguish archived (deleted) from cloud-only
+                if photo.get("archived"):
+                    overlay = "[Local File Deleted - Thumbnail Only]"
+                else:
+                    overlay = "[Cloud Photo - Thumbnail Only]"
+                text_item = self.scene.addText(overlay)
                 text_item.setDefaultTextColor(Qt.GlobalColor.yellow)
                 font = text_item.font()
                 font.setPointSize(14)
@@ -3628,7 +3634,10 @@ class TrainerWindow(QMainWindow):
                 text_item.setPos(10, 10)
         else:
             self.current_pixmap = None
-            self.scene.addText(f"Cloud photo - no thumbnail available")
+            if photo.get("archived"):
+                self.scene.addText("No local file or thumbnail available\nDownload from cloud to view")
+            else:
+                self.scene.addText("Cloud photo - no thumbnail available")
 
         # Load boxes and metadata even for cloud photos
         self.current_boxes = []
@@ -3952,6 +3961,20 @@ class TrainerWindow(QMainWindow):
 
         layout.addSpacing(10)
 
+        # Delete local files option
+        delete_group = QGroupBox("Local File Cleanup")
+        delete_layout = QVBoxLayout(delete_group)
+        delete_cb = QCheckBox("Delete local files after archiving")
+        delete_cb.setChecked(settings.value("delete_local_on_archive", False, type=bool))
+        delete_layout.addWidget(delete_cb)
+        delete_desc = QLabel("Files are only deleted if confirmed uploaded to cloud storage.\n"
+                             "Thumbnails are kept for browsing.")
+        delete_desc.setStyleSheet("color: #888; font-size: 11px;")
+        delete_layout.addWidget(delete_desc)
+        layout.addWidget(delete_group)
+
+        layout.addSpacing(10)
+
         # Buttons
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("Save")
@@ -3971,6 +3994,13 @@ class TrainerWindow(QMainWindow):
                 settings.setValue("auto_archive_preset", "custom")
                 selected = [s for s, cb in species_checkboxes.items() if cb.isChecked()]
                 settings.setValue("auto_archive_keep_species", ",".join(selected))
+
+            # If delete setting changed, reset auto-archive confirmation
+            old_delete = settings.value("delete_local_on_archive", False, type=bool)
+            new_delete = delete_cb.isChecked()
+            if old_delete != new_delete:
+                settings.setValue("auto_archive_delete_confirmed", False)
+            settings.setValue("delete_local_on_archive", new_delete)
 
             dialog.accept()
             QMessageBox.information(self, "Auto-Archive",
@@ -4003,6 +4033,20 @@ class TrainerWindow(QMainWindow):
         if photo_ids:
             self.db.archive_photos(photo_ids)
             logger.info(f"Auto-archived {len(photo_ids)} photos (kept species: {keep_species})")
+            # Optionally delete local files — with one-time confirmation for auto-archive
+            if settings.value("delete_local_on_archive", False, type=bool):
+                if not settings.value("auto_archive_delete_confirmed", False, type=bool):
+                    reply = QMessageBox.question(
+                        self, "Auto-Archive: Delete Local Files?",
+                        f"Auto-archive wants to delete local files for {len(photo_ids)} archived photos.\n"
+                        "Cloud copies will be verified before deletion.\n\n"
+                        "Allow automatic local file deletion after auto-archive?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                    if reply == QMessageBox.StandardButton.Yes:
+                        settings.setValue("auto_archive_delete_confirmed", True)
+                    else:
+                        return len(photo_ids)
+                self._delete_local_files_for_archived(photo_ids)
             return len(photo_ids)
         return 0
 
@@ -7478,6 +7522,12 @@ class TrainerWindow(QMainWindow):
 
     def _populate_photo_list(self):
         """Fill the navigation list with photos (sorted)."""
+        # Save current photo before filter changes can shift self.index,
+        # otherwise on_photo_selection_changed will save stale UI data onto the wrong photo
+        if hasattr(self, 'preview_layout') and not getattr(self, '_loading_photo_data', False):
+            if self.save_timer.isActive():
+                self.save_timer.stop()
+            self.save_current()
         # Refresh all filter dropdowns with contextual options
         # UNLESS we're navigating to a specific photo (filters are bypassed anyway)
         if not getattr(self, '_navigating_to_specific_photo', False):
@@ -7522,19 +7572,24 @@ class TrainerWindow(QMainWindow):
         self.photo_list_widget.blockSignals(False)
 
         # Set current item AFTER unblocking signals so it sticks
-        if target_item:
-            self.photo_list_widget.setCurrentItem(target_item)
-            target_item.setSelected(True)
-            self.photo_list_widget.scrollToItem(target_item)
-            self.photo_list_widget.setFocus()
-        elif self.photo_list_widget.count() > 0 and not getattr(self, '_preserve_index_on_filter_miss', False):
-            first_item = self.photo_list_widget.item(0)
-            self.photo_list_widget.setCurrentItem(first_item)
-            first_item.setSelected(True)
-            self.photo_list_widget.setFocus()
-            jumped = True
-            if filtered_indices:
-                self.index = filtered_indices[0]
+        # Flag prevents on_photo_selection_changed from re-saving stale UI data
+        self._populating_photo_list = True
+        try:
+            if target_item:
+                self.photo_list_widget.setCurrentItem(target_item)
+                target_item.setSelected(True)
+                self.photo_list_widget.scrollToItem(target_item)
+                self.photo_list_widget.setFocus()
+            elif self.photo_list_widget.count() > 0 and not getattr(self, '_preserve_index_on_filter_miss', False):
+                first_item = self.photo_list_widget.item(0)
+                self.photo_list_widget.setCurrentItem(first_item)
+                first_item.setSelected(True)
+                self.photo_list_widget.setFocus()
+                jumped = True
+                if filtered_indices:
+                    self.index = filtered_indices[0]
+        finally:
+            self._populating_photo_list = False
 
         # Load photo if we jumped to a different one (but not during init)
         if jumped and filtered_indices and hasattr(self, 'preview_layout'):
@@ -7550,6 +7605,9 @@ class TrainerWindow(QMainWindow):
             return
         # Don't interfere with programmatic navigation (next_photo/prev_photo)
         if getattr(self, '_navigating', False):
+            return
+        # Skip save if triggered by _populate_photo_list (already saved before index changed)
+        if getattr(self, '_populating_photo_list', False):
             return
         selected = self.photo_list_widget.selectedItems()
         if not selected:
@@ -7696,6 +7754,10 @@ class TrainerWindow(QMainWindow):
                     QMessageBox.information(self, "Archived", f"Archived {archived_count} photos.\n{skipped_favorites} favorites were protected.")
                 else:
                     QMessageBox.information(self, "Archived", f"Archived {archived_count} photos.")
+                # Optionally delete local files for archived photos
+                actually_archived = [pid for pid in photo_ids
+                                     if any(p.get("id") == pid and p.get("archived") for p in self.photos)]
+                self._delete_local_files_for_archived(actually_archived)
         elif self.photos and 0 <= self.index < len(self.photos):
             # Archive single current photo
             photo = self.photos[self.index]
@@ -7706,10 +7768,81 @@ class TrainerWindow(QMainWindow):
             if pid:
                 self.db.archive_photo(pid)
                 photo["archived"] = 1
+                self._delete_local_files_for_archived([pid])
                 self._populate_photo_list()
                 # Move to next photo if available
                 if self.index < len(self.photos) - 1:
                     self.next_photo()
+
+    def _delete_local_files_for_archived(self, photo_ids: list):
+        """Delete local files for archived photos if setting enabled and cloud copy confirmed."""
+        settings = QSettings("TrailCam", "Trainer")
+        if not settings.value("delete_local_on_archive", False, type=bool):
+            return
+
+        from r2_storage import R2Storage
+        r2 = R2Storage()
+        if not r2.is_configured():
+            return
+
+        # Fetch from DB (not self.photos) to avoid filter mismatch
+        photos = self.db.get_photos_by_ids(photo_ids)
+        candidates = [p for p in photos
+                      if p.get("file_path") and not p["file_path"].startswith("cloud://")]
+        if not candidates:
+            return
+
+        # Confirmation dialog for bulk deletes (skip for single photo — setting is already opt-in)
+        if len(candidates) > 1:
+            reply = QMessageBox.question(
+                self, "Delete Local Files",
+                f"{len(candidates)} archived photo files will be permanently deleted from this device.\n"
+                "Cloud copies will be verified before deletion.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Batch cloud check — one API call, not N HEAD requests
+        progress = QProgressDialog("Verifying cloud backups...", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+        uploaded_hashes = r2.get_uploaded_photo_hashes()
+        progress.close()
+
+        deleted = 0
+        skipped_no_cloud = 0
+        for p in candidates:
+            file_hash = p.get("file_hash")
+            if not file_hash or file_hash not in uploaded_hashes:
+                skipped_no_cloud += 1
+                continue
+            # Verify thumbnail exists before deleting original
+            thumb = p.get("thumbnail_path")
+            if not thumb or not os.path.exists(thumb):
+                try:
+                    from image_processor import create_thumbnail
+                    create_thumbnail(p["file_path"], file_hash=file_hash)
+                except Exception:
+                    skipped_no_cloud += 1
+                    continue
+            try:
+                os.remove(p["file_path"])
+                self.db.update_file_path(p["id"], f"cloud://{file_hash}")
+                # Update in-memory photos list too
+                for mem_p in self.photos:
+                    if mem_p.get("id") == p["id"]:
+                        mem_p["file_path"] = f"cloud://{file_hash}"
+                        break
+                deleted += 1
+            except OSError:
+                pass
+
+        if deleted > 0 or skipped_no_cloud > 0:
+            msg = f"Deleted {deleted} local file(s)."
+            if skipped_no_cloud > 0:
+                msg += f"\n{skipped_no_cloud} skipped (no cloud backup found)."
+            QMessageBox.information(self, "Local Files Deleted", msg)
 
     def unarchive_current_photo(self):
         """Unarchive the current photo or selected photos."""
@@ -7932,6 +8065,8 @@ class TrainerWindow(QMainWindow):
                 self, "Bulk Archive",
                 f"Archived {archived} photos.\nThey can be restored from the Archive filter."
             )
+            # Optionally delete local files
+            self._delete_local_files_for_archived(ids)
 
         archive_btn.clicked.connect(do_archive)
 
