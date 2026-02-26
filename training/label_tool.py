@@ -640,12 +640,27 @@ SPECIES_OPTIONS = [
     "Vehicle",
     "Verification",
 ]
-SEX_TAGS = {"buck", "doe"}
+SEX_TAGS = {"buck", "antlerless"}
 
 # Master list of valid species labels - matches SPECIES_OPTIONS (excluding empty string)
 VALID_SPECIES = set(s for s in SPECIES_OPTIONS if s)
-SEX_OPTIONS = ["", "Buck", "Doe", "Unknown", "Unexamined"]
+SEX_OPTIONS = ["", "Buck", "Antlerless", "Unknown", "Unexamined"]
 AGE_OPTIONS = ["", "1.5", "2.5", "3.5", "4.5", "5.5+", "Fawn", "Mature", "Unknown"]
+
+def _normalize_sex(value: str) -> str:
+    """Normalize sex values: handle case, old 'Doe' → 'Antlerless'."""
+    if not value:
+        return value
+    v = value.strip().lower()
+    if v == "antlerless":
+        return "Antlerless"
+    if v == "doe":
+        return "Antlerless"
+    if v == "buck":
+        return "Buck"
+    if v == "unknown":
+        return "Unknown"
+    return value
 
 # Simple modern QSS theme for a cleaner, less “Win95” look
 APP_STYLE = """
@@ -805,13 +820,13 @@ class AIWorker(QThread):
     finished_all = pyqtSignal(dict)  # counts dict with all stats
     error = pyqtSignal(str)  # error message
 
-    def __init__(self, photos: list, db, speciesnet_wrapper, buckdoe_suggester=None,
+    def __init__(self, photos: list, db, speciesnet_wrapper, buckantlerless_suggester=None,
                  species_suggester=None, detector=None, parent=None, options=None):
         super().__init__(parent)
         self.photos = photos
         self.db = db
         self.speciesnet = speciesnet_wrapper
-        self.buckdoe_suggester = buckdoe_suggester
+        self.buckantlerless_suggester = buckantlerless_suggester
         self.species_suggester = species_suggester  # Custom ONNX species model
         self.detector = detector  # Standalone MegaDetector (when not using SpeciesNet's)
         self._cancelled = False
@@ -820,7 +835,7 @@ class AIWorker(QThread):
             "detect_boxes": True,
             "species_id": True,
             "deer_head_boxes": True,
-            "buck_doe": True
+            "buck_antlerless": True
         }
 
     def cancel(self):
@@ -979,9 +994,9 @@ class AIWorker(QThread):
                     result["species_conf"] = conf
                     counts["species"] += 1
 
-                # Buck/doe for deer
-                if label == "Deer" and self.options.get("buck_doe"):
-                    if self.buckdoe_suggester and self.buckdoe_suggester.buckdoe_ready:
+                # Buck/antlerless for deer
+                if label == "Deer" and self.options.get("buck_antlerless"):
+                    if self.buckantlerless_suggester and self.buckantlerless_suggester.buckantlerless_ready:
                         sex_count = self._predict_sex_for_boxes(p)
                         if sex_count > 0:
                             counts["sex"] += sex_count
@@ -1148,13 +1163,13 @@ class AIWorker(QThread):
             return None, None
 
     def _best_head_crop_for_photo(self, photo: dict):
-        """Return a temp file path of deer crop for buck/doe classification, or None.
+        """Return a temp file path of deer crop for buck/antlerless classification, or None.
 
         Priority order:
         1. deer_head (human-labeled)
         2. ai_deer_head (AI-detected head)
         3. subject box with species=Deer (human-labeled body)
-        4. ai_animal box (AI-detected body) - buck/doe v2.0 was trained on these
+        4. ai_animal box (AI-detected body) - buck/antlerless v2.0 was trained on these
         """
         from PIL import Image
 
@@ -1186,7 +1201,7 @@ class AIWorker(QThread):
                 if b.get("label") == "subject" and b.get("species", "").lower() == "deer":
                     chosen = b
                     break
-        # Priority 4: ai_animal box with deer species (buck/doe v2.0 trained on these)
+        # Priority 4: ai_animal box with deer species (buck/antlerless v2.0 trained on these)
         # Only use ai_animal if species is deer or unset (caller should verify deer)
         if chosen is None:
             for b in boxes:
@@ -1225,12 +1240,12 @@ class AIWorker(QThread):
         pass
 
     def _predict_sex_for_boxes(self, photo: dict) -> int:
-        """Run buck/doe prediction on all deer boxes in a photo.
+        """Run buck/antlerless prediction on all deer boxes in a photo.
 
         Returns the number of boxes that got sex predictions.
         Stores predictions at box level using set_box_sex.
         """
-        if not self.buckdoe_suggester or not self.buckdoe_suggester.buckdoe_ready:
+        if not self.buckantlerless_suggester or not self.buckantlerless_suggester.buckantlerless_ready:
             return 0
 
         pid = photo.get("id")
@@ -1250,8 +1265,8 @@ class AIWorker(QThread):
             label = (box.get("label") or "").lower()
             ai_species = (box.get("ai_suggested_species") or "").lower()
 
-            # Skip if sex already confirmed by user (Buck, Doe, or Unknown = deliberate choice)
-            if box.get("sex") in ("Buck", "Doe", "Unknown"):
+            # Skip if sex already confirmed by user (Buck, Antlerless, or Unknown = deliberate choice)
+            if box.get("sex") in ("Buck", "Antlerless", "Unknown"):
                 continue
 
             # Identify deer boxes (by species or AI suggestion)
@@ -1313,9 +1328,10 @@ class AIWorker(QThread):
                     img.crop((x1, y1, x2, y2)).save(crop_path, "JPEG", quality=90)
 
                     # Run prediction
-                    sex_res = self.buckdoe_suggester.predict_sex(str(crop_path))
+                    sex_res = self.buckantlerless_suggester.predict_sex(str(crop_path))
                     if sex_res:
                         sex_label, sex_conf = sex_res
+                        sex_label = _normalize_sex(sex_label)
                         self.db.set_box_sex(deer_box["id"], sex_label, sex_conf)
                         count += 1
 
@@ -1475,7 +1491,7 @@ class TrainerWindow(QMainWindow):
         self.sex_group.setExclusive(False)  # Allow manual toggle control
         self.sex_buttons = {}
         sex_row = QHBoxLayout()
-        for label in ["Buck", "Doe", "Unknown"]:
+        for label in ["Buck", "Antlerless", "Unknown"]:
             btn = QToolButton()
             btn.setText(label)
             btn.setCheckable(True)
@@ -1721,7 +1737,7 @@ class TrainerWindow(QMainWindow):
         form.addRow("Recent species:", quick_species_container)
         sex_row_widget = QWidget()
         sex_row_widget.setLayout(sex_row)
-        form.addRow("Sex (buck/doe):", sex_row_widget)
+        form.addRow("Sex (buck/antlerless):", sex_row_widget)
         form.addRow("Deer ID:", self.deer_id_edit)
         # Uncategorized buck quick buttons (Small / Medium / Mature)
         uncat_row = QHBoxLayout()
@@ -2174,7 +2190,7 @@ class TrainerWindow(QMainWindow):
         detect_missing_boxes_action = self.tools_menu.addAction("Detect Boxes for Tagged Photos...")
         detect_missing_boxes_action.triggered.connect(self.detect_boxes_for_tagged_photos)
         self.tools_menu.addSeparator()
-        sex_suggest_action = self.tools_menu.addAction("Suggest Buck/Doe (AI) on Deer Photos...")
+        sex_suggest_action = self.tools_menu.addAction("Suggest Buck/Antlerless (AI) on Deer Photos...")
         sex_suggest_action.triggered.connect(self.run_sex_suggestions_on_deer)
         verification_action = self.tools_menu.addAction("Detect Verification Photos...")
         verification_action.triggered.connect(self.detect_verification_photos)
@@ -2189,7 +2205,7 @@ class TrainerWindow(QMainWindow):
         species_review_action = self.tools_menu.addAction("Review Species Suggestions...")
         species_review_action.triggered.connect(self.review_species_suggestions_integrated)
 
-        sex_review_action = self.tools_menu.addAction("Review Buck/Doe Suggestions...")
+        sex_review_action = self.tools_menu.addAction("Review Buck/Antlerless Suggestions...")
         sex_review_action.triggered.connect(self.review_sex_suggestions)
 
         site_review_action = self.tools_menu.addAction("Review Site Suggestions...")
@@ -3929,7 +3945,7 @@ class TrainerWindow(QMainWindow):
         species_layout.setContentsMargins(20, 5, 0, 0)
 
         # Get all species from database
-        all_species = ["Buck", "Deer", "Doe"]  # Common ones first
+        all_species = ["Antlerless", "Buck", "Deer"]  # Common ones first
         if self.db:
             db_species = self.db.get_all_species_tags()
             for s in db_species:
@@ -4275,9 +4291,9 @@ class TrainerWindow(QMainWindow):
         # crude sex inference from tags
         sex = ""
         for t in tags:
-            if t.lower() in ("buck", "doe"):
-                sex = t.capitalize()
-        if sex not in ("Buck", "Doe", "Unknown"):
+            if t.lower() in ("buck", "antlerless", "antlerless"):
+                sex = _normalize_sex(t)
+        if sex not in ("Buck", "Antlerless", "Unknown"):
             sex = "Unexamined"
         self._set_sex(sex)
 
@@ -4419,7 +4435,7 @@ class TrainerWindow(QMainWindow):
         else:
             # Field is empty (likely hidden in simple mode) - get from database
             tags = self.db.get_tags(pid)
-        # Remove prior sex tags so we don't end up with both buck and doe
+        # Remove prior sex tags so we don't end up with both buck and antlerless
         tags = [t for t in tags if t.lower() not in SEX_TAGS]
         # Build species set for validation
         species_set = set(SPECIES_OPTIONS)
@@ -4464,7 +4480,7 @@ class TrainerWindow(QMainWindow):
             tags = non_species_tags + sorted(set(box_species))
 
         # Add sex tag if applicable
-        if sex.lower() in ("buck", "doe") and sex not in tags:
+        if sex.lower() in ("buck", "antlerless") and sex not in tags:
             tags.append(sex)
         # If a real species exists, remove Empty/Unknown tags
         real_species = [t for t in tags if t in species_set and t not in ("Empty", "Unknown")]
@@ -5258,8 +5274,8 @@ class TrainerWindow(QMainWindow):
                 self._set_sex("Buck")
             box["sex"] = sex
             # Clear sex_conf when user has confirmed sex - removes from review queue
-            # Buck, Doe, Unknown are all confirmed decisions; Unexamined is not
-            if sex in ("Buck", "Doe", "Unknown"):
+            # Buck, Antlerless, Unknown are all confirmed decisions; Unexamined is not
+            if sex in ("Buck", "Antlerless", "Unknown"):
                 box["sex_conf"] = None
         else:
             box["sex"] = None
@@ -5304,9 +5320,9 @@ class TrainerWindow(QMainWindow):
         # Load species
         self.species_combo.setCurrentText(box.get("species", ""))
 
-        # Load sex
-        sex = box.get("sex", "")
-        if sex not in ("Buck", "Doe", "Unknown"):
+        # Load sex (normalize handles case + old "Antlerless" → "Antlerless")
+        sex = _normalize_sex(box.get("sex", ""))
+        if sex not in ("Buck", "Antlerless", "Unknown"):
             sex = "Unexamined"
         self._set_sex(sex)
 
@@ -5350,7 +5366,7 @@ class TrainerWindow(QMainWindow):
         Priority order:
         0 = Deer with buck ID (highest)
         1 = Buck
-        2 = Doe
+        2 = Antlerless
         3 = Deer (general)
         4 = Other species (lowest)
         """
@@ -5364,8 +5380,8 @@ class TrainerWindow(QMainWindow):
         # Buck
         if sex == "buck" or species == "deer" and sex == "buck":
             return 1
-        # Doe
-        if sex == "doe" or species == "deer" and sex == "doe":
+        # Antlerless
+        if sex == "antlerless" or species == "deer" and sex == "antlerless":
             return 2
         # Deer (general, no sex specified)
         if species == "deer":
@@ -5376,7 +5392,7 @@ class TrainerWindow(QMainWindow):
     def _get_subject_boxes(self) -> list:
         """Get only subject boxes (not head boxes) for tab display, sorted by priority.
 
-        Priority: Deer with buck ID > Bucks > Does > Deer > Other species
+        Priority: Deer with buck ID > Bucks > Antlerless > Deer > Other species
         """
         if not hasattr(self, "current_boxes") or not self.current_boxes:
             return []
@@ -5725,7 +5741,7 @@ class TrainerWindow(QMainWindow):
         self.load_photo()
 
     def _compute_species_labels(self) -> List[str]:
-        """Collect all species labels used (defaults + custom + tags excluding buck/doe)."""
+        """Collect all species labels used (defaults + custom + tags excluding buck/antlerless)."""
         species = set(SPECIES_OPTIONS)
         try:
             species.update(self.db.list_custom_species())
@@ -5989,8 +6005,8 @@ class TrainerWindow(QMainWindow):
                         species = t
                 sex = ""
                 for t in tags:
-                    if t.lower() in ("buck", "doe"):
-                        sex = t.capitalize()
+                    if t.lower() in ("buck", "antlerless", "antlerless"):
+                        sex = _normalize_sex(t)
                 f.write(f"{p['file_path']},{species},{sex}\n")
 
         with reid_path.open("w", encoding="utf-8") as f:
@@ -6470,14 +6486,14 @@ class TrainerWindow(QMainWindow):
         return True
 
     def _update_sex_suggestion_display(self, photo: dict):
-        """Show AI sex suggestion (buck/doe) with confidence."""
-        sex = photo.get("suggested_sex") or ""
+        """Show AI sex suggestion (buck/antlerless) with confidence."""
+        sex = _normalize_sex(photo.get("suggested_sex") or "")
         conf = photo.get("suggested_sex_confidence")
         self.current_suggested_sex = sex
         self.current_suggested_sex_conf = conf
-        # Only show if not already set to buck/doe
+        # Only show if not already set to buck/antlerless
         current_sex = self._get_sex()
-        already_set = current_sex in ("Buck", "Doe")
+        already_set = current_sex in ("Buck", "Antlerless")
         if sex and not already_set:
             if conf is not None:
                 pct = int(conf * 100) if conf <= 1 else int(conf)
@@ -6490,12 +6506,12 @@ class TrainerWindow(QMainWindow):
             self.apply_sex_suggest_btn.setEnabled(False)
 
     def _apply_sex_suggestion(self):
-        """User-approval step: apply suggested sex (buck/doe)."""
+        """User-approval step: apply suggested sex (buck/antlerless)."""
         sex = getattr(self, "current_suggested_sex", "") or ""
         if not sex:
             return
-        # Normalize to title case for button matching
-        sex_title = sex.title()
+        # Normalize to canonical form for button matching
+        sex_title = _normalize_sex(sex) or sex.title()
         if sex_title in self.sex_buttons:
             self.sex_buttons[sex_title].setChecked(True)
             self._sync_species_on_sex()
@@ -6518,12 +6534,14 @@ class TrainerWindow(QMainWindow):
 
         self._update_sex_status_label()
         self._sync_species_on_sex()
+        # Persist current box sex choice before saving photo-level tags/metadata
+        self._save_current_box_data()
         self.save_current()
 
     def _sync_species_on_sex(self):
-        """If Buck or Doe selected, set species to Deer. If Unknown, default to Deer if empty."""
+        """If Buck or Antlerless selected, set species to Deer. If Unknown, default to Deer if empty."""
         sex = self._get_sex()
-        if sex in ("Buck", "Doe"):
+        if sex in ("Buck", "Antlerless"):
             self.species_combo.blockSignals(True)
             self.species_combo.setCurrentText("Deer")
             self.species_combo.blockSignals(False)
@@ -6821,21 +6839,21 @@ class TrainerWindow(QMainWindow):
         try:
             context_photos = self._get_context_filtered_photos(exclude_filter='sex')
             buck_count = 0
-            doe_count = 0
+            antlerless_count = 0
             unknown_count = 0
             unexamined_count = 0
-            # Collect deer photos without Buck/Doe tags to check box-level sex
+            # Collect deer photos without Buck/Antlerless tags to check box-level sex
             deer_no_sex_ids = []
             for photo in context_photos:
                 tags = set(self.db.get_tags(photo["id"]))
                 if "Buck" in tags:
                     buck_count += 1
-                elif "Doe" in tags:
-                    doe_count += 1
+                elif "Antlerless" in tags:
+                    antlerless_count += 1
                 elif "Deer" in tags:
-                    # Deer photo without Buck/Doe tag — check box sex
+                    # Deer photo without Buck/Antlerless tag — check box sex
                     deer_no_sex_ids.append(photo["id"])
-            # Batch check box sex for deer photos without Buck/Doe tags (single SQL query)
+            # Batch check box sex for deer photos without Buck/Antlerless tags (single SQL query)
             if deer_no_sex_ids:
                 sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
                 for pid in deer_no_sex_ids:
@@ -6846,15 +6864,15 @@ class TrainerWindow(QMainWindow):
                         unexamined_count += 1
             if buck_count > 0:
                 self.sex_filter_combo.add_item(f"Buck ({buck_count})", "Buck", checked=True)
-            if doe_count > 0:
-                self.sex_filter_combo.add_item(f"Doe ({doe_count})", "Doe", checked=True)
+            if antlerless_count > 0:
+                self.sex_filter_combo.add_item(f"Antlerless ({antlerless_count})", "Antlerless", checked=True)
             if unknown_count > 0:
                 self.sex_filter_combo.add_item(f"Unknown ({unknown_count})", "Unknown", checked=True)
             if unexamined_count > 0:
                 self.sex_filter_combo.add_item(f"Unexamined ({unexamined_count})", "Unexamined", checked=True)
         except Exception:
             self.sex_filter_combo.add_item("Buck", "Buck", checked=True)
-            self.sex_filter_combo.add_item("Doe", "Doe", checked=True)
+            self.sex_filter_combo.add_item("Antlerless", "Antlerless", checked=True)
             self.sex_filter_combo.add_item("Unknown", "Unknown", checked=True)
             self.sex_filter_combo.add_item("Unexamined", "Unexamined", checked=True)
         if had_items:
@@ -7117,13 +7135,13 @@ class TrainerWindow(QMainWindow):
                 filtered = []
                 selected_set = set(selected_sex)
                 need_box_check = "Unknown" in selected_set or "Unexamined" in selected_set
-                # Batch-load box sex for deer photos without Buck/Doe tags
+                # Batch-load box sex for deer photos without Buck/Antlerless tags
                 sex_map = {}
                 if need_box_check:
                     deer_no_sex_ids = [p["id"] for _, p in result
                                        if "Deer" in set(tags_map.get(p["id"], []))
                                        and "Buck" not in set(tags_map.get(p["id"], []))
-                                       and "Doe" not in set(tags_map.get(p["id"], []))]
+                                       and "Antlerless" not in set(tags_map.get(p["id"], []))]
                     if deer_no_sex_ids:
                         sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
                 for idx, p in result:
@@ -7131,8 +7149,8 @@ class TrainerWindow(QMainWindow):
                     photo_sex = ""
                     if "Buck" in tags:
                         photo_sex = "Buck"
-                    elif "Doe" in tags:
-                        photo_sex = "Doe"
+                    elif "Antlerless" in tags:
+                        photo_sex = "Antlerless"
                     elif "Deer" in tags and need_box_check:
                         box_sex = sex_map.get(p["id"])
                         photo_sex = "Unknown" if box_sex == "Unknown" else "Unexamined"
@@ -7352,13 +7370,13 @@ class TrainerWindow(QMainWindow):
                 filtered = []
                 selected_set = set(selected_sex)
                 need_box_check = "Unknown" in selected_set or "Unexamined" in selected_set
-                # Batch-load box sex for deer photos without Buck/Doe tags
+                # Batch-load box sex for deer photos without Buck/Antlerless tags
                 sex_map = {}
                 if need_box_check:
                     deer_no_sex_ids = [p["id"] for p in result
                                        if "Deer" in set(tags_map.get(p["id"], []))
                                        and "Buck" not in set(tags_map.get(p["id"], []))
-                                       and "Doe" not in set(tags_map.get(p["id"], []))]
+                                       and "Antlerless" not in set(tags_map.get(p["id"], []))]
                     if deer_no_sex_ids:
                         sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
                 for p in result:
@@ -7366,8 +7384,8 @@ class TrainerWindow(QMainWindow):
                     photo_sex = ""
                     if "Buck" in tags:
                         photo_sex = "Buck"
-                    elif "Doe" in tags:
-                        photo_sex = "Doe"
+                    elif "Antlerless" in tags:
+                        photo_sex = "Antlerless"
                     elif "Deer" in tags and need_box_check:
                         box_sex = sex_map.get(p["id"])
                         photo_sex = "Unknown" if box_sex == "Unknown" else "Unexamined"
@@ -7876,7 +7894,7 @@ class TrainerWindow(QMainWindow):
 
     # ── Bulk Archive by Species ──
 
-    def _compute_bulk_archive_candidates(self, selected_species: set, does_only: bool):
+    def _compute_bulk_archive_candidates(self, selected_species: set, antlerless_only: bool):
         """Return (to_archive, skipped_multi, skipped_fav) photo ID lists."""
         to_archive = []
         skipped_multi = []
@@ -7901,8 +7919,8 @@ class TrainerWindow(QMainWindow):
                     skipped_multi.append(pid)
                 continue
 
-            if does_only and "Deer" in species_tags:
-                if "Buck" in tags or "Doe" not in tags:
+            if antlerless_only and "Deer" in species_tags:
+                if "Buck" in tags or "Antlerless" not in tags:
                     continue
 
             if p.get("favorite"):
@@ -7958,10 +7976,10 @@ class TrainerWindow(QMainWindow):
         scroll.setMaximumHeight(250)
         layout.addWidget(scroll)
 
-        # Does-only checkbox
-        does_only_cb = QCheckBox("Does only (exclude any Buck photos)")
-        does_only_cb.setEnabled("Deer" in checkboxes)
-        layout.addWidget(does_only_cb)
+        # Antlerless-only checkbox
+        antlerless_only_cb = QCheckBox("Antlerless only (exclude any Buck photos)")
+        antlerless_only_cb.setEnabled("Deer" in checkboxes)
+        layout.addWidget(antlerless_only_cb)
 
         # Preview labels
         layout.addSpacing(8)
@@ -7993,16 +8011,16 @@ class TrainerWindow(QMainWindow):
 
         def update_preview():
             selected = {sp for sp, cb in checkboxes.items() if cb.isChecked()}
-            does_only_cb.setEnabled("Deer" in selected)
+            antlerless_only_cb.setEnabled("Deer" in selected)
             if "Deer" not in selected:
-                does_only_cb.setChecked(False)
+                antlerless_only_cb.setChecked(False)
             if not selected:
                 preview_label.setText("Select species above to see preview.")
                 archive_btn.setEnabled(False)
                 preview_btn.setEnabled(False)
                 return
             to_archive, skipped_multi, skipped_fav = self._compute_bulk_archive_candidates(
-                selected, does_only_cb.isChecked()
+                selected, antlerless_only_cb.isChecked()
             )
             candidates["to_archive"] = to_archive
             candidates["skipped_multi"] = skipped_multi
@@ -8019,7 +8037,7 @@ class TrainerWindow(QMainWindow):
 
         for cb in checkboxes.values():
             cb.toggled.connect(update_preview)
-        does_only_cb.toggled.connect(update_preview)
+        antlerless_only_cb.toggled.connect(update_preview)
 
         def show_preview():
             ids = candidates["to_archive"]
@@ -8217,7 +8235,7 @@ class TrainerWindow(QMainWindow):
         self._populate_photo_list()
 
     def _build_photo_label(self, idx: int) -> tuple:
-        """Build list label: date + most specific identifier (buck ID > buck/doe > species).
+        """Build list label: date + most specific identifier (buck ID > buck/antlerless > species).
         Returns (display_string, is_suggestion) tuple."""
         if idx < 0 or idx >= len(self.photos):
             return ("", False)
@@ -8239,7 +8257,7 @@ class TrainerWindow(QMainWindow):
         else:
             label = os.path.basename(p.get("file_path", ""))
 
-        # Get the most specific identifier: buck ID > buck/doe > species
+        # Get the most specific identifier: buck ID > buck/antlerless > species
         detail = ""
         is_suggestion = False
         try:
@@ -8249,12 +8267,12 @@ class TrainerWindow(QMainWindow):
             if deer_id:
                 detail = deer_id
             else:
-                # Second priority: Buck or Doe tag (verified)
+                # Second priority: Buck or Antlerless tag (verified)
                 tags = set(self.db.get_tags(pid))
                 if "Buck" in tags:
                     detail = "Buck"
-                elif "Doe" in tags:
-                    detail = "Doe"
+                elif "Antlerless" in tags:
+                    detail = "Antlerless"
                 else:
                     # Third priority: Species (verified)
                     species_labels = set(SPECIES_OPTIONS)
@@ -8593,13 +8611,13 @@ class TrainerWindow(QMainWindow):
             return None
 
     def _best_head_crop_for_photo(self, photo: dict) -> Optional[Path]:
-        """Return a temp file path of deer crop for buck/doe classification, or None.
+        """Return a temp file path of deer crop for buck/antlerless classification, or None.
 
         Priority order:
         1. deer_head (human-labeled)
         2. ai_deer_head (AI-detected head)
         3. subject box with species=Deer (human-labeled body)
-        4. ai_animal box (AI-detected body) - buck/doe v2.0 was trained on these
+        4. ai_animal box (AI-detected body) - buck/antlerless v2.0 was trained on these
         """
         pid = photo.get("id")
         if not pid:
@@ -8629,7 +8647,7 @@ class TrainerWindow(QMainWindow):
                 if b.get("label") == "subject" and b.get("species", "").lower() == "deer":
                     chosen = b
                     break
-        # Priority 4: ai_animal box with deer species (buck/doe v2.0 trained on these)
+        # Priority 4: ai_animal box with deer species (buck/antlerless v2.0 trained on these)
         # Only use ai_animal if species is deer or unset (caller should verify deer)
         if chosen is None:
             for b in boxes:
@@ -8664,13 +8682,13 @@ class TrainerWindow(QMainWindow):
             return None
 
     def _predict_sex_for_deer_boxes(self, photo: dict) -> int:
-        """Run buck/doe prediction on all deer boxes in a photo.
+        """Run buck/antlerless prediction on all deer boxes in a photo.
 
         Returns the number of boxes that got sex predictions.
         Only runs on boxes where species='Deer' (case-insensitive).
         Uses deer_head crops when available for better accuracy.
         """
-        if not self.suggester or not self.suggester.buckdoe_ready:
+        if not self.suggester or not self.suggester.buckantlerless_ready:
             return 0
 
         pid = photo.get("id")
@@ -8757,6 +8775,7 @@ class TrainerWindow(QMainWindow):
                     sex_res = self.suggester.predict_sex(str(crop_path))
                     if sex_res:
                         sex_label, sex_conf = sex_res
+                        sex_label = _normalize_sex(sex_label)
                         self.db.set_box_sex(deer_box["id"], sex_label, sex_conf)
                         count += 1
 
@@ -10078,7 +10097,7 @@ class TrainerWindow(QMainWindow):
 
         Shows a dialog to let user choose:
         - Which photos to process (without suggestions vs all unlabeled)
-        - Which AI steps to run (detect boxes, species ID, deer heads, buck/doe)
+        - Which AI steps to run (detect boxes, species ID, deer heads, buck/antlerless)
 
         Runs on main thread with progress dialog for reliable UI feedback.
         """
@@ -10091,7 +10110,7 @@ class TrainerWindow(QMainWindow):
 
         # Check if any steps are selected
         if not any([options["detect_boxes"], options["species_id"],
-                    options["deer_head_boxes"], options["buck_doe"]]):
+                    options["deer_head_boxes"], options["buck_antlerless"]]):
             QMessageBox.information(self, "AI Suggestions", "No AI steps selected.")
             return
 
@@ -10111,9 +10130,9 @@ class TrainerWindow(QMainWindow):
                         f"SpeciesNet could not be loaded:\n{self.speciesnet_wrapper.error_message}")
                     return
 
-        if options["buck_doe"] and (not self.suggester or not self.suggester.buckdoe_ready):
+        if options["buck_antlerless"] and (not self.suggester or not self.suggester.buckantlerless_ready):
             QMessageBox.information(self, "AI Model Not Available",
-                "Buck/doe classifier not loaded. Uncheck 'Identify buck vs doe' or add models/buckdoe.onnx")
+                "Buck/antlerless classifier not loaded. Uncheck 'Identify buck vs antlerless' or add models/buckantlerless.onnx")
             return
 
         # Filter photos based on scope
@@ -10135,7 +10154,7 @@ class TrainerWindow(QMainWindow):
                 if pid:
                     if options["species_id"]:
                         self.db.set_suggested_tag(pid, None, None)
-                    if options["buck_doe"]:
+                    if options["buck_antlerless"]:
                         self.db.set_suggested_sex(pid, None, None)
 
         total = len(target_photos)
@@ -10268,14 +10287,15 @@ class TrainerWindow(QMainWindow):
                                     "sex_conf": 0
                                 }
 
-                            # Buck/doe for deer
+                            # Buck/antlerless for deer
                             if label == "Deer":
-                                if options["buck_doe"] and self.suggester and self.suggester.buckdoe_ready:
+                                if options["buck_antlerless"] and self.suggester and self.suggester.buckantlerless_ready:
                                     head_crop = self._best_head_crop_for_photo(p)
                                     if head_crop:
                                         sex_res = self.suggester.predict_sex(str(head_crop))
                                         if sex_res:
                                             sex_label, sex_conf = sex_res
+                                            sex_label = _normalize_sex(sex_label)
                                             self.db.set_suggested_sex(pid, sex_label, sex_conf)
                                             counts["sex"] += 1
                                             if pid in self.queue_data:
@@ -10299,7 +10319,7 @@ class TrainerWindow(QMainWindow):
         # Show results
         if self.queue_photo_ids:
             self.queue_title_label.setText(f"Species Review ({len(self.queue_photo_ids)})")
-            self.queue_suggestion_label.setText(f"AI complete: {counts['species']} species, {counts['sex']} buck/doe")
+            self.queue_suggestion_label.setText(f"AI complete: {counts['species']} species, {counts['sex']} buck/antlerless")
             self.queue_progress_bar.hide()
             self.queue_panel.show()
             self._populate_photo_list()
@@ -10307,7 +10327,7 @@ class TrainerWindow(QMainWindow):
             QMessageBox.information(self, "AI Complete",
                 f"Processed {total} photos.\n"
                 f"Species identified: {counts['species']}\n"
-                f"Buck/doe identified: {counts['sex']}\n\n"
+                f"Buck/antlerless identified: {counts['sex']}\n\n"
                 f"Ready for review.")
         else:
             self.queue_mode = False
@@ -10326,14 +10346,14 @@ class TrainerWindow(QMainWindow):
         self.run_ai_suggestions_background()
 
     def run_sex_suggestions_on_deer(self):
-        """Run buck/doe suggestions on deer boxes without sex predictions.
+        """Run buck/antlerless suggestions on deer boxes without sex predictions.
 
-        Runs per-box: each deer box gets its own buck/doe prediction.
+        Runs per-box: each deer box gets its own buck/antlerless prediction.
         Automatically runs detection first if no boxes exist.
         """
-        if not self.suggester or not self.suggester.buckdoe_ready:
-            QMessageBox.information(self, "Buck/Doe Model Not Available",
-                "Buck/doe classifier not loaded.\nPlace buckdoe.onnx in the models/ folder.")
+        if not self.suggester or not self.suggester.buckantlerless_ready:
+            QMessageBox.information(self, "Buck/Antlerless Model Not Available",
+                "Buck/antlerless classifier not loaded.\nPlace buckantlerless.onnx in the models/ folder.")
             return
 
         # Find photos with deer boxes that need sex prediction
@@ -10361,8 +10381,8 @@ class TrainerWindow(QMainWindow):
                 photos_to_process.append(p)
 
         if not photos_to_process:
-            QMessageBox.information(self, "Buck/Doe Suggestions",
-                "No deer boxes without buck/doe predictions found.")
+            QMessageBox.information(self, "Buck/Antlerless Suggestions",
+                "No deer boxes without buck/antlerless predictions found.")
             return
 
         # Get detector for auto-detection if needed
@@ -10370,7 +10390,7 @@ class TrainerWindow(QMainWindow):
 
         total_boxes = 0
         progress = QProgressDialog(
-            f"Running buck/doe predictions on {len(photos_to_process)} photos...",
+            f"Running buck/antlerless predictions on {len(photos_to_process)} photos...",
             "Cancel", 0, len(photos_to_process), self
         )
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -10392,9 +10412,9 @@ class TrainerWindow(QMainWindow):
 
         progress.setValue(len(photos_to_process))
 
-        msg = f"Suggested buck/doe for {total_boxes} deer box(es) across {len(photos_to_process)} photo(s)."
-        msg += "\nUse 'Review Buck/Doe Suggestions' to verify."
-        QMessageBox.information(self, "Buck/Doe Suggestions", msg)
+        msg = f"Suggested buck/antlerless for {total_boxes} deer box(es) across {len(photos_to_process)} photo(s)."
+        msg += "\nUse 'Review Buck/Antlerless Suggestions' to verify."
+        QMessageBox.information(self, "Buck/Antlerless Suggestions", msg)
         self._populate_photo_list()
 
     # ====== INTEGRATED QUEUE MODE ======
@@ -11302,7 +11322,7 @@ class TrainerWindow(QMainWindow):
             "detect_boxes": True,
             "species_id": True,
             "deer_head_boxes": True,
-            "buck_doe": True,
+            "buck_antlerless": True,
             "use_megadetector": detector_obj is not None,
             "use_custom_classifier": species_suggester is not None,
         }
@@ -11311,7 +11331,7 @@ class TrainerWindow(QMainWindow):
             photos=unlabeled_photos,
             db=self.db,
             speciesnet_wrapper=self.speciesnet_wrapper,
-            buckdoe_suggester=self.suggester,
+            buckantlerless_suggester=self.suggester,
             species_suggester=species_suggester,
             detector=detector_obj,
             parent=self,
@@ -11379,7 +11399,7 @@ class TrainerWindow(QMainWindow):
 
         if self.queue_photo_ids:
             self.queue_title_label.setText(f"Species Review ({len(self.queue_photo_ids)})")
-            self.queue_suggestion_label.setText(f"AI complete: {species_count} species, {sex_count} buck/doe")
+            self.queue_suggestion_label.setText(f"AI complete: {species_count} species, {sex_count} buck/antlerless")
             self._populate_photo_list()  # Final refresh to show all processed photos
             self._update_queue_ui()
         else:
@@ -11388,7 +11408,7 @@ class TrainerWindow(QMainWindow):
                 self,
                 "AI Complete",
                 f"Processed {species_count} species suggestion(s).\n"
-                f"Suggested buck/doe for {sex_count} deer photo(s).\n\n"
+                f"Suggested buck/antlerless for {sex_count} deer photo(s).\n\n"
                 "No photos require review."
             )
 
@@ -11409,8 +11429,8 @@ class TrainerWindow(QMainWindow):
             msg_parts.append(f"Suggested species for {counts.get('species', 0)} photo(s)")
         if options.get("deer_head_boxes"):
             msg_parts.append(f"Added deer head boxes on {counts.get('heads', 0)} photo(s)")
-        if options.get("buck_doe"):
-            msg_parts.append(f"Suggested buck/doe for {counts.get('sex', 0)} deer photo(s)")
+        if options.get("buck_antlerless"):
+            msg_parts.append(f"Suggested buck/antlerless for {counts.get('sex', 0)} deer photo(s)")
 
         msg = "\n".join(msg_parts) if msg_parts else "Processing complete."
 
@@ -11561,7 +11581,7 @@ class TrainerWindow(QMainWindow):
         cursor.execute("""
             SELECT DISTINCT t.tag_name FROM tags t
             JOIN annotation_boxes b ON t.photo_id = b.photo_id
-            WHERE t.tag_name NOT IN ('Buck', 'Doe', 'Other')
+            WHERE t.tag_name NOT IN ('Buck', 'Antlerless', 'Other')
               AND t.deleted_at IS NULL
         """)
         db_species = set(row[0] for row in cursor.fetchall())
@@ -12040,7 +12060,7 @@ class TrainerWindow(QMainWindow):
         Excludes photos that:
         - Already have a species tag
         - Have a box with confirmed species (user-labeled, not AI suggestion)
-        - Have a box with confirmed sex (Buck/Doe) - implies deer already identified
+        - Have a box with confirmed sex (Buck/Antlerless) - implies deer already identified
         - Have a deer_id set - implies deer already identified
         """
         species_set = self._species_set()
@@ -12056,7 +12076,7 @@ class TrainerWindow(QMainWindow):
                       SELECT 1 FROM annotation_boxes b
                       WHERE b.photo_id = p.id
                         AND b.deleted_at IS NULL
-                        AND b.sex IN ('Buck', 'Doe')
+                        AND b.sex IN ('Buck', 'Antlerless')
                         AND (b.sex_conf IS NULL OR b.sex_conf = 0)
                   )
                   AND NOT EXISTS (
@@ -12187,7 +12207,7 @@ class TrainerWindow(QMainWindow):
         cursor.execute("""
             SELECT DISTINCT t.tag_name FROM tags t
             JOIN annotation_boxes b ON t.photo_id = b.photo_id
-            WHERE t.tag_name NOT IN ('Buck', 'Doe', 'Empty', 'Other')
+            WHERE t.tag_name NOT IN ('Buck', 'Antlerless', 'Empty', 'Other')
               AND t.deleted_at IS NULL
         """)
         db_species = set(row[0] for row in cursor.fetchall())
@@ -12666,16 +12686,16 @@ class TrainerWindow(QMainWindow):
         return pending
 
     def review_sex_suggestions(self):
-        """Review and approve/reject pending buck/doe suggestions with zoomable photo preview."""
+        """Review and approve/reject pending buck/antlerless suggestions with zoomable photo preview."""
         from PyQt6.QtWidgets import QGraphicsView
         # Gather pending sex suggestions
         pending = self._gather_pending_sex_suggestions()
         if not pending:
-            QMessageBox.information(self, "Buck/Doe Suggestions", "No pending buck/doe suggestions to review.")
+            QMessageBox.information(self, "Buck/Antlerless Suggestions", "No pending buck/antlerless suggestions to review.")
             return
         # Create review dialog with zoomable photo preview
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Review Buck/Doe Suggestions ({len(pending)})")
+        dlg.setWindowTitle(f"Review Buck/Antlerless Suggestions ({len(pending)})")
         dlg.resize(1100, 750)
         layout = QVBoxLayout(dlg)
 
@@ -12690,11 +12710,11 @@ class TrainerWindow(QMainWindow):
         filter_label.setStyleSheet("font-weight: bold;")
         left_panel.addWidget(filter_label)
 
-        # Suggestion filter (All/Buck/Doe)
+        # Suggestion filter (All/Buck/Antlerless)
         filter_row1 = QHBoxLayout()
         filter_row1.addWidget(QLabel("Type:"))
         sex_filter = QComboBox()
-        sex_filter.addItems(["All", "Buck", "Doe"])
+        sex_filter.addItems(["All", "Buck", "Antlerless"])
         sex_filter.setMaximumWidth(100)
         filter_row1.addWidget(sex_filter)
         filter_row1.addStretch()
@@ -12783,8 +12803,8 @@ class TrainerWindow(QMainWindow):
                         continue
                 filtered_items.append((item, conf_pct))
 
-            # Sort by sex (Buck, Doe, Unknown) then by confidence descending
-            sex_order = {"buck": 0, "doe": 1, "unknown": 2}
+            # Sort by sex (Buck, Antlerless, Unknown) then by confidence descending
+            sex_order = {"buck": 0, "antlerless": 1, "unknown": 2}
             filtered_items.sort(key=lambda x: (
                 sex_order.get(x[0].get("sex", "").lower(), 3),  # Sex order
                 -x[1]  # Confidence descending (negative for reverse)
@@ -12799,7 +12819,7 @@ class TrainerWindow(QMainWindow):
                 list_widget.addItem(li)
 
             # Update title with filtered count
-            dlg.setWindowTitle(f"Review Buck/Doe Suggestions ({list_widget.count()} shown, {len(all_pending)} total)")
+            dlg.setWindowTitle(f"Review Buck/Antlerless Suggestions ({list_widget.count()} shown, {len(all_pending)} total)")
 
         # Connect filters
         sex_filter.currentIndexChanged.connect(_populate_list)
@@ -12853,8 +12873,8 @@ class TrainerWindow(QMainWindow):
         btn_row = QHBoxLayout()
         accept_buck_btn = QPushButton("Buck (B)")
         accept_buck_btn.setStyleSheet("background: #264; padding: 8px 16px;")
-        accept_doe_btn = QPushButton("Doe (D)")
-        accept_doe_btn.setStyleSheet("background: #462; padding: 8px 16px;")
+        accept_antlerless_btn = QPushButton("Antlerless (D)")
+        accept_antlerless_btn.setStyleSheet("background: #462; padding: 8px 16px;")
         unknown_btn = QPushButton("Unknown (U)")
         unknown_btn.setStyleSheet("background: #444; padding: 8px 16px;")
         reject_btn = QPushButton("Reject (R)")
@@ -12864,7 +12884,7 @@ class TrainerWindow(QMainWindow):
         props_btn.setStyleSheet("padding: 8px 16px;")
         close_btn = QPushButton("Close")
         btn_row.addWidget(accept_buck_btn)
-        btn_row.addWidget(accept_doe_btn)
+        btn_row.addWidget(accept_antlerless_btn)
         btn_row.addWidget(unknown_btn)
         btn_row.addWidget(reject_btn)
         btn_row.addWidget(skip_btn)
@@ -13077,7 +13097,7 @@ class TrainerWindow(QMainWindow):
             item.setBackground(QColor(144, 238, 144))  # Light green
             # Update window title with remaining count
             remaining = list_widget.count() - len(reviewed_rows)
-            dlg.setWindowTitle(f"Review Buck/Doe Suggestions ({remaining} remaining)")
+            dlg.setWindowTitle(f"Review Buck/Antlerless Suggestions ({remaining} remaining)")
 
         def _next_unreviewed():
             """Move to next unreviewed item."""
@@ -13118,7 +13138,7 @@ class TrainerWindow(QMainWindow):
                     suggestion_type="sex",
                     ai_suggested=ai_suggested,
                     correct_label=sex_tag,
-                    model_version=get_model_version("buckdoe")
+                    model_version=get_model_version("buckantlerless")
                 )
             # Update the box's sex field and set species to Deer
             if box and pid:
@@ -13143,8 +13163,8 @@ class TrainerWindow(QMainWindow):
                 tags = set(self.db.get_tags(pid))
                 if "Deer" not in tags:
                     self.db.add_tag(pid, "Deer")
-                # Also add Buck/Doe tag
-                if sex_tag in ("Buck", "Doe") and sex_tag not in tags:
+                # Also add Buck/Antlerless tag
+                if sex_tag in ("Buck", "Antlerless") and sex_tag not in tags:
                     self.db.add_tag(pid, sex_tag)
                 # Clear species suggestion only if all boxes have been reviewed
                 try:
@@ -13178,7 +13198,7 @@ class TrainerWindow(QMainWindow):
                     suggestion_type="sex",
                     ai_suggested=ai_suggested,
                     correct_label=None,
-                    model_version=get_model_version("buckdoe")
+                    model_version=get_model_version("buckantlerless")
                 )
             # Clear the box's sex suggestion (mark as reviewed/rejected)
             if box and pid:
@@ -13209,7 +13229,7 @@ class TrainerWindow(QMainWindow):
                 _update_preview()
 
         def _unknown():
-            """Mark sex as unknown - still a deer, just can't determine buck/doe."""
+            """Mark sex as unknown - still a deer, just can't determine buck/antlerless."""
             item = list_widget.currentItem()
             if not item:
                 return
@@ -13325,7 +13345,7 @@ class TrainerWindow(QMainWindow):
         zoom_fit_btn.clicked.connect(_zoom_fit)
         zoom_100_btn.clicked.connect(_zoom_100)
         accept_buck_btn.clicked.connect(lambda: _accept_as("Buck"))
-        accept_doe_btn.clicked.connect(lambda: _accept_as("Doe"))
+        accept_antlerless_btn.clicked.connect(lambda: _accept_as("Antlerless"))
         unknown_btn.clicked.connect(_unknown)
         reject_btn.clicked.connect(_reject)
         skip_btn.clicked.connect(_skip)
@@ -13336,7 +13356,7 @@ class TrainerWindow(QMainWindow):
         # Keyboard shortcuts
         from PyQt6.QtGui import QShortcut, QKeySequence
         QShortcut(QKeySequence("B"), dlg).activated.connect(lambda: _accept_as("Buck"))
-        QShortcut(QKeySequence("D"), dlg).activated.connect(lambda: _accept_as("Doe"))
+        QShortcut(QKeySequence("D"), dlg).activated.connect(lambda: _accept_as("Antlerless"))
         QShortcut(QKeySequence("U"), dlg).activated.connect(_unknown)
         QShortcut(QKeySequence("R"), dlg).activated.connect(_reject)
         QShortcut(QKeySequence("S"), dlg).activated.connect(_skip)
@@ -13645,7 +13665,7 @@ class TrainerWindow(QMainWindow):
         dlg.exec()
 
     def _gather_pending_sex_suggestions(self) -> list:
-        """Return list of boxes with pending buck/doe suggestions.
+        """Return list of boxes with pending buck/antlerless suggestions.
 
         Optimized: Uses single SQL query instead of N+1 queries.
         Queries box-level suggestions (sex_conf > 0 means AI suggestion).
@@ -17592,7 +17612,7 @@ class TrainerWindow(QMainWindow):
 <p><b>Features:</b></p>
 <ul>
 <li>AI-powered species identification</li>
-<li>Buck/doe classification</li>
+<li>Buck/antlerless classification</li>
 <li>Individual deer tracking</li>
 <li>Antler point counting</li>
 <li>Cloud sync via Supabase</li>
