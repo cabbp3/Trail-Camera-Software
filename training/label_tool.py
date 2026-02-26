@@ -641,6 +641,7 @@ SPECIES_OPTIONS = [
     "Verification",
 ]
 SEX_TAGS = {"buck", "antlerless"}
+UNKNOWN_SEX_TAG = "Unknown Sex"
 
 # Master list of valid species labels - matches SPECIES_OPTIONS (excluding empty string)
 VALID_SPECIES = set(s for s in SPECIES_OPTIONS if s)
@@ -4211,6 +4212,8 @@ class TrainerWindow(QMainWindow):
         except Exception as e:
             logger.debug(f"Failed to load boxes for photo {photo.get('id')}: {e}")
             self.current_boxes = []
+        box_sexes = [(i, b.get("sex")) for i, b in enumerate(self.current_boxes)]
+        print(f"[DEBUG load_photo] photo_id={photo.get('id')}, boxes loaded: {box_sexes}")
         self._draw_boxes()
         # Update box tab bar
         self._update_box_tab_bar()
@@ -4288,14 +4291,19 @@ class TrainerWindow(QMainWindow):
         self._original_saved_species = set(current_species)
         self._update_current_species_label(current_species)
 
-        # crude sex inference from tags
-        sex = ""
-        for t in tags:
-            if t.lower() in ("buck", "antlerless", "antlerless"):
-                sex = _normalize_sex(t)
-        if sex not in ("Buck", "Antlerless", "Unknown"):
-            sex = "Unexamined"
-        self._set_sex(sex)
+        # Sex: use box-level sex when boxes exist (source of truth),
+        # fall back to tag-based inference for photos without boxes
+        if not has_subject_boxes:
+            sex = ""
+            for t in tags:
+                if t == UNKNOWN_SEX_TAG:
+                    sex = "Unknown"
+                    break
+                if t.lower() in ("buck", "antlerless"):
+                    sex = _normalize_sex(t)
+            if sex not in ("Buck", "Antlerless", "Unknown"):
+                sex = "Unexamined"
+            self._set_sex(sex)
 
         # Set camera location
         cam_loc = photo.get("camera_location") or ""
@@ -4436,7 +4444,7 @@ class TrainerWindow(QMainWindow):
             # Field is empty (likely hidden in simple mode) - get from database
             tags = self.db.get_tags(pid)
         # Remove prior sex tags so we don't end up with both buck and antlerless
-        tags = [t for t in tags if t.lower() not in SEX_TAGS]
+        tags = [t for t in tags if t.lower() not in SEX_TAGS and t != UNKNOWN_SEX_TAG]
         # Build species set for validation
         species_set = set(SPECIES_OPTIONS)
         try:
@@ -4470,6 +4478,8 @@ class TrainerWindow(QMainWindow):
                         if not b.get("species"):
                             b["species"] = species
             # Persist box changes before deriving tags
+            box_sex_vals = [(b.get("id"), b.get("sex")) for b in self.current_boxes]
+            print(f"[DEBUG save_current] about to set_boxes, box sex values: {box_sex_vals}")
             try:
                 self.db.set_boxes(pid, self.current_boxes)
             except Exception as exc:
@@ -4482,6 +4492,12 @@ class TrainerWindow(QMainWindow):
         # Add sex tag if applicable
         if sex.lower() in ("buck", "antlerless") and sex not in tags:
             tags.append(sex)
+        # Persist "Unknown sex" for deer photos without boxes
+        if not has_subject_boxes and sex == "Unknown":
+            if UNKNOWN_SEX_TAG not in tags:
+                tags.append(UNKNOWN_SEX_TAG)
+        else:
+            tags = [t for t in tags if t != UNKNOWN_SEX_TAG]
         # If a real species exists, remove Empty/Unknown tags
         real_species = [t for t in tags if t in species_set and t not in ("Empty", "Unknown")]
         if real_species:
@@ -5266,13 +5282,19 @@ class TrainerWindow(QMainWindow):
 
         # Save sex (only for Deer - clear for other species)
         deer_id = self.deer_id_edit.currentText().strip()
+        sex = self._get_sex()
+        if sex in ("Buck", "Antlerless", "Unknown") and species.lower() != "deer":
+            species = "Deer"
+            self.species_combo.blockSignals(True)
+            self.species_combo.setCurrentText("Deer")
+            self.species_combo.blockSignals(False)
         if species.lower() == "deer":
-            sex = self._get_sex()
             # If deer_id is set, auto-set to Buck (only if unexamined, not if user chose Unknown)
             if deer_id and sex == "Unexamined":
                 sex = "Buck"
                 self._set_sex("Buck")
             box["sex"] = sex
+            print(f"[DEBUG _save_current_box_data] species={species}, sex={sex}, box_id={box.get('id')}")
             # Clear sex_conf when user has confirmed sex - removes from review queue
             # Buck, Antlerless, Unknown are all confirmed decisions; Unexamined is not
             if sex in ("Buck", "Antlerless", "Unknown"):
@@ -5321,7 +5343,9 @@ class TrainerWindow(QMainWindow):
         self.species_combo.setCurrentText(box.get("species", ""))
 
         # Load sex (normalize handles case + old "Antlerless" → "Antlerless")
-        sex = _normalize_sex(box.get("sex", ""))
+        raw_sex = box.get("sex", "")
+        sex = _normalize_sex(raw_sex)
+        print(f"[DEBUG _load_box_data] box_idx={box_idx}, raw_sex={raw_sex!r}, normalized={sex!r}")
         if sex not in ("Buck", "Antlerless", "Unknown"):
             sex = "Unexamined"
         self._set_sex(sex)
@@ -6535,7 +6559,11 @@ class TrainerWindow(QMainWindow):
         self._update_sex_status_label()
         self._sync_species_on_sex()
         # Persist current box sex choice before saving photo-level tags/metadata
+        sex_val = self._get_sex()
+        print(f"[DEBUG _on_sex_clicked] label={label}, checked={checked}, _get_sex()={sex_val}")
         self._save_current_box_data()
+        if hasattr(self, 'current_boxes') and self.current_boxes and self.current_box_index < len(self.current_boxes):
+            print(f"[DEBUG _on_sex_clicked] after _save_current_box_data: box['sex']={self.current_boxes[self.current_box_index].get('sex')}")
         self.save_current()
 
     def _sync_species_on_sex(self):
@@ -6545,10 +6573,12 @@ class TrainerWindow(QMainWindow):
             self.species_combo.blockSignals(True)
             self.species_combo.setCurrentText("Deer")
             self.species_combo.blockSignals(False)
-        elif sex == "Unknown" and not self.species_combo.currentText().strip():
-            self.species_combo.blockSignals(True)
-            self.species_combo.setCurrentText("Deer")
-            self.species_combo.blockSignals(False)
+        elif sex == "Unknown":
+            current = self.species_combo.currentText().strip()
+            if not current or current == "Unknown" or current.lower() in SEX_TAGS:
+                self.species_combo.blockSignals(True)
+                self.species_combo.setCurrentText("Deer")
+                self.species_combo.blockSignals(False)
 
     @staticmethod
     def _normalize_tags_text(text: str) -> str:
@@ -6850,6 +6880,8 @@ class TrainerWindow(QMainWindow):
                     buck_count += 1
                 elif "Antlerless" in tags:
                     antlerless_count += 1
+                elif UNKNOWN_SEX_TAG in tags:
+                    unknown_count += 1
                 elif "Deer" in tags:
                     # Deer photo without Buck/Antlerless tag — check box sex
                     deer_no_sex_ids.append(photo["id"])
@@ -7141,7 +7173,8 @@ class TrainerWindow(QMainWindow):
                     deer_no_sex_ids = [p["id"] for _, p in result
                                        if "Deer" in set(tags_map.get(p["id"], []))
                                        and "Buck" not in set(tags_map.get(p["id"], []))
-                                       and "Antlerless" not in set(tags_map.get(p["id"], []))]
+                                       and "Antlerless" not in set(tags_map.get(p["id"], []))
+                                       and UNKNOWN_SEX_TAG not in set(tags_map.get(p["id"], []))]
                     if deer_no_sex_ids:
                         sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
                 for idx, p in result:
@@ -7151,6 +7184,8 @@ class TrainerWindow(QMainWindow):
                         photo_sex = "Buck"
                     elif "Antlerless" in tags:
                         photo_sex = "Antlerless"
+                    elif UNKNOWN_SEX_TAG in tags:
+                        photo_sex = "Unknown"
                     elif "Deer" in tags and need_box_check:
                         box_sex = sex_map.get(p["id"])
                         photo_sex = "Unknown" if box_sex == "Unknown" else "Unexamined"
@@ -7376,7 +7411,8 @@ class TrainerWindow(QMainWindow):
                     deer_no_sex_ids = [p["id"] for p in result
                                        if "Deer" in set(tags_map.get(p["id"], []))
                                        and "Buck" not in set(tags_map.get(p["id"], []))
-                                       and "Antlerless" not in set(tags_map.get(p["id"], []))]
+                                       and "Antlerless" not in set(tags_map.get(p["id"], []))
+                                       and UNKNOWN_SEX_TAG not in set(tags_map.get(p["id"], []))]
                     if deer_no_sex_ids:
                         sex_map = self.db.get_deer_sex_batch(deer_no_sex_ids)
                 for p in result:
@@ -7386,6 +7422,8 @@ class TrainerWindow(QMainWindow):
                         photo_sex = "Buck"
                     elif "Antlerless" in tags:
                         photo_sex = "Antlerless"
+                    elif UNKNOWN_SEX_TAG in tags:
+                        photo_sex = "Unknown"
                     elif "Deer" in tags and need_box_check:
                         box_sex = sex_map.get(p["id"])
                         photo_sex = "Unknown" if box_sex == "Unknown" else "Unexamined"
