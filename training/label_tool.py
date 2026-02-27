@@ -3404,7 +3404,13 @@ class TrainerWindow(QMainWindow):
 
             # Refresh photo list
             self.photos = self._sorted_photos(self.db.get_all_photos())
-            self._populate_photo_list()
+            # Avoid auto-saving stale UI state while rebuilding list after AI writes.
+            prev_loading = getattr(self, "_loading_photo_data", False)
+            self._loading_photo_data = True
+            try:
+                self._populate_photo_list()
+            finally:
+                self._loading_photo_data = prev_loading
             if self.photos:
                 self.load_photo()
 
@@ -4212,8 +4218,6 @@ class TrainerWindow(QMainWindow):
         except Exception as e:
             logger.debug(f"Failed to load boxes for photo {photo.get('id')}: {e}")
             self.current_boxes = []
-        box_sexes = [(i, b.get("sex")) for i, b in enumerate(self.current_boxes)]
-        print(f"[DEBUG load_photo] photo_id={photo.get('id')}, boxes loaded: {box_sexes}")
         self._draw_boxes()
         # Update box tab bar
         self._update_box_tab_bar()
@@ -4249,25 +4253,26 @@ class TrainerWindow(QMainWindow):
         self.favorite_checkbox.blockSignals(False)
 
         # Deer metadata now comes from per-box data via _load_box_data().
-        # Populate dropdown, then clear fields — _load_box_data() fills them for the selected box.
+        # For photos without boxes, fall back to deer_metadata so values can persist.
         self._populate_deer_id_dropdown()
         has_subject_boxes_for_deer = any(not self._is_head_box(b) for b in self.current_boxes) if self.current_boxes else False
         if not has_subject_boxes_for_deer:
-            # No subject boxes — clear all deer fields
+            # No subject boxes — load from deer_metadata (photo-level fallback)
+            deer_meta = self.db.get_deer_metadata(pid)
             self.deer_id_edit.blockSignals(True)
-            self.deer_id_edit.setCurrentText("")
+            self.deer_id_edit.setCurrentText(deer_meta.get("deer_id") or "")
             self.deer_id_edit.blockSignals(False)
-            self.age_combo.setCurrentText("")
-            self._set_int_field(self.left_min, None)
-            self.left_uncertain.setChecked(False)
-            self._set_int_field(self.right_min, None)
-            self.right_uncertain.setChecked(False)
-            self._set_int_field(self.left_ab_min, None)
-            self.left_ab_unc.setChecked(False)
-            self._set_int_field(self.right_ab_min, None)
-            self.right_ab_unc.setChecked(False)
-            self._set_int_field(self.ab_min, None)
-            self._set_int_field(self.ab_max, None)
+            self.age_combo.setCurrentText(deer_meta.get("age_class") or "")
+            self._set_int_field(self.left_min, deer_meta.get("left_points_min"))
+            self.left_uncertain.setChecked(bool(deer_meta.get("left_points_uncertain")))
+            self._set_int_field(self.right_min, deer_meta.get("right_points_min"))
+            self.right_uncertain.setChecked(bool(deer_meta.get("right_points_uncertain")))
+            self._set_int_field(self.left_ab_min, deer_meta.get("left_ab_points_min"))
+            self.left_ab_unc.setChecked(bool(deer_meta.get("left_ab_points_uncertain")))
+            self._set_int_field(self.right_ab_min, deer_meta.get("right_ab_points_min"))
+            self.right_ab_unc.setChecked(bool(deer_meta.get("right_ab_points_uncertain")))
+            self._set_int_field(self.ab_min, deer_meta.get("abnormal_points_min"))
+            self._set_int_field(self.ab_max, deer_meta.get("abnormal_points_max"))
 
         # species: use box species when boxes exist, else use stored tags (suggestions require user approval)
         species_options = set(SPECIES_OPTIONS)
@@ -4478,8 +4483,6 @@ class TrainerWindow(QMainWindow):
                         if not b.get("species"):
                             b["species"] = species
             # Persist box changes before deriving tags
-            box_sex_vals = [(b.get("id"), b.get("sex")) for b in self.current_boxes]
-            print(f"[DEBUG save_current] about to set_boxes, box sex values: {box_sex_vals}")
             try:
                 self.db.set_boxes(pid, self.current_boxes)
             except Exception as exc:
@@ -4502,15 +4505,19 @@ class TrainerWindow(QMainWindow):
         real_species = [t for t in tags if t in species_set and t not in ("Empty", "Unknown")]
         if real_species:
             tags = [t for t in tags if t not in ("Empty", "Unknown")]
-        # If Empty is in tags, it should be the ONLY tag (clear everything else)
+        # "Empty" is only valid when there are no subject boxes.
+        # If boxes exist (e.g. after re-running AI), drop Empty instead of clearing detections.
         if "Empty" in tags:
-            tags = ["Empty"]
-            if self.current_boxes:
-                self.current_boxes = []
-                try:
-                    self.db.set_boxes(pid, [])
-                except Exception as exc:
-                    logger.error(f"Box clear failed: {exc}")
+            if has_subject_boxes:
+                tags = [t for t in tags if t != "Empty"]
+            else:
+                tags = ["Empty"]
+                if self.current_boxes:
+                    self.current_boxes = []
+                    try:
+                        self.db.set_boxes(pid, [])
+                    except Exception as exc:
+                        logger.error(f"Box clear failed: {exc}")
         self._save_tags_role_aware(pid, tags)
         # Update UI to reflect tag changes (block signals to prevent re-triggering save)
         self.tags_edit.blockSignals(True)
@@ -4533,8 +4540,27 @@ class TrainerWindow(QMainWindow):
             self.db.set_boxes(pid, self.current_boxes)
         except Exception as exc:
             logger.error(f"Box save failed: {exc}")
-        # Mirror primary box deer data to deer_metadata for backwards compat
-        self._mirror_box_deer_to_metadata(pid)
+        # Persist deer metadata:
+        # - If boxes exist, mirror from primary box (source of truth).
+        # - If no boxes, persist from UI so deer_id/age/points can stick.
+        if has_subject_boxes:
+            self._mirror_box_deer_to_metadata(pid)
+        else:
+            self.db.set_deer_metadata(
+                photo_id=pid,
+                deer_id=deer_id or None,
+                age_class=age or None,
+                left_points_min=self._get_int_field(self.left_min),
+                right_points_min=self._get_int_field(self.right_min),
+                left_points_uncertain=self.left_uncertain.isChecked(),
+                right_points_uncertain=self.right_uncertain.isChecked(),
+                left_ab_points_min=self._get_int_field(self.left_ab_min) if hasattr(self, 'left_ab_min') else None,
+                right_ab_points_min=self._get_int_field(self.right_ab_min) if hasattr(self, 'right_ab_min') else None,
+                left_ab_points_uncertain=self.left_ab_unc.isChecked() if hasattr(self, 'left_ab_unc') else False,
+                right_ab_points_uncertain=self.right_ab_unc.isChecked() if hasattr(self, 'right_ab_unc') else False,
+                abnormal_points_min=self._get_int_field(self.ab_min) if hasattr(self, 'ab_min') else None,
+                abnormal_points_max=self._get_int_field(self.ab_max) if hasattr(self, 'ab_max') else None,
+            )
         # Derive deer_additional from non-primary boxes with deer_ids
         self._derive_deer_additional_from_boxes(pid)
         # Clear suggestion if a NEW species tag was added, OR if current species
@@ -5294,7 +5320,6 @@ class TrainerWindow(QMainWindow):
                 sex = "Buck"
                 self._set_sex("Buck")
             box["sex"] = sex
-            print(f"[DEBUG _save_current_box_data] species={species}, sex={sex}, box_id={box.get('id')}")
             # Clear sex_conf when user has confirmed sex - removes from review queue
             # Buck, Antlerless, Unknown are all confirmed decisions; Unexamined is not
             if sex in ("Buck", "Antlerless", "Unknown"):
@@ -5343,9 +5368,7 @@ class TrainerWindow(QMainWindow):
         self.species_combo.setCurrentText(box.get("species", ""))
 
         # Load sex (normalize handles case + old "Antlerless" → "Antlerless")
-        raw_sex = box.get("sex", "")
-        sex = _normalize_sex(raw_sex)
-        print(f"[DEBUG _load_box_data] box_idx={box_idx}, raw_sex={raw_sex!r}, normalized={sex!r}")
+        sex = _normalize_sex(box.get("sex", ""))
         if sex not in ("Buck", "Antlerless", "Unknown"):
             sex = "Unexamined"
         self._set_sex(sex)
@@ -6559,11 +6582,7 @@ class TrainerWindow(QMainWindow):
         self._update_sex_status_label()
         self._sync_species_on_sex()
         # Persist current box sex choice before saving photo-level tags/metadata
-        sex_val = self._get_sex()
-        print(f"[DEBUG _on_sex_clicked] label={label}, checked={checked}, _get_sex()={sex_val}")
         self._save_current_box_data()
-        if hasattr(self, 'current_boxes') and self.current_boxes and self.current_box_index < len(self.current_boxes):
-            print(f"[DEBUG _on_sex_clicked] after _save_current_box_data: box['sex']={self.current_boxes[self.current_box_index].get('sex')}")
         self.save_current()
 
     def _sync_species_on_sex(self):
@@ -13906,6 +13925,15 @@ class TrainerWindow(QMainWindow):
             new_boxes = self._detect_boxes_megadetector(path, conf_thresh=0.2)
             if new_boxes:
                 self.current_boxes.extend(new_boxes)
+                # Detections found: ensure stale Empty tag does not conflict with boxes.
+                try:
+                    tags = [t for t in self.db.get_tags(pid) if t != "Empty"]
+                    self.db.update_photo_tags(pid, tags)
+                    self.tags_edit.blockSignals(True)
+                    self.tags_edit.setText(", ".join(tags))
+                    self.tags_edit.blockSignals(False)
+                except Exception:
+                    pass
                 results.append(f"Detected {len(new_boxes)} subject(s)")
             else:
                 # Only suggest Empty if there are NO boxes at all
@@ -13958,10 +13986,21 @@ class TrainerWindow(QMainWindow):
 
             # Step 4: Persist and update UI
             self._persist_boxes()
+            # Reload from DB to ensure inserted AI boxes are visible (have IDs)
+            try:
+                self.current_boxes = self.db.get_boxes(pid)
+            except Exception:
+                pass
             self._draw_boxes()
             self._update_box_tab_bar()
             self._update_suggestion_display(photo)
-            self._populate_photo_list()
+            # Avoid auto-saving stale UI state while rebuilding list after AI writes.
+            prev_loading = getattr(self, "_loading_photo_data", False)
+            self._loading_photo_data = True
+            try:
+                self._populate_photo_list()
+            finally:
+                self._loading_photo_data = prev_loading
 
             result_msg = "\n".join(results) if results else "AI processing complete"
 
@@ -14055,6 +14094,12 @@ class TrainerWindow(QMainWindow):
                     non_ai_boxes = [b for b in existing_boxes if not str(b.get("label", "")).startswith("ai_")]
                     all_boxes = non_ai_boxes + new_boxes
                     self.db.set_boxes(pid, all_boxes)
+                    # Detections found: remove stale Empty tag for this photo.
+                    try:
+                        tags = [t for t in self.db.get_tags(pid) if t != "Empty"]
+                        self.db.update_photo_tags(pid, tags)
+                    except Exception:
+                        pass
                     detected_count += len(new_boxes)
 
                     # Run species classifier on each box
@@ -14102,7 +14147,13 @@ class TrainerWindow(QMainWindow):
 
         # Refresh UI
         self.photos = self._sorted_photos(self.db.get_all_photos())
-        self._populate_photo_list()
+        # Avoid auto-saving stale UI state while rebuilding list after AI writes.
+        prev_loading = getattr(self, "_loading_photo_data", False)
+        self._loading_photo_data = True
+        try:
+            self._populate_photo_list()
+        finally:
+            self._loading_photo_data = prev_loading
         self.load_photo()
 
         # Show results
@@ -16573,6 +16624,14 @@ class TrainerWindow(QMainWindow):
                         collection_combo.setCurrentIndex(idx)
 
         layout.addWidget(collection_combo)
+        layout.addSpacing(8)
+
+        layout.addWidget(QLabel("Detection mode:"))
+        mode_combo = QComboBox()
+        mode_combo.addItem("Fast OCR (recommended)", "ocr_fast")
+        mode_combo.addItem("OCR only (timestamp text)", "ocr_only")
+        mode_combo.addItem("OCR + visual fallback", "hybrid")
+        layout.addWidget(mode_combo)
         layout.addSpacing(10)
 
         btn_layout = QHBoxLayout()
@@ -16590,6 +16649,7 @@ class TrainerWindow(QMainWindow):
             return
 
         selected_collection = collection_combo.currentData()
+        detection_mode = mode_combo.currentData()
 
         # Filter by selected collection
         if selected_collection:
@@ -16597,6 +16657,27 @@ class TrainerWindow(QMainWindow):
             collection_msg = f" in collection '{selected_collection}'"
         else:
             collection_msg = ""
+
+        # Exclude verification photos before building reference and target sets.
+        # These are test/check-in images and can pollute OCR site matching.
+        filtered_photos = []
+        verification_filtered = 0
+        for p in all_photos:
+            suggested = (p.get("suggested_tag") or "").strip().lower()
+            if suggested == "verification":
+                verification_filtered += 1
+                continue
+
+            pid = p.get("id")
+            if pid:
+                tags = self.db.get_tags(pid)
+                if any((t or "").strip().lower() == "verification" for t in tags):
+                    verification_filtered += 1
+                    continue
+
+            filtered_photos.append(p)
+
+        all_photos = filtered_photos
 
         labeled = [p for p in all_photos if (p.get('camera_location') or '').strip()]
         unlabeled = [p for p in all_photos if not (p.get('camera_location') or '').strip()]
@@ -16608,16 +16689,33 @@ class TrainerWindow(QMainWindow):
                 "(use the 'Camera Location' field in the photo info panel).")
             return
 
+        if not unlabeled:
+            note = ""
+            if verification_filtered:
+                note = f"\n\nExcluded {verification_filtered} verification photo(s)."
+            QMessageBox.information(
+                self,
+                "Site Detection",
+                f"No unlabeled photos found{collection_msg} to process.{note}"
+            )
+            return
+
         # Get unique locations from the filtered photos
         locations = set(p['camera_location'].strip() for p in labeled)
+
+        verification_note = ""
+        if verification_filtered:
+            verification_note = f"\nExcluded verification photos: {verification_filtered}\n"
 
         info_msg = (
             f"Ready to auto-detect sites for {len(unlabeled)} unlabeled photos{collection_msg}.\n\n"
             f"Using {len(labeled)} labeled photos from {len(locations)} sites as reference:\n"
             f"  {', '.join(sorted(locations))}\n\n"
+            f"{verification_note}"
             "Detection methods:\n"
-            "1. OCR - reads site name from camera text overlay (most accurate)\n"
-            "2. Visual - matches scene appearance (fallback)\n\n"
+            f"• Mode: {'Fast OCR' if detection_mode == 'ocr_fast' else ('OCR only' if detection_mode == 'ocr_only' else 'OCR + visual fallback')}\n"
+            "• OCR reads site name from camera text overlay\n"
+            "• Visual fallback matches scene appearance when OCR fails\n\n"
             "Continue?"
         )
         if QMessageBox.question(self, "Site Detection", info_msg,
@@ -16647,8 +16745,8 @@ class TrainerWindow(QMainWindow):
             QCoreApplication.processEvents()
 
         try:
-            # Create detector
-            progress.setLabelText("Loading OCR detection...")
+            # Create detector/identifier
+            progress.setLabelText("Loading site detection...")
             QCoreApplication.processEvents()
 
             if not OCR_AVAILABLE:
@@ -16658,15 +16756,40 @@ class TrainerWindow(QMainWindow):
                     "Install pytesseract for site detection.")
                 return
 
-            detector = SiteDetector()
-            if not detector.ready:
-                progress.close()
-                QMessageBox.warning(self, "Site Detection",
-                    "OCR detector not ready.")
-                return
+            detector = None
+            identifier = None
+
+            if detection_mode in ("ocr_only", "ocr_fast"):
+                detector = SiteDetector(list(locations))
+                if not detector.ready:
+                    progress.close()
+                    QMessageBox.warning(self, "Site Detection", "OCR detector not ready.")
+                    return
+            else:
+                try:
+                    from site_identifier import SiteIdentifier
+                    identifier = SiteIdentifier(self.db)
+                except Exception as e:
+                    progress.close()
+                    QMessageBox.warning(self, "Site Detection", f"Failed to load hybrid detector: {e}")
+                    return
+
+                if not identifier.ready:
+                    progress.close()
+                    QMessageBox.warning(
+                        self,
+                        "Site Detection",
+                        "Hybrid detector not ready. Use OCR only or install semantic dependencies."
+                    )
+                    return
+
+                progress.setLabelText("Building visual site references...")
+                QCoreApplication.processEvents()
+                identifier.build_site_references(labeled)
 
             # Process unlabeled photos
             ocr_count = 0
+            semantic_count = 0
             failed_count = 0
             by_site = {}
 
@@ -16683,10 +16806,28 @@ class TrainerWindow(QMainWindow):
 
                 # Update progress every photo to keep UI responsive
                 progress.setValue(i + 1)
-                progress.setLabelText(f"Processing {i+1}/{len(unlabeled)}... Detected: {ocr_count}")
+                if detection_mode in ("ocr_only", "ocr_fast"):
+                    progress.setLabelText(f"Processing {i+1}/{len(unlabeled)}... OCR detected: {ocr_count}")
+                else:
+                    progress.setLabelText(
+                        f"Processing {i+1}/{len(unlabeled)}... OCR: {ocr_count}, Visual: {semantic_count}"
+                    )
                 QCoreApplication.processEvents()
 
-                result = detector.detect_site(path)
+                if detection_mode in ("ocr_only", "ocr_fast"):
+                    if detection_mode == "ocr_fast":
+                        result = detector.detect_site_fast(path)
+                    else:
+                        result = detector.detect_site(path)
+                    method = "ocr" if result else None
+                else:
+                    id_result = identifier.identify_site(path, date_taken=photo.get("date_taken"))
+                    if id_result:
+                        site_name, confidence, method = id_result
+                        result = (site_name, confidence)
+                    else:
+                        result = None
+                        method = None
 
                 if result:
                     site_name, confidence = result
@@ -16700,7 +16841,10 @@ class TrainerWindow(QMainWindow):
                         self.db.set_photo_site_suggestion(photo['id'], site_id, confidence)
 
                     by_site[site_name] = by_site.get(site_name, 0) + 1
-                    ocr_count += 1
+                    if method == "semantic":
+                        semantic_count += 1
+                    else:
+                        ocr_count += 1
                 else:
                     failed_count += 1
 
@@ -16711,9 +16855,12 @@ class TrainerWindow(QMainWindow):
                 return
 
             # Show results
-            msg = (f"Site detection complete!\n\n"
-                   f"Detected via OCR: {ocr_count}\n"
-                   f"Could not detect: {failed_count}\n\n")
+            msg = "Site detection complete!\n\n"
+            msg += f"Mode: {'Fast OCR' if detection_mode == 'ocr_fast' else ('OCR only' if detection_mode == 'ocr_only' else 'OCR + visual fallback')}\n"
+            msg += f"Detected via OCR: {ocr_count}\n"
+            if detection_mode not in ("ocr_only", "ocr_fast"):
+                msg += f"Detected via visual fallback: {semantic_count}\n"
+            msg += f"Could not detect: {failed_count}\n\n"
 
             if by_site:
                 msg += "By site:\n"

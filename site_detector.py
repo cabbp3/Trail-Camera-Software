@@ -12,11 +12,11 @@ labels the photos.
 """
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Optional, Dict, List, Tuple
-from pathlib import Path
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps, ImageFilter
     import pytesseract
     OCR_AVAILABLE = True
 except ImportError:
@@ -100,6 +100,26 @@ class SiteDetector:
             print(f"[SiteDetector] Error processing {image_path}: {e}")
             return None
 
+    def detect_site_fast(self, image_path: str) -> Optional[Tuple[str, float]]:
+        """
+        Fast OCR path for bulk processing.
+
+        Uses only:
+        - bottom 12% with psm 6
+        - top 12% fallback with psm 6
+        """
+        if not self._ready or not os.path.exists(image_path):
+            return None
+
+        try:
+            text = self._extract_overlay_text_fast(image_path)
+            if not text:
+                return None
+            return self._match_site(text)
+        except Exception as e:
+            print(f"[SiteDetector] Fast OCR error processing {image_path}: {e}")
+            return None
+
     def _extract_overlay_text(self, image_path: str) -> str:
         """
         Extract text from the camera's overlay region.
@@ -109,29 +129,84 @@ class SiteDetector:
         """
         with Image.open(image_path) as img:
             w, h = img.size
+            regions = [
+                img.crop((0, int(h * 0.88), w, h)),  # bottom 12%
+                img.crop((0, int(h * 0.82), w, h)),  # bottom 18%
+                img.crop((0, int(h * 0.75), w, h)),  # bottom 25%
+                img.crop((0, 0, w, int(h * 0.12))),  # top 12%
+            ]
 
-            # Try bottom 12% first (most common location)
+            best_text = ""
+            best_score = 0.0
+            for region in regions:
+                for prepared in self._prepare_ocr_variants(region):
+                    for config in ("--psm 6", "--psm 7"):
+                        text = pytesseract.image_to_string(prepared, config=config).strip()
+                        if not text:
+                            continue
+                        score = self._site_hint_score(text)
+                        if score > best_score:
+                            best_score = score
+                            best_text = text
+
+        return best_text.strip()
+
+    def _extract_overlay_text_fast(self, image_path: str) -> str:
+        """Quick overlay OCR for performance-sensitive runs."""
+        with Image.open(image_path) as img:
+            w, h = img.size
+
             bottom = img.crop((0, int(h * 0.88), w, h))
-            text = pytesseract.image_to_string(bottom, config='--psm 6')
+            text = pytesseract.image_to_string(bottom, config="--psm 6").strip()
+            if self._has_site_hint(text):
+                return text
 
-            # If no good text, try top 12%
-            if not self._has_site_hint(text):
-                top = img.crop((0, 0, w, int(h * 0.12)))
-                top_text = pytesseract.image_to_string(top, config='--psm 6')
-                if self._has_site_hint(top_text):
-                    text = top_text
+            top = img.crop((0, 0, w, int(h * 0.12)))
+            top_text = pytesseract.image_to_string(top, config="--psm 6").strip()
+            return top_text if self._has_site_hint(top_text) else text
 
-        return text.strip()
+    def _prepare_ocr_variants(self, image: Image.Image) -> List[Image.Image]:
+        """Generate OCR-friendly image variants for difficult overlays."""
+        gray = ImageOps.grayscale(image)
+        boosted = ImageOps.autocontrast(gray)
+        sharp = boosted.filter(ImageFilter.SHARPEN)
+        binary = sharp.point(lambda px: 255 if px > 150 else 0)
+        return [image, gray, boosted, sharp, binary]
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Normalize text for robust matching across OCR noise."""
+        text = text.upper()
+        text = re.sub(r"[^A-Z0-9]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _site_hint_score(self, text: str) -> float:
+        """Score whether text looks like a camera/site overlay."""
+        norm = self._normalize_text(text)
+        if not norm:
+            return 0.0
+
+        score = 0.0
+        compact = norm.replace(" ", "")
+
+        for site in self._sites:
+            site_norm = self._normalize_text(site)
+            if not site_norm:
+                continue
+            if site_norm in norm:
+                score += 2.0
+            if site_norm.replace(" ", "") in compact:
+                score += 1.0
+
+        patterns = ("LINE", "LICK", "ROAD", "TRIANGLE", "STAND", "FEEDER")
+        score += sum(0.5 for p in patterns if p in norm)
+        score += min(1.0, len(norm) / 80.0)
+        return score
 
     def _has_site_hint(self, text: str) -> bool:
         """Check if text contains any hint of a site name."""
-        upper = text.upper()
-        for site in self._sites:
-            if site.upper() in upper:
-                return True
-        # Also check for common patterns
-        patterns = ['LINE', 'LICK', 'ROAD', 'TRIANGLE', 'STAND', 'FEEDER']
-        return any(p in upper for p in patterns)
+        return self._site_hint_score(text) > 0.5
 
     def _match_site(self, text: str) -> Optional[Tuple[str, float]]:
         """
@@ -140,31 +215,62 @@ class SiteDetector:
         Returns:
             Tuple of (database_site_name, confidence) or None
         """
-        upper = text.upper()
+        norm_text = self._normalize_text(text)
+        compact_text = norm_text.replace(" ", "")
 
-        # Score each known pattern
-        best_pattern = None
-        best_score = 0
+        best_site = None
+        best_score = 0.0
 
-        for pattern in self._sites:
-            pattern_upper = pattern.upper()
+        candidates = set(self._sites) | set(CAMERA_TO_SITE_MAP.keys())
+        for pattern in candidates:
+            pattern_norm = self._normalize_text(pattern)
+            if not pattern_norm:
+                continue
 
-            # Exact substring match
-            if pattern_upper in upper:
-                # Give higher score to longer matches (more specific)
-                score = len(pattern) / 20.0  # Normalize to ~0-1
-                score = min(1.0, score + 0.5)  # Boost for exact match
+            token_score = 0.0
+            if pattern_norm in norm_text:
+                token_score = 0.95
+            elif pattern_norm.replace(" ", "") in compact_text:
+                token_score = 0.88
+            else:
+                ratio = SequenceMatcher(None, pattern_norm, norm_text).ratio()
+                pattern_tokens = set(pattern_norm.split())
+                text_tokens = set(norm_text.split())
+                overlap = (
+                    len(pattern_tokens & text_tokens) / max(1, len(pattern_tokens))
+                    if pattern_tokens else 0.0
+                )
+                token_score = max(ratio * 0.8, overlap * 0.85)
 
-                if score > best_score:
-                    best_score = score
-                    best_pattern = pattern
+            if token_score > best_score:
+                best_score = token_score
+                mapped = CAMERA_TO_SITE_MAP.get(pattern.upper(), pattern)
+                best_site = self._resolve_known_site(mapped)
 
-        if best_pattern:
-            # Map camera pattern to database site name
-            db_site = CAMERA_TO_SITE_MAP.get(best_pattern.upper(), best_pattern)
-            return (db_site, best_score)
+        if best_site and best_score >= 0.55:
+            return (best_site, min(1.0, best_score))
 
         return None
+
+    def _resolve_known_site(self, candidate: str) -> str:
+        """Resolve mapped site value to the closest known site label."""
+        if not self._sites:
+            return candidate
+
+        cand_norm = self._normalize_text(candidate)
+        best = candidate
+        best_ratio = 0.0
+        for site in self._sites:
+            site_norm = self._normalize_text(site)
+            if site_norm == cand_norm:
+                return site
+            if site_norm in cand_norm or cand_norm in site_norm:
+                return site
+            ratio = SequenceMatcher(None, cand_norm, site_norm).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = site
+        return best if best_ratio >= 0.72 else candidate
 
     def detect_sites_batch(
         self,
